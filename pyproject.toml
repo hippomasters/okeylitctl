@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omen-rgb-linux"
+version = "0.1.0"
+description = "Restricted Linux control for validated HP OMEN four-zone RGB keyboards"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+authors = [{name = "OMEN RGB Linux contributors"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware :: Hardware Drivers",
+]
+
+[project.scripts]
+omen-rgb = "omen_rgb.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["src"]

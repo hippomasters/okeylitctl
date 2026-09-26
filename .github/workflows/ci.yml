@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Run userspace and protocol tests
+        run: make test
+      - name: Build and install Python package
+        run: |
+          python3 -m pip install --disable-pip-version-check .
+          omen-rgb --help
+          omen-rgb --version
+
+  module-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Install kernel headers
+        run: sudo apt-get update && sudo apt-get install -y linux-headers-generic
+      - name: Build external module with warnings
+        run: |
+          KDIR=$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n 1)
+          test -n "$KDIR"
+          make KDIR="$KDIR" W=1
+      - name: Inspect module metadata
+        run: |
+          modinfo ./omen_rgb.ko
+          test "$(modinfo -F license ./omen_rgb.ko)" = GPL
