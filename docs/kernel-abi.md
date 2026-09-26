@@ -18,4 +18,4 @@ Device directory:
 
 Live firmware-backed reads and every mutation are root-only, preventing unprivileged callers from flooding firmware requests. Cached `original` and static `abi_version` remain public. Firmware state writes are intentionally absent because they did not pass repeat-cycle hardware validation. There is intentionally no raw command, offset, buffer, ioctl, procfs, or debugfs interface.
 
-Zone values follow HP firmware table order. Confirm physical zone order when adding a newly supported machine.
+Zone values follow HP firmware table order. On the validated hardware, positions 1–4 map to **Right, Center, Left, WASD** respectively. This is not physical left-to-right order. Confirm the mapping independently when adding another supported machine.

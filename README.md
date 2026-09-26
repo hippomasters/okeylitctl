@@ -17,6 +17,19 @@ A restricted Linux kernel module and CLI for HP OMEN four-zone keyboard RGB cont
 
 Hardware testing confirmed RGB read/write/readback, restore, and read-only power-state reporting on September 26, 2026. Software power writes are intentionally not exposed because repeated off/on cycles were not reliable on the validated firmware; use the laptop's physical keyboard-light key for power control.
 
+## Hardware-verified zone order
+
+The four values passed to `omen-rgb colors` use firmware order, not physical left-to-right order:
+
+| Value position | HP lighting-zone name | Physical area |
+|---:|---|---|
+| 1 | Right zone | Far-right section, including Backspace and Enter |
+| 2 | Center zone | Center section |
+| 3 | Left zone | Left section outside the dedicated WASD group |
+| 4 | WASD zone | W, A, S, D area |
+
+For example, `FFFFFF,000000,000000,000000` lights only the right zone. This mapping was physically verified on the supported laptop. HP's OMEN lighting software uses the corresponding Right, Center, Left, and WASD zone terminology.
+
 ## Safety properties
 
 - Exact DMI, BIOS, WMI GUID, keyboard-type, response-length, and table-marker checks.
