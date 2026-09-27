@@ -14,10 +14,27 @@ class InstallerSafetyTests(unittest.TestCase):
 
     def test_dkms_uses_a_fixed_root_owned_snapshot(self):
         source = (ROOT / "scripts" / "install-dkms.sh").read_text(encoding="utf-8")
-        self.assertIn('DEST="/usr/src/${MODULE}-${VERSION}"', source)
+        self.assertIn('DEST="/usr/src/${MODULE}-${DRIVER_VERSION}"', source)
         self.assertIn('chown -R root:root "$DEST"', source)
         self.assertIn('chmod -R go-w "$DEST"', source)
         self.assertIn('if [ -e "$path" ] || [ -L "$path" ]', source)
+
+    def test_installs_the_okeylitctl_public_command(self):
+        source = (ROOT / "scripts" / "install-dkms.sh").read_text(encoding="utf-8")
+        self.assertIn('CLI_DEST="/usr/local/bin/okeylitctl"', source)
+        self.assertIn("-m okeylitctl.cli:entrypoint", source)
+
+    def test_public_and_internal_versions_are_explicitly_separate(self):
+        for script in ("install-dkms.sh", "uninstall.sh"):
+            source = (ROOT / "scripts" / script).read_text(encoding="utf-8")
+            with self.subTest(script=script):
+                self.assertIn('APP_VERSION="0.2.0"', source)
+                self.assertIn('DRIVER_VERSION="0.1.0"', source)
+
+    def test_installer_refuses_a_stale_legacy_cli(self):
+        source = (ROOT / "scripts" / "install-dkms.sh").read_text(encoding="utf-8")
+        self.assertIn('LEGACY_CLI_DEST="/usr/local/bin/omen-rgb"', source)
+        self.assertIn('"$LEGACY_CLI_DEST"', source)
 
     def test_cli_is_never_installed_setuid(self):
         source = (ROOT / "scripts" / "install-dkms.sh").read_text(encoding="utf-8")
@@ -34,7 +51,7 @@ class InstallerSafetyTests(unittest.TestCase):
     def test_failed_install_has_cleanup_trap(self):
         source = (ROOT / "scripts" / "install-dkms.sh").read_text(encoding="utf-8")
         self.assertIn("trap cleanup 0", source)
-        self.assertIn('dkms remove -m "$MODULE" -v "$VERSION" --all', source)
+        self.assertIn('dkms remove -m "$MODULE" -v "$DRIVER_VERSION" --all', source)
         self.assertIn('if [ "$COMPLETE" -ne 1 ]', source)
 
     def test_cleanup_only_removes_artifacts_created_by_this_run(self):
@@ -43,6 +60,11 @@ class InstallerSafetyTests(unittest.TestCase):
             with self.subTest(flag=flag):
                 self.assertIn(flag, source)
         self.assertIn("refusing existing installed path", source)
+
+    def test_uninstaller_removes_new_and_legacy_cli_names(self):
+        source = (ROOT / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+        self.assertIn("/usr/local/bin/okeylitctl", source)
+        self.assertIn("/usr/local/bin/omen-rgb", source)
 
     def test_uninstaller_fails_closed_when_dkms_status_fails(self):
         source = (ROOT / "scripts" / "uninstall.sh").read_text(encoding="utf-8")

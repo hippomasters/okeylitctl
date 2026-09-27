@@ -2,8 +2,8 @@ import io
 import json
 import unittest
 
-from omen_rgb.cli import main
-from omen_rgb.sysfs import ModuleUnavailable, PermissionDenied, UnsupportedABI
+from okeylitctl.cli import main
+from okeylitctl.sysfs import ModuleUnavailable, PermissionDenied, UnsupportedABI
 
 
 class FakeBackend:
@@ -39,6 +39,18 @@ class CliTests(unittest.TestCase):
         backend = backend or FakeBackend()
         code = main(list(argv), backend=backend, stdout=out, stderr=err)
         return code, out.getvalue(), err.getvalue(), backend
+
+    def test_public_command_name_is_okeylitctl(self):
+        code, out, err, _ = self.run_cli("--help")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("usage: okeylitctl", out)
+
+    def test_public_release_version_is_0_2_0(self):
+        code, out, err, _ = self.run_cli("--version")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out, "okeylitctl 0.2.0\n")
 
     def test_human_status(self):
         code, out, err, _ = self.run_cli("status")

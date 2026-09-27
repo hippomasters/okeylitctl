@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from omen_rgb.sysfs import (
+from okeylitctl.sysfs import (
     BackendIOError,
     ModuleUnavailable,
     PermissionDenied,
@@ -51,7 +51,7 @@ class SysfsBackendTests(unittest.TestCase):
         self.assertEqual((self.root / "state").read_text(encoding="ascii"), "on\n")
 
     def test_writes_only_allowlisted_parameter_with_one_write(self):
-        with mock.patch("omen_rgb.sysfs.os.write", wraps=os.write) as write:
+        with mock.patch("okeylitctl.sysfs.os.write", wraps=os.write) as write:
             self.backend.write_colors("FF0000,00FF00,0000FF,FFFFFF")
         write.assert_called_once()
         self.assertEqual(
@@ -60,7 +60,7 @@ class SysfsBackendTests(unittest.TestCase):
         )
 
     def test_rejects_short_write(self):
-        with mock.patch("omen_rgb.sysfs.os.write", return_value=1):
+        with mock.patch("okeylitctl.sysfs.os.write", return_value=1):
             with self.assertRaises(BackendIOError):
                 self.backend.write_colors("FF0000,00FF00,0000FF,FFFFFF")
 
@@ -70,7 +70,7 @@ class SysfsBackendTests(unittest.TestCase):
             self.backend.status()
 
     def test_permission_error_is_distinct(self):
-        with mock.patch("omen_rgb.sysfs.os.open", side_effect=PermissionError(errno.EACCES, "no")):
+        with mock.patch("okeylitctl.sysfs.os.open", side_effect=PermissionError(errno.EACCES, "no")):
             with self.assertRaises(PermissionDenied):
                 self.backend.write_colors("FF0000,00FF00,0000FF,FFFFFF")
 

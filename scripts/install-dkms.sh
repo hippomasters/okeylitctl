@@ -6,10 +6,12 @@ export PATH
 unset PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT
 umask 022
 
-VERSION="0.1.0"
+APP_VERSION="0.2.0"
+DRIVER_VERSION="0.1.0"
 MODULE="omen-rgb"
-DEST="/usr/src/${MODULE}-${VERSION}"
-CLI_DEST="/usr/local/bin/omen-rgb"
+DEST="/usr/src/${MODULE}-${DRIVER_VERSION}"
+CLI_DEST="/usr/local/bin/okeylitctl"
+LEGACY_CLI_DEST="/usr/local/bin/omen-rgb"
 LOAD_DEST="/etc/modules-load.d/omen-rgb.conf"
 TMP=""
 COMPLETE=0
@@ -31,7 +33,7 @@ cleanup()
         [ "$INSTALLED_LOAD" -ne 1 ] || rm -f -- "$LOAD_DEST"
         [ "$INSTALLED_CLI" -ne 1 ] || rm -f -- "$CLI_DEST"
         if [ "$DKMS_ADDED" -eq 1 ]; then
-            dkms remove -m "$MODULE" -v "$VERSION" --all >/dev/null 2>&1 || true
+            dkms remove -m "$MODULE" -v "$DRIVER_VERSION" --all >/dev/null 2>&1 || true
         fi
         if [ "$CREATED_DEST" -eq 1 ] && [ -d "$DEST" ] && [ ! -L "$DEST" ]; then
             rm -rf -- "$DEST"
@@ -61,7 +63,7 @@ fi
 
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 SOURCE=$(CDPATH= cd -- "${SELF_DIR}/.." && pwd -P)
-for path in "$DEST" "$CLI_DEST" "$LOAD_DEST"; do
+for path in "$DEST" "$CLI_DEST" "$LEGACY_CLI_DEST" "$LOAD_DEST"; do
     if [ -e "$path" ] || [ -L "$path" ]; then
         printf 'refusing existing installed path: %s\n' "$path" >&2
         printf '%s\n' "remove the existing version deliberately before reinstalling" >&2
@@ -77,13 +79,13 @@ install -m 0644 "$SOURCE/module/omen_rgb.c" \
 chown -R root:root "$DEST"
 chmod -R go-w "$DEST"
 
-dkms add -m "$MODULE" -v "$VERSION"
+dkms add -m "$MODULE" -v "$DRIVER_VERSION"
 DKMS_ADDED=1
-dkms build -m "$MODULE" -v "$VERSION"
-dkms install -m "$MODULE" -v "$VERSION"
+dkms build -m "$MODULE" -v "$DRIVER_VERSION"
+dkms install -m "$MODULE" -v "$DRIVER_VERSION"
 
-TMP=$(mktemp /tmp/omen-rgb.XXXXXX)
-python3 -I -m zipapp "$SOURCE/src" -m omen_rgb.cli:entrypoint \
+TMP=$(mktemp /tmp/okeylitctl.XXXXXX)
+python3 -I -m zipapp "$SOURCE/src" -m okeylitctl.cli:entrypoint \
     -p /usr/bin/python3 -o "$TMP"
 install -m 0755 "$TMP" "$CLI_DEST"
 INSTALLED_CLI=1
@@ -93,4 +95,4 @@ INSTALLED_LOAD=1
 MAY_HAVE_LOADED=1
 modprobe omen_rgb
 COMPLETE=1
-printf '%s\n' "omen-rgb ${VERSION} installed and loaded"
+printf '%s\n' "OKeyLitCtl ${APP_VERSION} installed; omen_rgb ${DRIVER_VERSION} loaded"

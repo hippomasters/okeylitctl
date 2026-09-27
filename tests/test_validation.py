@@ -1,6 +1,6 @@
 import unittest
 
-from omen_rgb.validation import ValidationError, normalize_colors
+from okeylitctl.validation import ValidationError, normalize_colors
 
 
 class ColorValidationTests(unittest.TestCase):

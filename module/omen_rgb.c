@@ -449,7 +449,7 @@ static void __exit omen_rgb_exit(void)
 module_init(omen_rgb_init);
 module_exit(omen_rgb_exit);
 
-MODULE_AUTHOR("OMEN RGB Linux contributors");
+MODULE_AUTHOR("OKeyLitCtl contributors");
 MODULE_DESCRIPTION("Restricted HP OMEN 16-wf0xxx four-zone RGB controller");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(DRIVER_VERSION);

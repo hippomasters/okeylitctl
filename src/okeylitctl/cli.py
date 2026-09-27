@@ -1,4 +1,4 @@
-"""Command-line interface for the omen_rgb kernel module."""
+"""OKeyLitCtl command-line interface for the omen_rgb kernel module."""
 
 from __future__ import annotations
 
@@ -18,10 +18,12 @@ from .sysfs import (
 )
 from .validation import ValidationError, normalize_colors
 
+APP_NAME = "okeylitctl"
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="omen-rgb",
+        prog=APP_NAME,
         description="Safely control supported HP OMEN four-zone keyboard lighting.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -82,26 +84,26 @@ def main(
         stdout.flush()
         return 0
     except ValidationError as exc:
-        stderr.write(f"omen-rgb: {exc}\n")
+        stderr.write(f"{APP_NAME}: {exc}\n")
         return 2
     except ModuleUnavailable as exc:
-        stderr.write(f"omen-rgb: {exc}\n")
+        stderr.write(f"{APP_NAME}: {exc}\n")
         stderr.write("Hint: load the omen_rgb kernel module first.\n")
         return 3
     except PermissionDenied as exc:
-        stderr.write(f"omen-rgb: {exc}\n")
+        stderr.write(f"{APP_NAME}: {exc}\n")
         stderr.write("Hint: mutation commands must be run as root (for example, with sudo).\n")
         return 4
     except BackendIOError as exc:
-        stderr.write(f"omen-rgb: {exc}\n")
+        stderr.write(f"{APP_NAME}: {exc}\n")
         return 5
     except UnsupportedABI as exc:
-        stderr.write(f"omen-rgb: unsupported kernel ABI: {exc}\n")
+        stderr.write(f"{APP_NAME}: unsupported kernel ABI: {exc}\n")
         return 6
     except BrokenPipeError:
         return 0
     except Exception as exc:  # Avoid exposing tracebacks from an installed root CLI.
-        stderr.write(f"omen-rgb: unexpected internal error: {exc}\n")
+        stderr.write(f"{APP_NAME}: unexpected internal error: {exc}\n")
         return 70
 
 

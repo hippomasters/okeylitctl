@@ -1,4 +1,4 @@
-"""Validation helpers for the omen-rgb command."""
+"""Validation helpers for the OKeyLitCtl command."""
 
 from __future__ import annotations
 

@@ -19,8 +19,13 @@ jobs:
       - name: Build and install Python package
         run: |
           python3 -m pip install --disable-pip-version-check .
-          omen-rgb --help
-          omen-rgb --version
+          okeylitctl --help
+          okeylitctl --version
+      - name: Build and execute installer-style zipapp
+        run: |
+          python3 -m zipapp src -m okeylitctl.cli:entrypoint -p /usr/bin/python3 -o /tmp/okeylitctl
+          python3 /tmp/okeylitctl --help
+          python3 /tmp/okeylitctl --version
 
   module-build:
     runs-on: ubuntu-latest

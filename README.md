@@ -1,8 +1,8 @@
-# OMEN RGB Linux
+# OKeyLitCtl
 
-A restricted Linux kernel module and CLI for HP OMEN four-zone keyboard RGB control through HP's firmware WMI interface.
+A restricted Linux controller for HP OMEN four-zone keyboard RGB lighting through HP's firmware WMI interface. The public command is `okeylitctl`; the internal kernel module `omen_rgb`, DKMS package `omen-rgb`, and sysfs path remain stable for compatibility.
 
-> **Experimental firmware driver:** version 0.1.0 intentionally supports one hardware/BIOS tuple. It refuses everything else. Do not remove the checks to force unsupported hardware.
+> **Experimental firmware driver:** OKeyLitCtl 0.2.0 bundles internal driver 0.1.0, which intentionally supports one hardware/BIOS tuple. It refuses everything else. Do not remove the checks to force unsupported hardware.
 
 ## Confirmed hardware
 
@@ -19,7 +19,7 @@ Hardware testing confirmed RGB read/write/readback, restore, and read-only power
 
 ## Hardware-verified zone order
 
-The four values passed to `omen-rgb colors` use firmware order, not physical left-to-right order:
+The four values passed to `okeylitctl colors` use firmware order, not physical left-to-right order:
 
 | Value position | HP lighting-zone name | Physical area |
 |---:|---|---|
@@ -49,14 +49,14 @@ This experimental out-of-tree module and Linux's `hp_wmi` driver can both call t
 ## Commands
 
 ```console
-$ sudo omen-rgb status
+$ sudo okeylitctl status
 State:    on
 Colors:   FF0000,00FF00,0000FF,FFFFFF
 Original: 580BC3,D00FEF,4D0998,AF0AA1
 
-$ sudo omen-rgb status --json
-$ sudo omen-rgb colors FF0000,00FF00,0000FF,FFFFFF
-$ sudo omen-rgb restore
+$ sudo okeylitctl status --json
+$ sudo okeylitctl colors FF0000,00FF00,0000FF,FFFFFF
+$ sudo okeylitctl restore
 ```
 
 The CLI never invokes `sudo`; mutation fails unless the caller already has root privileges. `status` reports the firmware's current `on`/`off` state but does not change it.
@@ -70,7 +70,7 @@ sudo pacman -S --needed base-devel dkms linux-headers python
 sudo ./scripts/install-dkms.sh
 ```
 
-The installer performs no downloads. It copies a root-owned snapshot to `/usr/src/omen-rgb-0.1.0`, builds through DKMS, installs a modules-load entry, creates a Python zipapp at `/usr/local/bin/omen-rgb`, and loads the module.
+The installer performs no downloads. It copies a root-owned snapshot to `/usr/src/omen-rgb-0.1.0`, builds the stable internal `omen_rgb` driver through DKMS, installs a modules-load entry, creates a Python zipapp at `/usr/local/bin/okeylitctl`, and loads the module. Before upgrading from 0.1.0, run this release's `scripts/uninstall.sh`; it deliberately removes both the new command and the legacy `/usr/local/bin/omen-rgb` command.
 
 Secure Boot systems must locally sign and trust the DKMS-built module. No private signing key is included. See [docs/troubleshooting.md](docs/troubleshooting.md).
 
@@ -80,7 +80,7 @@ Secure Boot systems must locally sign and trust the DKMS-built module. No privat
 make
 make test
 sudo insmod ./omen_rgb.ko
-PYTHONPATH=src python -m omen_rgb status
+PYTHONPATH=src python -m okeylitctl status
 ```
 
 The public ABI is documented in [docs/kernel-abi.md](docs/kernel-abi.md).
