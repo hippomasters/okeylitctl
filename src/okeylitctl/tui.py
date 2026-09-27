@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import curses
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
@@ -30,6 +31,39 @@ class TuiCommand(Enum):
     REFRESH = auto()
     EDIT = auto()
     QUIT = auto()
+
+
+@dataclass(frozen=True)
+class VisualRegion:
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+def keyboard_region_geometry(terminal_width: int) -> dict[Zone, VisualRegion]:
+    """Return a coarse four-region keyboard silhouette, never per-key geometry."""
+    margin = 2
+    gap = 2
+    available = terminal_width - margin * 2 - gap * 2
+    left_width = max(18, available * 24 // 100)
+    center_width = max(22, available * 31 // 100)
+    right_width = available - left_width - center_width
+    if right_width < 26:
+        shortage = 26 - right_width
+        center_width -= shortage
+        right_width = 26
+
+    left = VisualRegion(margin, 5, left_width, 6)
+    center = VisualRegion(left.x + left.width + gap, 5, center_width, 6)
+    right = VisualRegion(center.x + center.width + gap, 5, right_width, 6)
+    wasd = VisualRegion(left.x + 2, 7, left.width - 4, 2)
+    return {
+        Zone.LEFT: left,
+        Zone.CENTER: center,
+        Zone.RIGHT: right,
+        Zone.WASD: wasd,
+    }
 
 
 def rgb_to_xterm_index(color: str) -> int:
@@ -208,11 +242,7 @@ class CursesTui:
         dirty = "UNAPPLIED CHANGES" if self.state.dirty else "SYNCHRONIZED"
         self._safe_add(screen, 3, width - len(dirty) - 3, dirty, warn if self.state.dirty else good)
 
-        card_gap = 2
-        card_width = max(16, (width - 4 - card_gap * 3) // 4)
-        for index, zone in enumerate(FIRMWARE_ZONE_ORDER):
-            x = 2 + index * (card_width + card_gap)
-            self._draw_zone_card(screen, 5, x, card_width, zone, index + 1)
+        self._draw_keyboard_visualization(screen, width)
 
         selected = self.state.selected_zone
         color = self.state.selected_color
@@ -243,30 +273,118 @@ class CursesTui:
             self._draw_help(screen)
         screen.refresh()
 
-    def _draw_zone_card(
-        self, screen: Any, y: int, x: int, width: int, zone: Zone, number: int
+    def _draw_keyboard_visualization(self, screen: Any, width: int) -> None:
+        regions = keyboard_region_geometry(width)
+        labels = {
+            Zone.LEFT: "3 · LEFT REGION",
+            Zone.CENTER: "2 · CENTER REGION",
+            Zone.RIGHT: "1 · RIGHT + ARROWS + NUMPAD",
+            Zone.WASD: "WASD REGION",
+        }
+        for zone in (Zone.LEFT, Zone.CENTER, Zone.RIGHT):
+            self._draw_visual_region(screen, regions[zone], zone, labels[zone])
+        self._draw_visual_region(
+            screen,
+            regions[Zone.WASD],
+            Zone.WASD,
+            labels[Zone.WASD],
+            compact=True,
+        )
+
+    def _draw_visual_region(
+        self,
+        screen: Any,
+        region: VisualRegion,
+        zone: Zone,
+        label: str,
+        *,
+        compact: bool = False,
     ) -> None:
         selected = zone is self.state.selected_zone
         color = getattr(self.state.draft, zone.value)
-        border_attr = curses.color_pair(1) | curses.A_BOLD if selected and self.colors_enabled else (curses.A_BOLD if selected else curses.A_DIM)
-        top = "╭" + "─" * (width - 2) + "╮"
-        bottom = "╰" + "─" * (width - 2) + "╯"
-        self._safe_add(screen, y, x, top, border_attr)
-        self._safe_add(screen, y + 1, x, "│" + " " * (width - 2) + "│", border_attr)
-        self._safe_add(screen, y + 2, x, "│" + " " * (width - 2) + "│", border_attr)
-        self._safe_add(screen, y + 3, x, "│" + " " * (width - 2) + "│", border_attr)
-        self._safe_add(screen, y + 4, x, bottom, border_attr)
-        self._safe_add(screen, y + 1, x + 2, f"{number}  {zone.value.upper()}", curses.A_BOLD)
-        self._safe_add(screen, y + 3, x + 2, f"#{color}", curses.A_BOLD)
+        if selected and self.colors_enabled:
+            border_attr = curses.color_pair(1) | curses.A_BOLD
+        else:
+            border_attr = curses.A_BOLD if selected else curses.A_DIM
+
+        if compact:
+            compact_attr = curses.A_REVERSE if selected else curses.A_BOLD
+            self._safe_add(
+                screen,
+                region.y,
+                region.x,
+                "WASD REGION 4",
+                compact_attr,
+            )
+            self._safe_add(
+                screen,
+                region.y + 1,
+                region.x,
+                f"#{color}",
+                compact_attr,
+            )
+            if self.colors_enabled and getattr(curses, "COLORS", 0) >= 256:
+                background = rgb_to_xterm_index(color)
+                try:
+                    curses.init_pair(33, 231, background)
+                    swatch_width = max(3, region.width - 9)
+                    self._safe_add(
+                        screen,
+                        region.y + 1,
+                        region.x + region.width - swatch_width,
+                        " " * swatch_width,
+                        curses.color_pair(33),
+                    )
+                except curses.error:
+                    pass
+            return
+
+        top = "╭" + "─" * (region.width - 2) + "╮"
+        bottom = "╰" + "─" * (region.width - 2) + "╯"
+        self._safe_add(screen, region.y, region.x, top, border_attr)
+        for row in range(1, region.height - 1):
+            self._safe_add(
+                screen,
+                region.y + row,
+                region.x,
+                "│" + " " * (region.width - 2) + "│",
+                border_attr,
+            )
+        self._safe_add(
+            screen,
+            region.y + region.height - 1,
+            region.x,
+            bottom,
+            border_attr,
+        )
+
+        self._safe_add(screen, region.y + 1, region.x + 2, label, curses.A_BOLD)
+
+        self._safe_add(
+            screen,
+            region.y + region.height - 2,
+            region.x + 2,
+            f"#{color}",
+            curses.A_BOLD,
+        )
         if self.colors_enabled and getattr(curses, "COLORS", 0) >= 256:
-            pair_number = 20 + number
+            pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
             background = rgb_to_xterm_index(color)
-            luminance = sum(int(color[i : i + 2], 16) * weight for i, weight in zip((0, 2, 4), (299, 587, 114))) / 1000
+            luminance = sum(
+                int(color[offset : offset + 2], 16) * weight
+                for offset, weight in zip((0, 2, 4), (299, 587, 114))
+            ) / 1000
             foreground = 16 if luminance > 145 else 231
             try:
                 curses.init_pair(pair_number, foreground, background)
-                swatch = " " * max(4, width - 13)
-                self._safe_add(screen, y + 3, x + width - len(swatch) - 2, swatch, curses.color_pair(pair_number))
+                swatch_width = max(3, region.width - 13)
+                self._safe_add(
+                    screen,
+                    region.y + region.height - 2,
+                    region.x + region.width - swatch_width - 2,
+                    " " * swatch_width,
+                    curses.color_pair(pair_number),
+                )
             except curses.error:
                 pass
 

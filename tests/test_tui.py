@@ -9,6 +9,7 @@ from okeylitctl.tui import (
     TuiCommand,
     handle_key,
     initialize_colors,
+    keyboard_region_geometry,
     rgb_to_xterm_index,
     set_cursor_visibility,
 )
@@ -77,6 +78,21 @@ class TuiInteractionTests(unittest.TestCase):
         self.assertEqual(rgb_to_xterm_index("FF0000"), 196)
         self.assertEqual(rgb_to_xterm_index("FFFFFF"), 231)
 
+    def test_keyboard_visualization_uses_regions_not_individual_keys(self):
+        regions = keyboard_region_geometry(100)
+        left = regions[Zone.LEFT]
+        center = regions[Zone.CENTER]
+        right = regions[Zone.RIGHT]
+        wasd = regions[Zone.WASD]
+
+        self.assertLess(left.x + left.width, center.x)
+        self.assertLess(center.x + center.width, right.x)
+        self.assertGreater(right.width, left.width)
+        self.assertGreaterEqual(wasd.x, left.x)
+        self.assertLessEqual(wasd.x + wasd.width, left.x + left.width)
+        self.assertGreaterEqual(wasd.y, left.y)
+        self.assertLessEqual(wasd.y + wasd.height, left.y + left.height)
+
     def test_cursor_visibility_is_an_optional_terminal_capability(self):
         with mock.patch("okeylitctl.tui.curses.curs_set", side_effect=curses.error):
             set_cursor_visibility(0)
@@ -119,6 +135,84 @@ class FakeBackend:
 
 
 class TuiDeviceActionTests(unittest.TestCase):
+    def test_workspace_draws_coarse_keyboard_regions(self):
+        backend = FakeBackend()
+        app = CursesTui(backend)
+
+        class RecordingScreen:
+            def __init__(self):
+                self.text = []
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, _y, _x, text, _limit, _attr):
+                self.text.append(text)
+
+            def refresh(self):
+                return None
+
+        screen = RecordingScreen()
+        app._draw(screen)
+        rendered = " ".join(screen.text)
+
+        self.assertIn("LEFT REGION", rendered)
+        self.assertIn("WASD REGION", rendered)
+        self.assertIn("CENTER REGION", rendered)
+        self.assertIn("RIGHT + ARROWS + NUMPAD", rendered)
+        self.assertNotIn("BACKSPACE", rendered)
+
+    def test_keyboard_region_rendering_preserves_boundaries_and_all_four_colors(self):
+        backend = FakeBackend()
+        app = CursesTui(backend)
+
+        class BufferScreen:
+            def __init__(self, width):
+                self.width = width
+                self.height = 30
+                self.cells = [[" " for _ in range(width)] for _ in range(self.height)]
+
+            def getmaxyx(self):
+                return (self.height, self.width)
+
+            def erase(self):
+                self.cells = [
+                    [" " for _ in range(self.width)] for _ in range(self.height)
+                ]
+
+            def addnstr(self, y, x, text, limit, _attr):
+                for offset, character in enumerate(text[:limit]):
+                    if 0 <= y < self.height and 0 <= x + offset < self.width:
+                        self.cells[y][x + offset] = character
+
+            def refresh(self):
+                return None
+
+            def row(self, y):
+                return "".join(self.cells[y])
+
+        for width in (78, 79, 100, 140):
+            with self.subTest(width=width):
+                screen = BufferScreen(width)
+                app._draw(screen)
+                regions = keyboard_region_geometry(width)
+
+                for zone in (Zone.LEFT, Zone.CENTER, Zone.RIGHT):
+                    region = regions[zone]
+                    for y in range(region.y + 1, region.y + region.height - 1):
+                        self.assertEqual(screen.cells[y][region.x], "│")
+                        self.assertEqual(
+                            screen.cells[y][region.x + region.width - 1], "│"
+                        )
+
+                visualization = "\n".join(screen.row(y) for y in range(5, 11))
+                self.assertIn("#333333", visualization)
+                self.assertIn("#444444", visualization)
+                self.assertIn("WASD REGION", visualization)
+
     def test_apply_refuses_to_write_when_draft_is_unchanged(self):
         backend = FakeBackend()
         app = CursesTui(backend)
