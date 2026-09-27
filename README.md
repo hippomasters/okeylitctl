@@ -12,7 +12,7 @@ A restricted Linux controller for HP OMEN four-zone keyboard RGB lighting throug
 | SKU | `B21E3PA#ACJ` |
 | Board | `8BAB` |
 | BIOS | `F.26` |
-| Keyboard type | HP WMI `0x02` — four-zone without numpad |
+| Keyboard type | HP WMI `0x02` — four zones, with the numpad included in the Right zone |
 | Tested kernel | Arch Linux `7.2.6-arch2-1` |
 
 Hardware testing confirmed RGB read/write/readback, restore, and read-only power-state reporting on September 26, 2026. Software power writes are intentionally not exposed because repeated off/on cycles were not reliable on the validated firmware; use the laptop's physical keyboard-light key for power control.
@@ -23,7 +23,7 @@ The four values passed to `okeylitctl colors` use firmware order, not physical l
 
 | Value position | HP lighting-zone name | Physical area |
 |---:|---|---|
-| 1 | Right zone | Far-right section, including Backspace and Enter |
+| 1 | Right zone | Far-right section, including Backspace, Enter, and the numpad |
 | 2 | Center zone | Center section |
 | 3 | Left zone | Left section outside the dedicated WASD group |
 | 4 | WASD zone | W, A, S, D area |
