@@ -10,6 +10,7 @@ from typing import Callable, Sequence, TextIO
 
 from . import __version__
 from .models import ColorLayout, Zone
+from .profiles import ProfileError, ProfileStore, normalize_profile_name
 from .sysfs import (
     BackendIOError,
     ModuleUnavailable,
@@ -43,6 +44,16 @@ def _parser() -> argparse.ArgumentParser:
     named.add_argument("--left", action="append", metavar="RRGGBB")
     named.add_argument("--wasd", action="append", metavar="RRGGBB")
 
+    profile = commands.add_parser("profile", help="manage saved local layouts")
+    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
+    profile_save = profile_commands.add_parser("save", help="save the active layout")
+    profile_save.add_argument("name", metavar="NAME")
+    profile_load = profile_commands.add_parser("load", help="apply a saved layout")
+    profile_load.add_argument("name", metavar="NAME")
+    profile_commands.add_parser("list", help="list saved layouts")
+    profile_delete = profile_commands.add_parser("delete", help="delete a saved layout")
+    profile_delete.add_argument("name", metavar="NAME")
+
     commands.add_parser("restore", help="restore colors saved when the module loaded")
     commands.add_parser("tui", help="open the interactive four-zone workspace")
     return parser
@@ -58,6 +69,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     backend: SysfsBackend | None = None,
+    profile_store: ProfileStore | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
     tui_runner: Callable[[SysfsBackend], None] | None = None,
@@ -134,6 +146,26 @@ def main(
             value = layout.to_wire()
             backend.write_colors(value)
             stdout.write(f"Keyboard colors updated: {value}\n")
+        elif args.command == "profile" and args.profile_command == "save":
+            store = profile_store or ProfileStore()
+            name = normalize_profile_name(args.name)
+            status = backend.status()
+            layout = ColorLayout.from_wire(",".join(status["colors"]))
+            store.save(name, layout)
+            stdout.write(f"Saved profile: {name}\n")
+        elif args.command == "profile" and args.profile_command == "load":
+            store = profile_store or ProfileStore()
+            layout = store.load(args.name)
+            backend.write_colors(layout.to_wire())
+            stdout.write(f"Loaded and applied profile: {args.name}\n")
+        elif args.command == "profile" and args.profile_command == "list":
+            store = profile_store or ProfileStore()
+            for name in store.list_names():
+                stdout.write(f"{name}\n")
+        elif args.command == "profile" and args.profile_command == "delete":
+            store = profile_store or ProfileStore()
+            store.delete(args.name)
+            stdout.write(f"Deleted profile: {args.name}\n")
         elif args.command == "restore":
             backend.restore()
             stdout.write("Restored the colors saved when the module loaded.\n")
@@ -141,8 +173,9 @@ def main(
             if tui_runner is None:
                 from .tui import run_tui
 
-                tui_runner = run_tui
-            tui_runner(backend)
+                run_tui(backend, profile_store=profile_store)
+            else:
+                tui_runner(backend)
         else:  # argparse requires a known subcommand; retain fail-closed behavior.
             parser.error("unknown command")
         stdout.flush()
@@ -150,6 +183,9 @@ def main(
     except ValidationError as exc:
         stderr.write(f"{APP_NAME}: {exc}\n")
         return 2
+    except ProfileError as exc:
+        stderr.write(f"{APP_NAME}: {exc}\n")
+        return 7
     except ModuleUnavailable as exc:
         stderr.write(f"{APP_NAME}: {exc}\n")
         stderr.write("Hint: load the omen_rgb kernel module first.\n")

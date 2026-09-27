@@ -37,12 +37,13 @@ class TuiInteractionTests(unittest.TestCase):
         self.assertEqual(handle_key(self.state, ord("o")), TuiCommand.RESTORE)
         self.assertEqual(handle_key(self.state, ord("r")), TuiCommand.REFRESH)
         self.assertEqual(handle_key(self.state, ord("e")), TuiCommand.EDIT)
+        self.assertEqual(handle_key(self.state, ord("m")), TuiCommand.PROFILES)
         self.assertEqual(handle_key(self.state, ord("q")), TuiCommand.QUIT)
 
     def test_undersized_mode_suppresses_every_action_except_quit(self):
         self.state.set_selected_color("FFFFFF")
 
-        for key in (ord("a"), ord("o"), ord("r"), ord("e"), ord("p")):
+        for key in (ord("a"), ord("o"), ord("r"), ord("e"), ord("m"), ord("p")):
             with self.subTest(key=key):
                 self.assertEqual(
                     handle_key(self.state, key, actions_enabled=False),
@@ -134,7 +135,162 @@ class FakeBackend:
         self.restores += 1
 
 
+class FakeProfileStore:
+    def __init__(self):
+        self.calls = []
+        self.layouts = {
+            "Work": ColorLayout.from_wire("ABCDEF,123456,654321,FEDCBA")
+        }
+
+    def list_names(self):
+        self.calls.append(("list",))
+        return tuple(sorted(self.layouts))
+
+    def load(self, name):
+        self.calls.append(("load", name))
+        return self.layouts[name]
+
+    def save(self, name, layout, *, overwrite=False):
+        self.calls.append(("save", name, layout.to_wire(), overwrite))
+        self.layouts[name] = layout
+
+    def delete(self, name):
+        self.calls.append(("delete", name))
+        del self.layouts[name]
+
+
 class TuiDeviceActionTests(unittest.TestCase):
+    def test_profile_load_changes_only_the_local_draft(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+
+        app._load_profile("Work")
+
+        self.assertEqual(
+            app.state.draft.to_wire(), "ABCDEF,123456,654321,FEDCBA"
+        )
+        self.assertEqual(
+            app.state.current.to_wire(), "111111,222222,333333,444444"
+        )
+        self.assertEqual(backend.writes, [])
+        self.assertEqual(profiles.calls, [("load", "Work")])
+        self.assertIn("locally", app.state.message)
+
+    def test_profile_save_persists_the_local_draft_without_applying(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+        app.state.set_selected_color("A1B2C3")
+
+        app._save_profile("Draft")
+
+        self.assertEqual(backend.writes, [])
+        self.assertEqual(
+            profiles.calls,
+            [("save", "Draft", "A1B2C3,222222,333333,444444", False)],
+        )
+        self.assertIn("Draft", app.state.message)
+
+    def test_profile_delete_does_not_touch_the_device(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+
+        app._delete_profile("Work")
+
+        self.assertEqual(backend.writes, [])
+        self.assertEqual(profiles.calls, [("delete", "Work")])
+        self.assertIn("Work", app.state.message)
+
+    def test_profile_manager_enter_loads_selected_profile_locally(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+
+        class MenuScreen:
+            def getmaxyx(self):
+                return (30, 100)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return 10
+
+        app._profile_manager(MenuScreen())
+
+        self.assertEqual(
+            app.state.draft.to_wire(), "ABCDEF,123456,654321,FEDCBA"
+        )
+        self.assertEqual(profiles.calls, [("list",), ("load", "Work")])
+        self.assertEqual(backend.writes, [])
+
+    def test_profile_manager_saves_named_draft_without_applying(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+        app.state.set_selected_color("A1B2C3")
+
+        class MenuScreen:
+            def __init__(self):
+                self.keys = iter((ord("s"), 27))
+
+            def getmaxyx(self):
+                return (30, 100)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return next(self.keys)
+
+            def getstr(self, *_args):
+                return b"Draft"
+
+        with mock.patch("okeylitctl.tui.curses.echo"), mock.patch(
+            "okeylitctl.tui.curses.noecho"
+        ):
+            app._profile_manager(MenuScreen())
+
+        self.assertEqual(backend.writes, [])
+        self.assertIn(
+            ("save", "Draft", "A1B2C3,222222,333333,444444", False),
+            profiles.calls,
+        )
+
+    def test_profile_manager_requires_confirmation_before_delete(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+
+        class MenuScreen:
+            def __init__(self):
+                self.keys = iter((ord("d"), ord("y"), 27))
+
+            def getmaxyx(self):
+                return (30, 100)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return next(self.keys)
+
+        app._profile_manager(MenuScreen())
+
+        self.assertEqual(backend.writes, [])
+        self.assertIn(("delete", "Work"), profiles.calls)
+
     def test_workspace_draws_coarse_keyboard_regions(self):
         backend = FakeBackend()
         app = CursesTui(backend)

@@ -9,6 +9,7 @@ from typing import Any
 
 from . import __version__
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
+from .profiles import ProfileError, ProfileStore
 from .sysfs import SysfsBackend, SysfsError
 from .tui_state import TuiState
 from .validation import ValidationError
@@ -30,6 +31,7 @@ class TuiCommand(Enum):
     RESTORE = auto()
     REFRESH = auto()
     EDIT = auto()
+    PROFILES = auto()
     QUIT = auto()
 
 
@@ -157,6 +159,8 @@ def handle_key(
         return TuiCommand.REFRESH
     elif key == ord("e"):
         return TuiCommand.EDIT
+    elif key == ord("m"):
+        return TuiCommand.PROFILES
     elif key == ord("q"):
         return TuiCommand.QUIT
     return TuiCommand.NONE
@@ -165,8 +169,9 @@ def handle_key(
 class CursesTui:
     """Interactive adapter; all editing remains local until Apply."""
 
-    def __init__(self, backend: SysfsBackend):
+    def __init__(self, backend: SysfsBackend, profile_store: ProfileStore | None = None):
         self.backend = backend
+        self.profile_store = profile_store or ProfileStore()
         self.power_state = "unknown"
         self.colors_enabled = False
         self.state = self._load_state()
@@ -208,6 +213,8 @@ class CursesTui:
                 self._refresh()
             elif command is TuiCommand.EDIT:
                 self._edit_color(screen)
+            elif command is TuiCommand.PROFILES:
+                self._profile_manager(screen)
 
     @staticmethod
     def _safe_add(screen: Any, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -266,7 +273,7 @@ class CursesTui:
         self._safe_add(screen, 20, 2, f"PRESET  {preset}", curses.A_BOLD)
         self._safe_add(screen, 20, 24, "P cycles presets  ·  E enters an exact hex color", curses.A_DIM)
         self._safe_add(screen, height - 3, 2, self.state.message, good if not self.state.dirty else warn)
-        footer = "←/→ zone   ↑/↓ channel   +/- fine   [/ ] coarse   A apply   O original   R refresh   ? help   Q quit"
+        footer = "←/→ zone  ↑/↓ channel  +/- fine  [/ ] coarse  A apply  M profiles  O original  R refresh  ? help  Q quit"
         self._safe_add(screen, height - 1, 1, footer, curses.A_REVERSE)
 
         if self.state.help_visible:
@@ -398,6 +405,7 @@ class CursesTui:
             "+ -           Adjust by one    [ ] adjust by sixteen",
             "E             Enter an exact six-digit hex color",
             "P             Cycle curated local presets",
+            "M             Open the local profile manager",
             "A             Apply and verify the complete four-zone layout",
             "O             Restore the module's original layout",
             "X             Discard unapplied local edits",
@@ -417,6 +425,132 @@ class CursesTui:
             attr = curses.A_REVERSE | (curses.A_BOLD if row == 0 else 0)
             self._safe_add(screen, y + 1 + row, x + 2, line, attr)
 
+    def _profile_manager(self, screen: Any) -> None:
+        selected = 0
+        pending_delete: str | None = None
+        while True:
+            try:
+                names = self.profile_store.list_names()
+            except ProfileError as exc:
+                self.state.message = f"Profile manager failed: {exc}"
+                return
+
+            if names:
+                selected = min(selected, len(names) - 1)
+            else:
+                selected = 0
+            self._draw_profile_manager(screen, names, selected, pending_delete)
+            try:
+                key = screen.getch()
+            except curses.error:
+                self.state.message = "Profile manager closed after terminal error"
+                return
+
+            if pending_delete is not None:
+                if key in (ord("y"), ord("Y")):
+                    self._delete_profile(pending_delete)
+                    pending_delete = None
+                elif key in (ord("n"), ord("N"), 27):
+                    pending_delete = None
+                continue
+
+            if key in (27, ord("m"), ord("q")):
+                return
+            if key == curses.KEY_RESIZE:
+                continue
+            if key == curses.KEY_UP and names:
+                selected = (selected - 1) % len(names)
+            elif key == curses.KEY_DOWN and names:
+                selected = (selected + 1) % len(names)
+            elif key in (10, 13, curses.KEY_ENTER) and names:
+                self._load_profile(names[selected])
+                return
+            elif key == ord("s"):
+                name = self._prompt_profile_name(screen)
+                if name:
+                    self._save_profile(name)
+            elif key == ord("d") and names:
+                pending_delete = names[selected]
+
+    def _draw_profile_manager(
+        self,
+        screen: Any,
+        names: tuple[str, ...],
+        selected: int,
+        pending_delete: str | None = None,
+    ) -> None:
+        height, width = screen.getmaxyx()
+        box_width = min(56, width - 6)
+        visible = min(10, max(1, height - 10))
+        box_height = visible + 7
+        y = max(1, (height - box_height) // 2)
+        x = max(2, (width - box_width) // 2)
+        for row in range(box_height):
+            self._safe_add(screen, y + row, x, " " * box_width, curses.A_REVERSE)
+        self._safe_add(
+            screen,
+            y + 1,
+            x + 2,
+            "LOCAL PROFILES",
+            curses.A_REVERSE | curses.A_BOLD,
+        )
+        self._safe_add(
+            screen,
+            y + 2,
+            x + 2,
+            "Enter load locally  ·  S save draft  ·  Esc close",
+            curses.A_REVERSE,
+        )
+        if not names:
+            self._safe_add(
+                screen,
+                y + 4,
+                x + 2,
+                "No saved profiles",
+                curses.A_REVERSE | curses.A_DIM,
+            )
+        else:
+            start = max(0, min(selected - visible + 1, len(names) - visible))
+            for row, name in enumerate(names[start : start + visible]):
+                index = start + row
+                marker = "▶" if index == selected else " "
+                attr = curses.A_REVERSE | (curses.A_BOLD if index == selected else 0)
+                self._safe_add(screen, y + 4 + row, x + 2, f"{marker} {name}", attr)
+        if pending_delete is not None:
+            self._safe_add(
+                screen,
+                y + box_height - 2,
+                x + 2,
+                f"Delete {pending_delete}? Y confirm · N cancel",
+                curses.A_REVERSE | curses.A_BOLD,
+            )
+        try:
+            screen.refresh()
+        except curses.error:
+            pass
+
+    def _prompt_profile_name(self, screen: Any) -> str | None:
+        height, width = screen.getmaxyx()
+        prompt = "Profile name (letters, digits, _ or -): "
+        row = max(1, height - 3)
+        self._safe_add(screen, row, 2, " " * max(0, width - 4))
+        self._safe_add(screen, row, 2, prompt, curses.A_BOLD)
+        try:
+            screen.refresh()
+            curses.echo()
+            set_cursor_visibility(1)
+            raw = screen.getstr(row, 2 + len(prompt), 32).decode("ascii")
+            return raw or None
+        except (UnicodeDecodeError, curses.error):
+            self.state.message = "Profile name entry cancelled"
+            return None
+        finally:
+            try:
+                curses.noecho()
+            except curses.error:
+                pass
+            set_cursor_visibility(0)
+
     def _apply(self) -> None:
         if not self.state.dirty:
             self.state.message = "No unapplied changes"
@@ -426,6 +560,28 @@ class CursesTui:
             self.state.mark_applied()
         except SysfsError as exc:
             self.state.message = f"Apply failed: {exc}"
+
+    def _load_profile(self, name: str) -> None:
+        try:
+            self.state.draft = self.profile_store.load(name)
+            self.state.preset_index = -1
+            self.state.message = f"Profile loaded locally: {name} — press A to apply"
+        except ProfileError as exc:
+            self.state.message = f"Profile load failed: {exc}"
+
+    def _save_profile(self, name: str) -> None:
+        try:
+            self.profile_store.save(name, self.state.draft)
+            self.state.message = f"Saved local profile: {name}"
+        except ProfileError as exc:
+            self.state.message = f"Profile save failed: {exc}"
+
+    def _delete_profile(self, name: str) -> None:
+        try:
+            self.profile_store.delete(name)
+            self.state.message = f"Deleted local profile: {name}"
+        except ProfileError as exc:
+            self.state.message = f"Profile delete failed: {exc}"
 
     def _restore(self) -> None:
         if self.state.current == self.state.original and not self.state.dirty:
@@ -472,6 +628,9 @@ class CursesTui:
             set_cursor_visibility(0)
 
 
-def run_tui(backend: SysfsBackend | None = None) -> None:
+def run_tui(
+    backend: SysfsBackend | None = None,
+    profile_store: ProfileStore | None = None,
+) -> None:
     """Load verified device state and start the curses application."""
-    CursesTui(backend or SysfsBackend()).run()
+    CursesTui(backend or SysfsBackend(), profile_store=profile_store).run()

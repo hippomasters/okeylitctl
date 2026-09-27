@@ -3,6 +3,7 @@ import json
 import unittest
 
 from okeylitctl.cli import main
+from okeylitctl.models import ColorLayout
 from okeylitctl.sysfs import ModuleUnavailable, PermissionDenied, UnsupportedABI
 
 
@@ -33,12 +34,118 @@ class FakeBackend:
         self.calls.append(("restore", None))
 
 
+class FakeProfileStore:
+    def __init__(self):
+        self.calls = []
+        self.layouts = {
+            "Work": ColorLayout.from_wire("111111,222222,333333,444444")
+        }
+
+    def save(self, name, layout, *, overwrite=False):
+        self.calls.append(("save", name, layout.to_wire(), overwrite))
+        self.layouts[name] = layout
+
+    def load(self, name):
+        self.calls.append(("load", name))
+        return self.layouts[name]
+
+    def list_names(self):
+        self.calls.append(("list",))
+        return tuple(sorted(self.layouts))
+
+    def delete(self, name):
+        self.calls.append(("delete", name))
+        del self.layouts[name]
+
+
 class CliTests(unittest.TestCase):
-    def run_cli(self, *argv, backend=None):
+    def run_cli(self, *argv, backend=None, profile_store=None):
         out, err = io.StringIO(), io.StringIO()
         backend = backend or FakeBackend()
-        code = main(list(argv), backend=backend, stdout=out, stderr=err)
+        code = main(
+            list(argv),
+            backend=backend,
+            profile_store=profile_store,
+            stdout=out,
+            stderr=err,
+        )
         return code, out.getvalue(), err.getvalue(), backend
+
+    def test_profile_save_captures_current_complete_layout(self):
+        profiles = FakeProfileStore()
+
+        code, out, err, backend = self.run_cli(
+            "profile", "save", "Gaming", profile_store=profiles
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(
+            profiles.calls,
+            [("save", "Gaming", "FF0000,00FF00,0000FF,FFFFFF", False)],
+        )
+        self.assertIn("Gaming", out)
+
+    def test_profile_save_validates_name_before_device_access(self):
+        backend = FakeBackend()
+        backend.status = lambda: self.fail("invalid profile name must not read device")
+        profiles = FakeProfileStore()
+
+        code, _, err, backend = self.run_cli(
+            "profile", "save", "../escape", backend=backend, profile_store=profiles
+        )
+
+        self.assertEqual(code, 7)
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(profiles.calls, [])
+        self.assertIn("profile name", err)
+
+    def test_profile_load_performs_one_complete_layout_write(self):
+        profiles = FakeProfileStore()
+
+        code, out, err, backend = self.run_cli(
+            "profile", "load", "Work", profile_store=profiles
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(profiles.calls, [("load", "Work")])
+        self.assertEqual(
+            backend.calls,
+            [("colors", "111111,222222,333333,444444")],
+        )
+        self.assertIn("Work", out)
+
+    def test_profile_list_does_not_access_the_device(self):
+        profiles = FakeProfileStore()
+        backend = FakeBackend()
+        backend.status = lambda: self.fail("profile list must not read the device")
+
+        code, out, err, backend = self.run_cli(
+            "profile", "list", backend=backend, profile_store=profiles
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(profiles.calls, [("list",)])
+        self.assertEqual(out, "Work\n")
+
+    def test_profile_delete_does_not_access_the_device(self):
+        profiles = FakeProfileStore()
+        backend = FakeBackend()
+        backend.status = lambda: self.fail("profile delete must not read the device")
+
+        code, out, err, backend = self.run_cli(
+            "profile", "delete", "Work", backend=backend, profile_store=profiles
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(profiles.calls, [("delete", "Work")])
+        self.assertIn("Work", out)
 
     def test_tui_command_launches_with_the_same_backend(self):
         out, err = io.StringIO(), io.StringIO()
@@ -50,7 +157,7 @@ class CliTests(unittest.TestCase):
             backend=backend,
             stdout=out,
             stderr=err,
-            tui_runner=lambda received: launched.append(received),
+            tui_runner=lambda received_backend: launched.append(received_backend),
         )
 
         self.assertEqual(code, 0)

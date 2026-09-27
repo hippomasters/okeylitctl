@@ -13,6 +13,7 @@ DEST="/usr/src/${MODULE}-${DRIVER_VERSION}"
 CLI_DEST="/usr/local/bin/okeylitctl"
 LEGACY_CLI_DEST="/usr/local/bin/omen-rgb"
 LOAD_DEST="/etc/modules-load.d/omen-rgb.conf"
+PROFILE_DIR="/var/lib/okeylitctl"
 TMP=""
 COMPLETE=0
 CREATED_DEST=0
@@ -20,6 +21,7 @@ DKMS_ADDED=0
 INSTALLED_CLI=0
 INSTALLED_LOAD=0
 MAY_HAVE_LOADED=0
+CREATED_PROFILE_DIR=0
 
 cleanup()
 {
@@ -32,6 +34,9 @@ cleanup()
         fi
         [ "$INSTALLED_LOAD" -ne 1 ] || rm -f -- "$LOAD_DEST"
         [ "$INSTALLED_CLI" -ne 1 ] || rm -f -- "$CLI_DEST"
+        if [ "$CREATED_PROFILE_DIR" -eq 1 ] && [ -d "$PROFILE_DIR" ] && [ ! -L "$PROFILE_DIR" ]; then
+            rmdir -- "$PROFILE_DIR" 2>/dev/null || true
+        fi
         if [ "$DKMS_ADDED" -eq 1 ]; then
             dkms remove -m "$MODULE" -v "$DRIVER_VERSION" --all >/dev/null 2>&1 || true
         fi
@@ -50,7 +55,7 @@ if [ "$(id -u)" -ne 0 ]; then
     printf '%s\n' "install-dkms.sh must be run as root" >&2
     exit 1
 fi
-for command in dkms make python3 install modprobe mktemp; do
+for command in dkms make python3 install modprobe mktemp stat; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'missing required command: %s\n' "$command" >&2
         exit 1
@@ -59,6 +64,21 @@ done
 if [ -d /sys/module/omen_rgb ]; then
     printf '%s\n' "omen_rgb is already loaded; unload it before installing" >&2
     exit 1
+fi
+
+if [ -L "$PROFILE_DIR" ] || { [ -e "$PROFILE_DIR" ] && [ ! -d "$PROFILE_DIR" ]; }; then
+    printf 'refusing unsafe profile path: %s\n' "$PROFILE_DIR" >&2
+    exit 1
+fi
+if [ -d "$PROFILE_DIR" ]; then
+    if [ "$(stat -c %u -- "$PROFILE_DIR")" != 0 ] || \
+       [ "$(stat -c %a -- "$PROFILE_DIR")" != 700 ]; then
+        printf 'refusing unsafe profile directory ownership or mode: %s\n' "$PROFILE_DIR" >&2
+        exit 1
+    fi
+else
+    install -d -o root -g root -m 0700 "$PROFILE_DIR"
+    CREATED_PROFILE_DIR=1
 fi
 
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)

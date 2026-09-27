@@ -24,6 +24,11 @@ class InstallerSafetyTests(unittest.TestCase):
         self.assertIn('CLI_DEST="/usr/local/bin/okeylitctl"', source)
         self.assertIn("-m okeylitctl.cli:entrypoint", source)
 
+    def test_installer_creates_a_root_only_profile_directory(self):
+        source = (ROOT / "scripts" / "install-dkms.sh").read_text(encoding="utf-8")
+        self.assertIn('PROFILE_DIR="/var/lib/okeylitctl"', source)
+        self.assertIn('install -d -o root -g root -m 0700 "$PROFILE_DIR"', source)
+
     def test_public_and_internal_versions_are_explicitly_separate(self):
         for script in ("install-dkms.sh", "uninstall.sh"):
             source = (ROOT / "scripts" / script).read_text(encoding="utf-8")
