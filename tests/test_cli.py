@@ -108,6 +108,66 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("updated", out.lower())
 
+    def test_named_set_updates_selected_zones_as_one_complete_layout(self):
+        code, out, err, backend = self.run_cli(
+            "set", "--right", "abcdef", "--wasd", "123456"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            backend.calls,
+            [("colors", "ABCDEF,00FF00,0000FF,123456")],
+        )
+        self.assertIn("ABCDEF,00FF00,0000FF,123456", out)
+
+    def test_named_set_all_creates_a_uniform_complete_layout(self):
+        code, _, err, backend = self.run_cli("set", "--all", "a1b2c3")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            backend.calls,
+            [("colors", "A1B2C3,A1B2C3,A1B2C3,A1B2C3")],
+        )
+
+    def test_named_set_rejects_empty_or_conflicting_requests(self):
+        for argv in (("set",), ("set", "--all", "FFFFFF", "--left", "000000")):
+            with self.subTest(argv=argv):
+                code, _, err, backend = self.run_cli(*argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(backend.calls, [])
+                self.assertIn("set", err.lower())
+
+    def test_named_set_validates_before_reading_or_writing_device(self):
+        backend = FakeBackend()
+        backend.status = lambda: self.fail("invalid color must not read the device")
+
+        code, _, err, backend = self.run_cli(
+            "set", "--center", "not-a-color", backend=backend
+        )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(backend.calls, [])
+        self.assertIn("RRGGBB", err)
+
+    def test_named_set_rejects_repeated_options_before_device_access(self):
+        for argv in (
+            ("set", "--right", "not-a-color", "--right", "ABCDEF"),
+            ("set", "--all", "111111", "--all", "222222"),
+        ):
+            with self.subTest(argv=argv):
+                backend = FakeBackend()
+                backend.status = lambda: self.fail(
+                    "repeated options must not read the device"
+                )
+
+                code, _, err, backend = self.run_cli(*argv, backend=backend)
+
+                self.assertEqual(code, 2)
+                self.assertEqual(backend.calls, [])
+                self.assertTrue("RRGGBB" in err or "repeated" in err.lower())
+
     def test_state_mutation_command_is_not_exposed(self):
         code, _, err, backend = self.run_cli("state", "off")
         self.assertEqual(code, 2)

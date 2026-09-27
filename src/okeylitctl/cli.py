@@ -9,6 +9,7 @@ import sys
 from typing import Callable, Sequence, TextIO
 
 from . import __version__
+from .models import ColorLayout, Zone
 from .sysfs import (
     BackendIOError,
     ModuleUnavailable,
@@ -16,7 +17,7 @@ from .sysfs import (
     SysfsBackend,
     UnsupportedABI,
 )
-from .validation import ValidationError, normalize_colors
+from .validation import ValidationError, normalize_color, normalize_colors
 
 APP_NAME = "okeylitctl"
 
@@ -34,6 +35,13 @@ def _parser() -> argparse.ArgumentParser:
 
     colors = commands.add_parser("colors", help="set all four RGB zones atomically")
     colors.add_argument("value", metavar="RRGGBB,RRGGBB,RRGGBB,RRGGBB")
+
+    named = commands.add_parser("set", help="update zones by physical name")
+    named.add_argument("--all", dest="all_color", action="append", metavar="RRGGBB")
+    named.add_argument("--right", action="append", metavar="RRGGBB")
+    named.add_argument("--center", action="append", metavar="RRGGBB")
+    named.add_argument("--left", action="append", metavar="RRGGBB")
+    named.add_argument("--wasd", action="append", metavar="RRGGBB")
 
     commands.add_parser("restore", help="restore colors saved when the module loaded")
     commands.add_parser("tui", help="open the interactive four-zone workspace")
@@ -76,6 +84,54 @@ def main(
                 _print_status(status, stdout)
         elif args.command == "colors":
             value = normalize_colors(args.value)
+            backend.write_colors(value)
+            stdout.write(f"Keyboard colors updated: {value}\n")
+        elif args.command == "set":
+            raw_named_values = {
+                Zone.RIGHT: args.right or [],
+                Zone.CENTER: args.center or [],
+                Zone.LEFT: args.left or [],
+                Zone.WASD: args.wasd or [],
+            }
+            raw_all_values = args.all_color or []
+
+            normalized_named_values = {
+                zone: [normalize_color(value) for value in values]
+                for zone, values in raw_named_values.items()
+            }
+            normalized_all_values = [normalize_color(value) for value in raw_all_values]
+
+            repeated = [
+                f"--{zone.value.lower()}"
+                for zone, values in normalized_named_values.items()
+                if len(values) > 1
+            ]
+            if len(normalized_all_values) > 1:
+                repeated.append("--all")
+            if repeated:
+                raise ValidationError(f"set option cannot be repeated: {', '.join(repeated)}")
+
+            provided = {
+                zone: values[0]
+                for zone, values in normalized_named_values.items()
+                if values
+            }
+            if normalized_all_values and provided:
+                raise ValidationError("set --all cannot be combined with named zones")
+            if not normalized_all_values and not provided:
+                raise ValidationError("set requires --all or at least one named zone")
+
+            if normalized_all_values:
+                color = normalized_all_values[0]
+                layout = ColorLayout(color, color, color, color)
+            else:
+                status = backend.status()
+                layout = ColorLayout.from_wire(",".join(status["colors"]))
+                for zone in (Zone.RIGHT, Zone.CENTER, Zone.LEFT, Zone.WASD):
+                    if zone in provided:
+                        layout = layout.with_zone(zone, provided[zone])
+
+            value = layout.to_wire()
             backend.write_colors(value)
             stdout.write(f"Keyboard colors updated: {value}\n")
         elif args.command == "restore":
