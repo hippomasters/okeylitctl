@@ -6,7 +6,7 @@ import argparse
 import contextlib
 import json
 import sys
-from typing import Sequence, TextIO
+from typing import Callable, Sequence, TextIO
 
 from . import __version__
 from .sysfs import (
@@ -36,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     colors.add_argument("value", metavar="RRGGBB,RRGGBB,RRGGBB,RRGGBB")
 
     commands.add_parser("restore", help="restore colors saved when the module loaded")
+    commands.add_parser("tui", help="open the interactive four-zone workspace")
     return parser
 
 
@@ -51,6 +52,7 @@ def main(
     backend: SysfsBackend | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
+    tui_runner: Callable[[SysfsBackend], None] | None = None,
 ) -> int:
     """Run the CLI and return a stable process exit code."""
     stdout = stdout or sys.stdout
@@ -79,6 +81,12 @@ def main(
         elif args.command == "restore":
             backend.restore()
             stdout.write("Restored the colors saved when the module loaded.\n")
+        elif args.command == "tui":
+            if tui_runner is None:
+                from .tui import run_tui
+
+                tui_runner = run_tui
+            tui_runner(backend)
         else:  # argparse requires a known subcommand; retain fail-closed behavior.
             parser.error("unknown command")
         stdout.flush()

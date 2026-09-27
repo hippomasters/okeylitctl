@@ -40,6 +40,24 @@ class CliTests(unittest.TestCase):
         code = main(list(argv), backend=backend, stdout=out, stderr=err)
         return code, out.getvalue(), err.getvalue(), backend
 
+    def test_tui_command_launches_with_the_same_backend(self):
+        out, err = io.StringIO(), io.StringIO()
+        backend = FakeBackend()
+        launched = []
+
+        code = main(
+            ["tui"],
+            backend=backend,
+            stdout=out,
+            stderr=err,
+            tui_runner=lambda received: launched.append(received),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(launched, [backend])
+
     def test_public_command_name_is_okeylitctl(self):
         code, out, err, _ = self.run_cli("--help")
         self.assertEqual(code, 0)
