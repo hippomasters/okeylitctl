@@ -12,6 +12,7 @@ from okeylitctl.tui import (
     keyboard_region_geometry,
     rgb_to_xterm_index,
     set_cursor_visibility,
+    workspace_frame,
 )
 from okeylitctl.tui_state import TuiState
 
@@ -93,6 +94,18 @@ class TuiInteractionTests(unittest.TestCase):
         self.assertLessEqual(wasd.x + wasd.width, left.x + left.width)
         self.assertGreaterEqual(wasd.y, left.y)
         self.assertLessEqual(wasd.y + wasd.height, left.y + left.height)
+
+    def test_workspace_is_centered_and_width_capped_on_large_terminals(self):
+        minimum = workspace_frame(24, 78)
+        self.assertEqual((minimum.x, minimum.y, minimum.width), (0, 0, 78))
+
+        large = workspace_frame(60, 180)
+        self.assertEqual(large.width, 132)
+        self.assertEqual(large.x, 24)
+        self.assertEqual(large.y, 18)
+
+        medium = workspace_frame(30, 100)
+        self.assertEqual(medium.y, 3)
 
     def test_cursor_visibility_is_an_optional_terminal_capability(self):
         with mock.patch("okeylitctl.tui.curses.curs_set", side_effect=curses.error):
@@ -236,14 +249,14 @@ class TuiDeviceActionTests(unittest.TestCase):
         )
         self.assertEqual(truncated.reads, 0)
 
-    def test_cancelled_apply_never_writes_and_dirty_quit_requires_confirmation(self):
+    def test_apply_is_immediate_and_quits_cleanly(self):
         backend = FakeBackend()
         app = CursesTui(backend, profile_store=FakeProfileStore())
         app.state.set_selected_color("A1B2C3")
 
         class ScriptedScreen:
             def __init__(self):
-                self.keys = iter((ord("a"), ord("n"), ord("q"), ord("y")))
+                self.keys = iter((ord("a"), ord("q")))
 
             def keypad(self, _enabled):
                 return None
@@ -266,17 +279,17 @@ class TuiDeviceActionTests(unittest.TestCase):
         with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
             app._main(ScriptedScreen())
 
-        self.assertEqual(backend.writes, [])
-        self.assertTrue(app.state.dirty)
+        self.assertEqual(backend.writes, ["A1B2C3,222222,333333,444444"])
+        self.assertFalse(app.state.dirty)
 
-    def test_confirmed_apply_writes_once_then_quits_cleanly(self):
+    def test_apply_does_not_consume_a_followup_key_as_confirmation(self):
         backend = FakeBackend()
         app = CursesTui(backend, profile_store=FakeProfileStore())
         app.state.set_selected_color("A1B2C3")
 
         class ScriptedScreen:
             def __init__(self):
-                self.keys = iter((ord("a"), ord("y"), ord("q")))
+                self.keys = iter((ord("a"), ord("n"), ord("q")))
 
             def keypad(self, _enabled):
                 return None
@@ -655,6 +668,111 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertIn("RIGHT + ARROWS + NUMPAD", rendered)
         self.assertNotIn("BACKSPACE", rendered)
 
+    def test_large_workspace_is_centered_with_live_draft_editor_and_command_bars(self):
+        backend = FakeBackend()
+        app = CursesTui(backend)
+        app.state.set_selected_color("A1B2C3")
+
+        class BufferScreen:
+            def __init__(self):
+                self.width = 180
+                self.height = 60
+                self.cells = [
+                    [" " for _ in range(self.width)] for _ in range(self.height)
+                ]
+
+            def getmaxyx(self):
+                return (self.height, self.width)
+
+            def erase(self):
+                self.cells = [
+                    [" " for _ in range(self.width)] for _ in range(self.height)
+                ]
+
+            def addnstr(self, y, x, text, limit, _attr):
+                for offset, character in enumerate(text[:limit]):
+                    if 0 <= y < self.height and 0 <= x + offset < self.width:
+                        self.cells[y][x + offset] = character
+
+            def refresh(self):
+                return None
+
+            def row(self, y):
+                return "".join(self.cells[y])
+
+        screen = BufferScreen()
+        app._draw(screen)
+        frame = workspace_frame(screen.height, screen.width)
+        visible = "\n".join(screen.row(y) for y in range(frame.y, frame.y + 24))
+        zone_area = "\n".join(
+            screen.row(y) for y in range(frame.y + 5, frame.y + 11)
+        )
+
+        self.assertIn("OKEYLITCTL", screen.row(frame.y))
+        self.assertNotIn("OKEYLITCTL", screen.row(1))
+        self.assertIn("▶ 1 · RIGHT + ARROWS + NUMPAD", zone_area)
+        self.assertIn("LIVE #111111", zone_area)
+        self.assertIn("DRAFT #A1B2C3", zone_area)
+        self.assertIn("COLOR EDITOR", visible)
+        self.assertIn("DRAFT #A1B2C3", visible)
+        self.assertIn("LIVE  #111111", visible)
+        self.assertIn("[A] APPLY", visible)
+        self.assertIn("[M] PROFILES", visible)
+
+    def test_minimum_workspace_preserves_borders_and_complete_safety_labels(self):
+        backend = FakeBackend()
+        app = CursesTui(backend)
+        app.state.draft = app.state.draft.with_zone(Zone.LEFT, "ABCDEF")
+
+        class BufferScreen:
+            def __init__(self):
+                self.width = 78
+                self.height = 24
+                self.cells = [
+                    [" " for _ in range(self.width)] for _ in range(self.height)
+                ]
+
+            def getmaxyx(self):
+                return (self.height, self.width)
+
+            def erase(self):
+                self.cells = [
+                    [" " for _ in range(self.width)] for _ in range(self.height)
+                ]
+
+            def addnstr(self, y, x, text, limit, _attr):
+                for offset, character in enumerate(text[:limit]):
+                    if 0 <= y < self.height and 0 <= x + offset < self.width:
+                        self.cells[y][x + offset] = character
+
+            def refresh(self):
+                return None
+
+            def row(self, y):
+                return "".join(self.cells[y])
+
+        screen = BufferScreen()
+        app._draw(screen)
+        zone_area = "\n".join(screen.row(y) for y in range(5, 11))
+
+        self.assertIn("NOT PER-KEY", screen.row(2))
+        self.assertIn("3 LEFT *", zone_area)
+        self.assertIn("D #ABCDEF *", zone_area)
+        self.assertIn("1 RIGHT+ARROWS+NUMPAD", zone_area)
+
+        app.state.selected_zone = Zone.LEFT
+        app._draw(screen)
+        editor = "\n".join(screen.row(y) for y in range(12, 21))
+        self.assertIn("A applies immediately", editor)
+        self.assertIn("[P] preset  [E] hex  [X] discard", editor)
+        self.assertEqual(screen.cells[12][2], "╭")
+        self.assertEqual(screen.cells[12][75], "╮")
+        for row in range(13, 20):
+            self.assertEqual(screen.cells[row][2], "│")
+            self.assertEqual(screen.cells[row][75], "│")
+        self.assertEqual(screen.cells[20][2], "╰")
+        self.assertEqual(screen.cells[20][75], "╯")
+
     def test_keyboard_region_rendering_preserves_boundaries_and_all_four_colors(self):
         backend = FakeBackend()
         app = CursesTui(backend)
@@ -688,7 +806,8 @@ class TuiDeviceActionTests(unittest.TestCase):
             with self.subTest(width=width):
                 screen = BufferScreen(width)
                 app._draw(screen)
-                regions = keyboard_region_geometry(width)
+                top = workspace_frame(screen.height, width).y
+                regions = keyboard_region_geometry(width, top=top)
 
                 for zone in (Zone.LEFT, Zone.CENTER, Zone.RIGHT):
                     region = regions[zone]
@@ -698,7 +817,9 @@ class TuiDeviceActionTests(unittest.TestCase):
                             screen.cells[y][region.x + region.width - 1], "│"
                         )
 
-                visualization = "\n".join(screen.row(y) for y in range(5, 11))
+                visualization = "\n".join(
+                    screen.row(y) for y in range(top + 5, top + 11)
+                )
                 self.assertIn("#333333", visualization)
                 self.assertIn("#444444", visualization)
                 self.assertIn("WASD REGION", visualization)

@@ -43,11 +43,29 @@ class VisualRegion:
     height: int
 
 
-def keyboard_region_geometry(terminal_width: int) -> dict[Zone, VisualRegion]:
+@dataclass(frozen=True)
+class WorkspaceFrame:
+    x: int
+    y: int
+    width: int
+
+
+def workspace_frame(terminal_height: int, terminal_width: int) -> WorkspaceFrame:
+    """Center a compact 24-row workspace and cap overly wide layouts."""
+    width = min(132, terminal_width)
+    x = max(0, (terminal_width - width) // 2)
+    y = max(0, (terminal_height - 24) // 2)
+    return WorkspaceFrame(x=x, y=y, width=width)
+
+
+def keyboard_region_geometry(
+    terminal_width: int, *, top: int = 0
+) -> dict[Zone, VisualRegion]:
     """Return a coarse four-region keyboard silhouette, never per-key geometry."""
-    margin = 2
+    frame = workspace_frame(24, terminal_width)
+    margin = frame.x + 2
     gap = 2
-    available = terminal_width - margin * 2 - gap * 2
+    available = frame.width - 4 - gap * 2
     left_width = max(18, available * 24 // 100)
     center_width = max(22, available * 31 // 100)
     right_width = available - left_width - center_width
@@ -56,10 +74,10 @@ def keyboard_region_geometry(terminal_width: int) -> dict[Zone, VisualRegion]:
         center_width -= shortage
         right_width = 26
 
-    left = VisualRegion(margin, 5, left_width, 6)
-    center = VisualRegion(left.x + left.width + gap, 5, center_width, 6)
-    right = VisualRegion(center.x + center.width + gap, 5, right_width, 6)
-    wasd = VisualRegion(left.x + 2, 7, left.width - 4, 2)
+    left = VisualRegion(margin, top + 5, left_width, 6)
+    center = VisualRegion(left.x + left.width + gap, top + 5, center_width, 6)
+    right = VisualRegion(center.x + center.width + gap, top + 5, right_width, 6)
+    wasd = VisualRegion(left.x + 2, top + 7, left.width - 4, 2)
     return {
         Zone.LEFT: left,
         Zone.CENTER: center,
@@ -221,12 +239,7 @@ class CursesTui:
                         continue
                 return
             if command is TuiCommand.APPLY:
-                if not self.state.dirty or self._confirm_action(
-                    screen, "Apply complete four-zone layout?"
-                ):
-                    self._apply()
-                else:
-                    self.state.message = "Apply cancelled"
+                self._apply()
             elif command is TuiCommand.RESTORE:
                 restore_needed = self.state.current != self.state.original or self.state.dirty
                 if not restore_needed or self._confirm_action(
@@ -280,45 +293,64 @@ class CursesTui:
                 pass
             return
 
+        frame = workspace_frame(height, width)
+        base = frame.y
+        left = frame.x + 2
+        right = frame.x + frame.width - 3
+        content_width = frame.width - 4
+
         cyan = curses.color_pair(1) if self.colors_enabled else curses.A_BOLD
-        chip = curses.color_pair(2) if self.colors_enabled else curses.A_REVERSE
         good = curses.color_pair(3) if self.colors_enabled else curses.A_BOLD
         warn = curses.color_pair(4) if self.colors_enabled else curses.A_BOLD
 
-        self._safe_add(screen, 1, 2, "OKEYLITCTL", cyan | curses.A_BOLD)
-        self._safe_add(screen, 1, 14, f"v{__version__}  ·  SAFE KEYBOARD LIGHTING", curses.A_DIM)
-        state_text = f" ● DEVICE {self.power_state.upper()} "
-        self._safe_add(screen, 1, max(2, width - len(state_text) - 3), state_text, chip)
-        self._safe_add(screen, 3, 2, "FOUR-ZONE WORKSPACE", curses.A_BOLD)
-        dirty = "UNAPPLIED CHANGES" if self.state.dirty else "SYNCHRONIZED"
-        self._safe_add(screen, 3, width - len(dirty) - 3, dirty, warn if self.state.dirty else good)
+        self._safe_add(screen, base, left, "OKEYLITCTL", cyan | curses.A_BOLD)
+        self._safe_add(
+            screen,
+            base,
+            left + 12,
+            f"v{__version__}  ·  FOUR-ZONE LIGHTING",
+            curses.A_DIM,
+        )
+        state_text = f"● DEVICE {self.power_state.upper()}"
+        draft_text = "* MODIFIED" if self.state.dirty else "SYNCED"
+        header_state = f"{state_text}  {draft_text}"
+        self._safe_add(
+            screen,
+            base,
+            right - len(header_state) + 1,
+            header_state,
+            warn if self.state.dirty else good,
+        )
+        self._safe_add(screen, base + 1, left, "─" * content_width, curses.A_DIM)
+        self._safe_add(screen, base + 2, left, "FOUR-ZONE OUTPUT", curses.A_BOLD)
+        region_note = (
+            "COARSE ZONES · NOT PER-KEY"
+            if frame.width < 100
+            else "COARSE HARDWARE REGIONS · NOT PER-KEY"
+        )
+        self._safe_add(
+            screen,
+            base + 2,
+            right - len(region_note) + 1,
+            region_note,
+            curses.A_DIM,
+        )
 
-        self._draw_keyboard_visualization(screen, width)
+        self._draw_keyboard_visualization(screen, width, top=base)
+        self._draw_editor_panel(screen, frame, cyan, warn)
 
-        selected = self.state.selected_zone
-        color = self.state.selected_color
-        self._safe_add(screen, 12, 2, f"EDITING  {selected.value.upper()}", cyan | curses.A_BOLD)
-        self._safe_add(screen, 12, 24, f"#{color}", curses.A_BOLD)
-        self._safe_add(screen, 12, 35, "Local draft only — A applies the complete layout", curses.A_DIM)
-
-        channels = ("RED", "GREEN", "BLUE")
-        for row, (name, offset) in enumerate(zip(channels, (0, 2, 4))):
-            value = int(color[offset : offset + 2], 16)
-            active = row == self.state.selected_channel
-            attr = cyan | curses.A_BOLD if active else 0
-            marker = "▶" if active else " "
-            filled = round(value / 255 * 24)
-            bar = "━" * filled + "─" * (24 - filled)
-            self._safe_add(screen, 14 + row * 2, 3, f"{marker} {name:<5}", attr)
-            self._safe_add(screen, 14 + row * 2, 13, bar, attr)
-            self._safe_add(screen, 14 + row * 2, 39, f"{value:3d}  {value:02X}", attr)
-
-        preset = "Custom" if self.state.preset_index < 0 else PRESETS[self.state.preset_index][0]
-        self._safe_add(screen, 20, 2, f"PRESET  {preset}", curses.A_BOLD)
-        self._safe_add(screen, 20, 24, "P cycles presets  ·  E enters an exact hex color", curses.A_DIM)
-        self._safe_add(screen, height - 3, 2, self.state.message, good if not self.state.dirty else warn)
-        footer = "←/→ zone  ↑/↓ channel  +/- fine  [/ ] coarse  A apply  M profiles  O original  R refresh  ? help  Q quit"
-        self._safe_add(screen, height - 1, 1, footer, curses.A_REVERSE)
+        status_prefix = "*" if self.state.dirty else "✓"
+        self._safe_add(
+            screen,
+            base + 21,
+            left,
+            f"{status_prefix} {self.state.message}",
+            warn if self.state.dirty else good,
+        )
+        edit_footer = "←/→ ZONE  ↑/↓ CHANNEL  -/+ FINE  [/] COARSE  [P] PRESET  [E] HEX"
+        global_footer = "[A] APPLY  [M] PROFILES  [O] ORIGINAL  [R] REFRESH  [?] HELP  [Q] QUIT"
+        self._safe_add(screen, base + 22, left, edit_footer, curses.A_DIM)
+        self._safe_add(screen, base + 23, left, global_footer, curses.A_BOLD)
 
         if self.state.help_visible:
             self._draw_help(screen)
@@ -327,12 +359,126 @@ class CursesTui:
         except curses.error:
             pass
 
-    def _draw_keyboard_visualization(self, screen: Any, width: int) -> None:
-        regions = keyboard_region_geometry(width)
+    def _draw_editor_panel(
+        self,
+        screen: Any,
+        frame: WorkspaceFrame,
+        accent: int,
+        warning: int,
+    ) -> None:
+        x = frame.x + 2
+        y = frame.y + 12
+        width = frame.width - 4
+        selected = self.state.selected_zone
+        draft = self.state.selected_color
+        live = getattr(self.state.current, selected.value)
+        dirty = draft != live
+        border_attr = accent if dirty else curses.A_DIM
+        interior_right = x + width - 2
+
+        def panel_add(row: int, column: int, text: str, attr: int = 0) -> None:
+            available = max(0, interior_right - column)
+            self._safe_add(screen, row, column, text[:available], attr)
+
+        self._safe_add(screen, y, x, "╭" + "─" * (width - 2) + "╮", border_attr)
+        for row in range(1, 8):
+            self._safe_add(
+                screen,
+                y + row,
+                x,
+                "│" + " " * (width - 2) + "│",
+                border_attr,
+            )
+        self._safe_add(
+            screen,
+            y + 8,
+            x,
+            "╰" + "─" * (width - 2) + "╯",
+            border_attr,
+        )
+
+        zone_name = selected.value.upper()
+        if selected is Zone.RIGHT:
+            zone_name = "RIGHT / ARROWS / NUMPAD"
+        title = f" COLOR EDITOR  ·  ZONE {FIRMWARE_ZONE_ORDER.index(selected) + 1}  {zone_name} "
+        state_label = "* UNAPPLIED" if dirty else "SYNCED"
+        state_x = x + width - len(state_label) - 3
+        title_available = max(0, state_x - (x + 2) - 1)
+        self._safe_add(
+            screen,
+            y,
+            x + 2,
+            title[:title_available],
+            accent | curses.A_BOLD,
+        )
+        self._safe_add(
+            screen,
+            y,
+            state_x,
+            f" {state_label} ",
+            warning if dirty else curses.A_BOLD,
+        )
+
+        panel_add(y + 2, x + 3, f"DRAFT #{draft}", curses.A_BOLD)
+        panel_add(y + 2, x + 23, f"LIVE  #{live}", curses.A_DIM)
+        if width < 100:
+            action_hint = "A applies immediately" if dirty else "Draft matches device"
+        else:
+            action_hint = (
+                "A applies all four zones immediately"
+                if dirty
+                else "Device and draft match"
+            )
+        panel_add(y + 2, x + 43, action_hint, curses.A_DIM)
+
+        channels = ("RED", "GREEN", "BLUE")
+        track_width = min(28, max(12, width - 35))
+        for row, (name, offset) in enumerate(zip(channels, (0, 2, 4))):
+            value = int(draft[offset : offset + 2], 16)
+            active = row == self.state.selected_channel
+            attr = accent | curses.A_BOLD if active else 0
+            marker = "▶" if active else " "
+            filled = round(value / 255 * track_width)
+            bar = "█" * filled + "░" * (track_width - filled)
+            panel_add(
+                y + 4 + row,
+                x + 3,
+                f"{marker} {name:<5} {value:3d}  {value:02X}  [{bar}]",
+                attr,
+            )
+
+        preset = "Custom" if self.state.preset_index < 0 else PRESETS[self.state.preset_index][0]
+        panel_add(y + 7, x + 3, f"PRESET  {preset}", curses.A_BOLD)
+        preset_help = (
+            "[P] preset  [E] hex  [X] discard"
+            if width < 100
+            else "[P] cycle preset   [E] exact hex   [X] discard draft"
+        )
+        panel_add(
+            y + 7,
+            x + 25,
+            preset_help,
+            curses.A_DIM,
+        )
+
+    def _draw_keyboard_visualization(
+        self, screen: Any, width: int, *, top: int = 0
+    ) -> None:
+        regions = keyboard_region_geometry(width, top=top)
         labels = {
-            Zone.LEFT: "3 · LEFT REGION",
-            Zone.CENTER: "2 · CENTER REGION",
-            Zone.RIGHT: "1 · RIGHT + ARROWS + NUMPAD",
+            Zone.LEFT: (
+                "3 LEFT" if regions[Zone.LEFT].width < 22 else "3 · LEFT REGION"
+            ),
+            Zone.CENTER: (
+                "2 CENTER"
+                if regions[Zone.CENTER].width < 25
+                else "2 · CENTER REGION"
+            ),
+            Zone.RIGHT: (
+                "1 RIGHT+ARROWS+NUMPAD"
+                if regions[Zone.RIGHT].width < 36
+                else "1 · RIGHT + ARROWS + NUMPAD"
+            ),
             Zone.WASD: "WASD REGION",
         }
         for zone in (Zone.LEFT, Zone.CENTER, Zone.RIGHT):
@@ -356,6 +502,12 @@ class CursesTui:
     ) -> None:
         selected = zone is self.state.selected_zone
         color = getattr(self.state.draft, zone.value)
+        live = getattr(self.state.current, zone.value)
+        dirty = color != live
+        inner_width = max(1, region.width - (0 if compact else 4))
+
+        def fit(text: str) -> str:
+            return text[:inner_width]
         if selected and self.colors_enabled:
             border_attr = curses.color_pair(1) | curses.A_BOLD
         else:
@@ -367,14 +519,17 @@ class CursesTui:
                 screen,
                 region.y,
                 region.x,
-                "WASD REGION 4",
+                fit(
+                    f"{'>' if selected else ''}WASD REGION 4"
+                    f"{'*' if dirty else ''}"
+                ),
                 compact_attr,
             )
             self._safe_add(
                 screen,
                 region.y + 1,
                 region.x,
-                f"#{color}",
+                fit(f"#{color}{' DRAFT' if dirty else ' SYNCED'}"),
                 compact_attr,
             )
             if self.colors_enabled and getattr(curses, "COLORS", 0) >= 256:
@@ -412,13 +567,55 @@ class CursesTui:
             border_attr,
         )
 
-        self._safe_add(screen, region.y + 1, region.x + 2, label, curses.A_BOLD)
+        title = f"{'▶' if selected else ' '} {label}{' *' if dirty else ''}"
+        self._safe_add(
+            screen,
+            region.y + 1,
+            region.x + 2,
+            fit(title),
+            curses.A_BOLD,
+        )
+
+        if zone is not Zone.LEFT:
+            live_text = f"LIVE #{live}" if inner_width >= 13 else f"L #{live}"
+            if dirty:
+                draft_text = (
+                    f"DRAFT #{color} *" if inner_width >= 15 else f"D #{color} *"
+                )
+            else:
+                draft_text = (
+                    f"DRAFT #{color} SYNCED"
+                    if inner_width >= 21
+                    else f"D #{color} OK"
+                )
+            self._safe_add(
+                screen,
+                region.y + 2,
+                region.x + 2,
+                fit(live_text),
+                curses.A_DIM,
+            )
+            self._safe_add(
+                screen,
+                region.y + 3,
+                region.x + 2,
+                fit(draft_text),
+                curses.A_BOLD if dirty else curses.A_DIM,
+            )
 
         self._safe_add(
             screen,
             region.y + region.height - 2,
             region.x + 2,
-            f"#{color}",
+            fit(
+                (
+                    f"D #{color} *"
+                    if dirty and inner_width < 22
+                    else f"LIVE #{live} → DRAFT #{color}{' *' if dirty else ''}"
+                )
+                if zone is Zone.LEFT
+                else f"#{color}"
+            ),
             curses.A_BOLD,
         )
         if self.colors_enabled and getattr(curses, "COLORS", 0) >= 256:
@@ -456,7 +653,7 @@ class CursesTui:
             "E             Enter an exact six-digit hex color",
             "P             Cycle curated local presets",
             "M             Open the local profile manager",
-            "A             Confirm, apply, and verify the complete layout",
+            "A             Apply and verify the complete layout immediately",
             "O             Confirm restoration of the original layout",
             "X             Discard unapplied local edits",
             "R             Refresh from the device (blocked while dirty)",
