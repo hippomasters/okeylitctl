@@ -188,27 +188,53 @@ class CursesTui:
         curses.wrapper(self._main)
 
     def _main(self, screen: Any) -> None:
-        screen.keypad(True)
+        try:
+            screen.keypad(True)
+        except curses.error:
+            return
         set_cursor_visibility(0)
         self.colors_enabled = initialize_colors()
 
         while True:
             self._draw(screen)
-            key = screen.getch()
+            try:
+                key = screen.getch()
+            except curses.error:
+                return
             if key == curses.KEY_RESIZE:
                 continue
-            height, width = screen.getmaxyx()
+            try:
+                height, width = screen.getmaxyx()
+            except curses.error:
+                return
             command = handle_key(
                 self.state,
                 key,
                 actions_enabled=height >= 24 and width >= 78,
             )
             if command is TuiCommand.QUIT:
+                if self.state.dirty:
+                    if height < 5 or width < 20:
+                        return
+                    if not self._confirm_action(screen, "Quit?"):
+                        self.state.message = "Quit cancelled — local changes preserved"
+                        continue
                 return
             if command is TuiCommand.APPLY:
-                self._apply()
+                if not self.state.dirty or self._confirm_action(
+                    screen, "Apply complete four-zone layout?"
+                ):
+                    self._apply()
+                else:
+                    self.state.message = "Apply cancelled"
             elif command is TuiCommand.RESTORE:
-                self._restore()
+                restore_needed = self.state.current != self.state.original or self.state.dirty
+                if not restore_needed or self._confirm_action(
+                    screen, "Restore the original module layout?"
+                ):
+                    self._restore()
+                else:
+                    self.state.message = "Restore cancelled"
             elif command is TuiCommand.REFRESH:
                 self._refresh()
             elif command is TuiCommand.EDIT:
@@ -217,23 +243,41 @@ class CursesTui:
                 self._profile_manager(screen)
 
     @staticmethod
-    def _safe_add(screen: Any, y: int, x: int, text: str, attr: int = 0) -> None:
-        height, width = screen.getmaxyx()
-        if y < 0 or y >= height or x < 0 or x >= width:
-            return
+    def _safe_add(
+        screen: Any,
+        y: int,
+        x: int,
+        text: str,
+        attr: int = 0,
+        *,
+        require_full: bool = False,
+    ) -> bool:
         try:
-            screen.addnstr(y, x, text, max(0, width - x - 1), attr)
+            height, width = screen.getmaxyx()
+            available = max(0, width - x - 1)
+            if y < 0 or y >= height or x < 0 or x >= width:
+                return False
+            if require_full and len(text) > available:
+                return False
+            screen.addnstr(y, x, text, available, attr)
+            return True
         except curses.error:
-            pass
+            return False
 
     def _draw(self, screen: Any) -> None:
-        screen.erase()
-        height, width = screen.getmaxyx()
+        try:
+            screen.erase()
+            height, width = screen.getmaxyx()
+        except curses.error:
+            return
         if height < 24 or width < 78:
             self._safe_add(screen, 1, 2, "OKeyLitCtl needs at least 78 x 24", curses.A_BOLD)
             self._safe_add(screen, 3, 2, f"Current terminal: {width} x {height}")
             self._safe_add(screen, 5, 2, "Resize the terminal or press Q to quit.")
-            screen.refresh()
+            try:
+                screen.refresh()
+            except curses.error:
+                pass
             return
 
         cyan = curses.color_pair(1) if self.colors_enabled else curses.A_BOLD
@@ -278,7 +322,10 @@ class CursesTui:
 
         if self.state.help_visible:
             self._draw_help(screen)
-        screen.refresh()
+        try:
+            screen.refresh()
+        except curses.error:
+            pass
 
     def _draw_keyboard_visualization(self, screen: Any, width: int) -> None:
         regions = keyboard_region_geometry(width)
@@ -396,7 +443,10 @@ class CursesTui:
                 pass
 
     def _draw_help(self, screen: Any) -> None:
-        height, width = screen.getmaxyx()
+        try:
+            height, width = screen.getmaxyx()
+        except curses.error:
+            return
         lines = (
             "OKEYLITCTL HELP",
             "",
@@ -406,11 +456,11 @@ class CursesTui:
             "E             Enter an exact six-digit hex color",
             "P             Cycle curated local presets",
             "M             Open the local profile manager",
-            "A             Apply and verify the complete four-zone layout",
-            "O             Restore the module's original layout",
+            "A             Confirm, apply, and verify the complete layout",
+            "O             Confirm restoration of the original layout",
             "X             Discard unapplied local edits",
             "R             Refresh from the device (blocked while dirty)",
-            "Q             Quit without applying local edits",
+            "Q             Quit; dirty drafts require confirmation",
             "",
             "No color-picker movement writes firmware. Apply is always explicit.",
             "Press ? or Esc to close",
@@ -439,7 +489,11 @@ class CursesTui:
                 selected = min(selected, len(names) - 1)
             else:
                 selected = 0
-            self._draw_profile_manager(screen, names, selected, pending_delete)
+            if not self._draw_profile_manager(
+                screen, names, selected, pending_delete
+            ):
+                self.state.message = "Profile manager closed after terminal rendering error"
+                return
             try:
                 key = screen.getch()
             except curses.error:
@@ -472,38 +526,88 @@ class CursesTui:
             elif key == ord("d") and names:
                 pending_delete = names[selected]
 
+    def _confirm_action(self, screen: Any, prompt: str) -> bool:
+        try:
+            height, width = screen.getmaxyx()
+            lines = (prompt, "Y=yes; else=no")
+            box_width = max(len(line) for line in lines) + 4
+            if height < 5 or width < box_width + 2:
+                return False
+            y = max(0, (height - 5) // 2)
+            x = max(1, (width - box_width) // 2)
+            for row in range(5):
+                screen.addnstr(
+                    y + row,
+                    x,
+                    " " * box_width,
+                    box_width,
+                    curses.A_REVERSE,
+                )
+            for row, line in enumerate(lines):
+                attr = curses.A_REVERSE | (curses.A_BOLD if row == 0 else 0)
+                screen.addnstr(
+                    y + 1 + row,
+                    x + 2,
+                    line,
+                    box_width - 4,
+                    attr,
+                )
+            screen.refresh()
+            final_height, final_width = screen.getmaxyx()
+            if final_height < 5 or final_width < box_width + 2:
+                return False
+            return screen.getch() in (ord("y"), ord("Y"))
+        except curses.error:
+            return False
+
     def _draw_profile_manager(
         self,
         screen: Any,
         names: tuple[str, ...],
         selected: int,
         pending_delete: str | None = None,
-    ) -> None:
-        height, width = screen.getmaxyx()
+    ) -> bool:
+        try:
+            height, width = screen.getmaxyx()
+        except curses.error:
+            return False
         box_width = min(56, width - 6)
         visible = min(10, max(1, height - 10))
         box_height = visible + 7
         y = max(1, (height - box_height) // 2)
         x = max(2, (width - box_width) // 2)
+        rendered = True
+
+        def add(row: int, column: int, text: str, attr: int) -> None:
+            nonlocal rendered
+            rendered = (
+                self._safe_add(
+                    screen,
+                    row,
+                    column,
+                    text,
+                    attr,
+                    require_full=True,
+                )
+                and rendered
+            )
+
         for row in range(box_height):
-            self._safe_add(screen, y + row, x, " " * box_width, curses.A_REVERSE)
-        self._safe_add(
-            screen,
+            add(y + row, x, " " * box_width, curses.A_REVERSE)
+        add(
             y + 1,
             x + 2,
             "LOCAL PROFILES",
             curses.A_REVERSE | curses.A_BOLD,
         )
-        self._safe_add(
-            screen,
+        add(
             y + 2,
             x + 2,
-            "Enter load locally  ·  S save draft  ·  Esc close",
+            "Enter load  ·  S save  ·  D delete  ·  Esc close",
             curses.A_REVERSE,
         )
         if not names:
-            self._safe_add(
-                screen,
+            add(
                 y + 4,
                 x + 2,
                 "No saved profiles",
@@ -515,27 +619,57 @@ class CursesTui:
                 index = start + row
                 marker = "▶" if index == selected else " "
                 attr = curses.A_REVERSE | (curses.A_BOLD if index == selected else 0)
-                self._safe_add(screen, y + 4 + row, x + 2, f"{marker} {name}", attr)
+                add(y + 4 + row, x + 2, f"{marker} {name}", attr)
         if pending_delete is not None:
-            self._safe_add(
-                screen,
-                y + box_height - 2,
+            add(
+                y + box_height - 3,
                 x + 2,
-                f"Delete {pending_delete}? Y confirm · N cancel",
+                f"Delete {pending_delete}?",
                 curses.A_REVERSE | curses.A_BOLD,
             )
+            add(
+                y + box_height - 2,
+                x + 2,
+                "Y confirm · N cancel",
+                curses.A_REVERSE | curses.A_BOLD,
+            )
+        else:
+            add(
+                y + box_height - 2,
+                x + 2,
+                self.state.message,
+                curses.A_REVERSE | curses.A_DIM,
+            )
+        if not rendered:
+            return False
         try:
             screen.refresh()
+            return True
         except curses.error:
-            pass
+            return False
 
     def _prompt_profile_name(self, screen: Any) -> str | None:
-        height, width = screen.getmaxyx()
         prompt = "Profile name (letters, digits, _ or -): "
-        row = max(1, height - 3)
-        self._safe_add(screen, row, 2, " " * max(0, width - 4))
-        self._safe_add(screen, row, 2, prompt, curses.A_BOLD)
         try:
+            height, width = screen.getmaxyx()
+            row = max(1, height - 3)
+            if not self._safe_add(
+                screen,
+                row,
+                2,
+                " " * max(0, width - 4),
+                require_full=True,
+            ):
+                raise curses.error
+            if not self._safe_add(
+                screen,
+                row,
+                2,
+                prompt,
+                curses.A_BOLD,
+                require_full=True,
+            ):
+                raise curses.error
             screen.refresh()
             curses.echo()
             set_cursor_visibility(1)
@@ -605,11 +739,26 @@ class CursesTui:
             self.state.message = f"Refresh failed: {exc}"
 
     def _edit_color(self, screen: Any) -> None:
-        height, _ = screen.getmaxyx()
         prompt = f"Enter {self.state.selected_zone.value.upper()} color (RRGGBB): "
-        self._safe_add(screen, height - 3, 2, " " * 70)
-        self._safe_add(screen, height - 3, 2, prompt, curses.A_BOLD)
         try:
+            height, _ = screen.getmaxyx()
+            if not self._safe_add(
+                screen,
+                height - 3,
+                2,
+                " " * 70,
+                require_full=True,
+            ):
+                raise curses.error
+            if not self._safe_add(
+                screen,
+                height - 3,
+                2,
+                prompt,
+                curses.A_BOLD,
+                require_full=True,
+            ):
+                raise curses.error
             screen.refresh()
             curses.echo()
             set_cursor_visibility(1)

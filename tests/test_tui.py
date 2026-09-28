@@ -160,6 +160,283 @@ class FakeProfileStore:
 
 
 class TuiDeviceActionTests(unittest.TestCase):
+    def test_confirmation_accepts_only_explicit_yes(self):
+        app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
+
+        class ConfirmScreen:
+            def __init__(self, key):
+                self.key = key
+
+            def getmaxyx(self):
+                return (30, 100)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return self.key
+
+        self.assertTrue(app._confirm_action(ConfirmScreen(ord("y")), "Apply layout?"))
+        for key in (ord("n"), 27, ord("q"), curses.KEY_RESIZE):
+            with self.subTest(key=key):
+                self.assertFalse(
+                    app._confirm_action(ConfirmScreen(key), "Apply layout?")
+                )
+
+    def test_confirmation_fails_closed_when_prompt_cannot_render(self):
+        app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
+
+        class HiddenPromptScreen:
+            def getmaxyx(self):
+                return (30, 100)
+
+            def addnstr(self, *_args):
+                raise curses.error
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return ord("y")
+
+        class MissingGeometryScreen:
+            def getmaxyx(self):
+                raise curses.error
+
+        self.assertFalse(
+            app._confirm_action(HiddenPromptScreen(), "Apply complete layout?")
+        )
+        self.assertFalse(
+            app._confirm_action(MissingGeometryScreen(), "Apply complete layout?")
+        )
+
+        class TruncatedPromptScreen:
+            def __init__(self):
+                self.reads = 0
+
+            def getmaxyx(self):
+                return (7, 20)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                self.reads += 1
+                return ord("y")
+
+        truncated = TruncatedPromptScreen()
+        self.assertFalse(
+            app._confirm_action(truncated, "Apply complete four-zone layout?")
+        )
+        self.assertEqual(truncated.reads, 0)
+
+    def test_cancelled_apply_never_writes_and_dirty_quit_requires_confirmation(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("A1B2C3")
+
+        class ScriptedScreen:
+            def __init__(self):
+                self.keys = iter((ord("a"), ord("n"), ord("q"), ord("y")))
+
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(ScriptedScreen())
+
+        self.assertEqual(backend.writes, [])
+        self.assertTrue(app.state.dirty)
+
+    def test_confirmed_apply_writes_once_then_quits_cleanly(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("A1B2C3")
+
+        class ScriptedScreen:
+            def __init__(self):
+                self.keys = iter((ord("a"), ord("y"), ord("q")))
+
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(ScriptedScreen())
+
+        self.assertEqual(backend.writes, ["A1B2C3,222222,333333,444444"])
+        self.assertFalse(app.state.dirty)
+
+    def test_cancelled_restore_and_dirty_quit_never_change_firmware(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("A1B2C3")
+
+        class ScriptedScreen:
+            def __init__(self):
+                self.keys = iter(
+                    (
+                        ord("o"),
+                        ord("n"),
+                        ord("q"),
+                        ord("n"),
+                        ord("q"),
+                        ord("y"),
+                    )
+                )
+
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(ScriptedScreen())
+
+        self.assertEqual(backend.restores, 0)
+        self.assertEqual(backend.writes, [])
+        self.assertTrue(app.state.dirty)
+
+    def test_dirty_quit_remains_usable_after_terminal_shrinks(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("A1B2C3")
+
+        class NarrowScreen:
+            def __init__(self, width, keys):
+                self.width = width
+                self.keys = iter(keys)
+                self.reads = 0
+                self.rendered = []
+
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (7, self.width)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, _y, _x, text, limit, _attr):
+                self.rendered.append(text[:limit])
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                self.reads += 1
+                return next(self.keys)
+
+        confirmable = NarrowScreen(20, (ord("q"), ord("n"), ord("q"), ord("y")))
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(confirmable)
+        self.assertIn("Quit?", confirmable.rendered)
+        self.assertIn("Y=yes; else=no", confirmable.rendered)
+        self.assertEqual(confirmable.reads, 4)
+
+        too_small = NarrowScreen(19, (ord("q"),))
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(too_small)
+        self.assertEqual(too_small.reads, 1)
+
+    def test_main_and_draw_exit_safely_on_terminal_io_errors(self):
+        app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
+
+        class FailingInputScreen:
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                raise curses.error
+
+        class FailingDrawScreen:
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                raise curses.error
+
+        class FailingGeometryScreen:
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                raise curses.error
+
+            def erase(self):
+                return None
+
+            def getch(self):
+                return ord("q")
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(FailingInputScreen())
+        app._draw(FailingDrawScreen())
+        app._draw(FailingGeometryScreen())
+        with mock.patch.object(app, "_draw"):
+            app._main(FailingGeometryScreen())
+
     def test_profile_load_changes_only_the_local_draft(self):
         backend = FakeBackend()
         profiles = FakeProfileStore()
@@ -290,6 +567,63 @@ class TuiDeviceActionTests(unittest.TestCase):
 
         self.assertEqual(backend.writes, [])
         self.assertIn(("delete", "Work"), profiles.calls)
+
+    def test_profile_manager_render_failure_cannot_trigger_hidden_delete(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+
+        class HiddenMenuScreen:
+            def getmaxyx(self):
+                return (30, 100)
+
+            def addnstr(self, *_args):
+                raise curses.error("cannot render menu")
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return ord("y")
+
+        app._profile_manager(HiddenMenuScreen())
+
+        self.assertNotIn(("delete", "Work"), profiles.calls)
+        self.assertEqual(backend.writes, [])
+        self.assertIn("rendering error", app.state.message)
+
+    def test_profile_manager_resize_cannot_trigger_truncated_delete(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+
+        class ResizedMenuScreen:
+            def __init__(self):
+                self.width = 100
+                self.keys = iter((ord("d"), ord("y")))
+                self.reads = 0
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                self.reads += 1
+                key = next(self.keys)
+                self.width = 20
+                return key
+
+        screen = ResizedMenuScreen()
+        app._profile_manager(screen)
+
+        self.assertNotIn(("delete", "Work"), profiles.calls)
+        self.assertEqual(screen.reads, 1)
+        self.assertIn("rendering error", app.state.message)
 
     def test_workspace_draws_coarse_keyboard_regions(self):
         backend = FakeBackend()
@@ -438,6 +772,40 @@ class TuiDeviceActionTests(unittest.TestCase):
         app._edit_color(RefreshFailingScreen())
 
         self.assertIn("cancelled", app.state.message.lower())
+
+    def test_truncated_text_entry_prompts_do_not_accept_hidden_input(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        original = app.state.draft
+
+        class NarrowInputScreen:
+            def __init__(self):
+                self.reads = 0
+
+            def getmaxyx(self):
+                return (7, 20)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getstr(self, *_args):
+                self.reads += 1
+                return b"ABCDEF"
+
+        profile_screen = NarrowInputScreen()
+        color_screen = NarrowInputScreen()
+        with mock.patch("okeylitctl.tui.curses.echo"), mock.patch(
+            "okeylitctl.tui.curses.noecho"
+        ), mock.patch("okeylitctl.tui.curses.curs_set"):
+            self.assertIsNone(app._prompt_profile_name(profile_screen))
+            app._edit_color(color_screen)
+
+        self.assertEqual(profile_screen.reads, 0)
+        self.assertEqual(color_screen.reads, 0)
+        self.assertEqual(app.state.draft, original)
 
 
 if __name__ == "__main__":
