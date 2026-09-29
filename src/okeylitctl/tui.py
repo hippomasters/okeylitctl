@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import curses
-from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
 from . import __version__
+from .keyboard_layout import ProjectedKey, project_keyboard
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
 from .profiles import ProfileError, ProfileStore
 from .sysfs import SysfsBackend, SysfsError
@@ -33,57 +33,6 @@ class TuiCommand(Enum):
     EDIT = auto()
     PROFILES = auto()
     QUIT = auto()
-
-
-@dataclass(frozen=True)
-class VisualRegion:
-    x: int
-    y: int
-    width: int
-    height: int
-
-
-@dataclass(frozen=True)
-class WorkspaceFrame:
-    x: int
-    y: int
-    width: int
-
-
-def workspace_frame(terminal_height: int, terminal_width: int) -> WorkspaceFrame:
-    """Center a compact 24-row workspace and cap overly wide layouts."""
-    width = min(132, terminal_width)
-    x = max(0, (terminal_width - width) // 2)
-    y = max(0, (terminal_height - 24) // 2)
-    return WorkspaceFrame(x=x, y=y, width=width)
-
-
-def keyboard_region_geometry(
-    terminal_width: int, *, top: int = 0
-) -> dict[Zone, VisualRegion]:
-    """Return a coarse four-region keyboard silhouette, never per-key geometry."""
-    frame = workspace_frame(24, terminal_width)
-    margin = frame.x + 2
-    gap = 2
-    available = frame.width - 4 - gap * 2
-    left_width = max(18, available * 24 // 100)
-    center_width = max(22, available * 31 // 100)
-    right_width = available - left_width - center_width
-    if right_width < 26:
-        shortage = 26 - right_width
-        center_width -= shortage
-        right_width = 26
-
-    left = VisualRegion(margin, top + 5, left_width, 6)
-    center = VisualRegion(left.x + left.width + gap, top + 5, center_width, 6)
-    right = VisualRegion(center.x + center.width + gap, top + 5, right_width, 6)
-    wasd = VisualRegion(left.x + 2, top + 7, left.width - 4, 2)
-    return {
-        Zone.LEFT: left,
-        Zone.CENTER: center,
-        Zone.RIGHT: right,
-        Zone.WASD: wasd,
-    }
 
 
 def rgb_to_xterm_index(color: str) -> int:
@@ -164,7 +113,10 @@ def handle_key(
         state.preset_index = (state.preset_index + 1) % len(PRESETS)
         name, layout = PRESETS[state.preset_index]
         state.draft = layout
-        state.message = f"Preset loaded locally: {name} — press A to apply"
+        if state.dirty:
+            state.message = f"Preset loaded locally: {name} — press A to apply"
+        else:
+            state.message = f"Preset already active: {name}"
     elif key == ord("x"):
         state.discard_draft()
     elif key == ord("?"):
@@ -192,6 +144,9 @@ class CursesTui:
         self.profile_store = profile_store or ProfileStore()
         self.power_state = "unknown"
         self.colors_enabled = False
+        self._render_failed = False
+        self._rendered_geometry: tuple[int, int] | None = None
+        self._profile_rendered_geometry: tuple[int, int] | None = None
         self.state = self._load_state()
 
     def _load_state(self) -> TuiState:
@@ -214,7 +169,18 @@ class CursesTui:
         self.colors_enabled = initialize_colors()
 
         while True:
-            self._draw(screen)
+            workspace_visible = self._draw(screen)
+            rendered_geometry = self._rendered_geometry
+            if rendered_geometry is None:
+                return
+            try:
+                if screen.getmaxyx() != rendered_geometry:
+                    self.state.message = (
+                        "Terminal resized — workspace redrawn before accepting input"
+                    )
+                    continue
+            except curses.error:
+                return
             try:
                 key = screen.getch()
             except curses.error:
@@ -225,15 +191,18 @@ class CursesTui:
                 height, width = screen.getmaxyx()
             except curses.error:
                 return
+            if (height, width) != rendered_geometry:
+                self.state.message = "Terminal resized — action cancelled; press again"
+                continue
             command = handle_key(
                 self.state,
                 key,
-                actions_enabled=height >= 24 and width >= 78,
+                actions_enabled=(
+                    workspace_visible and height >= 24 and width >= 78
+                ),
             )
             if command is TuiCommand.QUIT:
                 if self.state.dirty:
-                    if height < 5 or width < 20:
-                        return
                     if not self._confirm_action(screen, "Quit?"):
                         self.state.message = "Quit cancelled — local changes preserved"
                         continue
@@ -241,10 +210,7 @@ class CursesTui:
             if command is TuiCommand.APPLY:
                 self._apply()
             elif command is TuiCommand.RESTORE:
-                restore_needed = self.state.current != self.state.original or self.state.dirty
-                if not restore_needed or self._confirm_action(
-                    screen, "Restore the original module layout?"
-                ):
+                if self._confirm_action(screen, "Restore the original module layout?"):
                     self._restore()
                 else:
                     self.state.message = "Restore cancelled"
@@ -255,8 +221,8 @@ class CursesTui:
             elif command is TuiCommand.PROFILES:
                 self._profile_manager(screen)
 
-    @staticmethod
     def _safe_add(
+        self,
         screen: Any,
         y: int,
         x: int,
@@ -269,20 +235,26 @@ class CursesTui:
             height, width = screen.getmaxyx()
             available = max(0, width - x - 1)
             if y < 0 or y >= height or x < 0 or x >= width:
+                self._render_failed = True
                 return False
             if require_full and len(text) > available:
+                self._render_failed = True
                 return False
             screen.addnstr(y, x, text, available, attr)
             return True
         except curses.error:
+            self._render_failed = True
             return False
 
-    def _draw(self, screen: Any) -> None:
+    def _draw(self, screen: Any) -> bool:
+        self._render_failed = False
+        self._rendered_geometry = None
         try:
             screen.erase()
             height, width = screen.getmaxyx()
         except curses.error:
-            return
+            return False
+        self._rendered_geometry = (height, width)
         if height < 24 or width < 78:
             self._safe_add(screen, 1, 2, "OKeyLitCtl needs at least 78 x 24", curses.A_BOLD)
             self._safe_add(screen, 3, 2, f"Current terminal: {width} x {height}")
@@ -290,354 +262,305 @@ class CursesTui:
             try:
                 screen.refresh()
             except curses.error:
-                pass
-            return
-
-        frame = workspace_frame(height, width)
-        base = frame.y
-        left = frame.x + 2
-        right = frame.x + frame.width - 3
-        content_width = frame.width - 4
+                self._render_failed = True
+            return not self._render_failed
 
         cyan = curses.color_pair(1) if self.colors_enabled else curses.A_BOLD
+        chip = curses.color_pair(2) if self.colors_enabled else curses.A_REVERSE
         good = curses.color_pair(3) if self.colors_enabled else curses.A_BOLD
         warn = curses.color_pair(4) if self.colors_enabled else curses.A_BOLD
+        top = max(0, (height - 24) // 2)
 
-        self._safe_add(screen, base, left, "OKEYLITCTL", cyan | curses.A_BOLD)
+        self._safe_add(screen, top + 1, 2, "OKEYLITCTL", cyan | curses.A_BOLD)
         self._safe_add(
             screen,
-            base,
-            left + 12,
-            f"v{__version__}  ·  FOUR-ZONE LIGHTING",
+            top + 1,
+            14,
+            f"v{__version__}  ·  SAFE KEYBOARD LIGHTING",
             curses.A_DIM,
         )
-        state_text = f"● DEVICE {self.power_state.upper()}"
-        draft_text = "* MODIFIED" if self.state.dirty else "SYNCED"
-        header_state = f"{state_text}  {draft_text}"
+        state_text = f" ● DEVICE {self.power_state.upper()} "
         self._safe_add(
             screen,
-            base,
-            right - len(header_state) + 1,
-            header_state,
+            top + 1,
+            max(2, width - len(state_text) - 3),
+            state_text,
+            chip,
+        )
+        self._safe_add(
+            screen,
+            top + 2,
+            2,
+            "PHOTO-MATCHED 100-KEY KEYBOARD",
+            curses.A_BOLD,
+        )
+        dirty = "UNAPPLIED CHANGES" if self.state.dirty else "SYNCHRONIZED"
+        self._safe_add(
+            screen,
+            top + 2,
+            width - len(dirty) - 3,
+            dirty,
             warn if self.state.dirty else good,
         )
-        self._safe_add(screen, base + 1, left, "─" * content_width, curses.A_DIM)
-        self._safe_add(screen, base + 2, left, "FOUR-ZONE OUTPUT", curses.A_BOLD)
-        region_note = (
-            "COARSE ZONES · NOT PER-KEY"
-            if frame.width < 100
-            else "COARSE HARDWARE REGIONS · NOT PER-KEY"
-        )
         self._safe_add(
             screen,
-            base + 2,
-            right - len(region_note) + 1,
-            region_note,
+            top + 3,
+            2,
+            "APPROX. FOUR-ZONE SHADING · NOT PER-KEY",
             curses.A_DIM,
+            require_full=True,
         )
 
-        self._draw_keyboard_visualization(screen, width, top=base)
-        self._draw_editor_panel(screen, frame, cyan, warn)
+        self._draw_keyboard_visualization(screen, width, top + 4)
 
-        status_prefix = "*" if self.state.dirty else "✓"
+        selected = self.state.selected_zone
+        color = self.state.selected_color
+        zones = (
+            f"1 RIGHT #{self.state.draft.right}  "
+            f"2 CENTER #{self.state.draft.center}  "
+            f"3 LEFT #{self.state.draft.left}  "
+            f"4 WASD #{self.state.draft.wasd}"
+        )
         self._safe_add(
             screen,
-            base + 21,
-            left,
-            f"{status_prefix} {self.state.message}",
-            warn if self.state.dirty else good,
+            top + 12,
+            2,
+            zones,
+            curses.A_BOLD,
+            require_full=True,
         )
-        edit_footer = "←/→ ZONE  ↑/↓ CHANNEL  -/+ FINE  [/] COARSE  [P] PRESET  [E] HEX"
-        global_footer = "[A] APPLY  [M] PROFILES  [O] ORIGINAL  [R] REFRESH  [?] HELP  [Q] QUIT"
-        self._safe_add(screen, base + 22, left, edit_footer, curses.A_DIM)
-        self._safe_add(screen, base + 23, left, global_footer, curses.A_BOLD)
+        current_color = getattr(self.state.current, selected.value)
+        editor = (
+            f"EDIT {selected.value.upper():<6}  LIVE #{current_color}  "
+            f"DRAFT #{color}  ·  LOCAL UNTIL A APPLY"
+        )
+        self._safe_add(
+            screen,
+            top + 13,
+            2,
+            editor,
+            cyan | curses.A_BOLD,
+            require_full=True,
+        )
+
+        channels = ("RED", "GREEN", "BLUE")
+        for row, (name, offset) in enumerate(zip(channels, (0, 2, 4))):
+            value = int(color[offset : offset + 2], 16)
+            active = row == self.state.selected_channel
+            attr = cyan | curses.A_BOLD if active else 0
+            marker = "▶" if active else " "
+            filled = round(value / 255 * 18)
+            bar = "━" * filled + "─" * (18 - filled)
+            self._safe_add(
+                screen,
+                top + 14 + row,
+                3,
+                f"{marker} {name:<5} {bar}  {value:3d}  {value:02X}",
+                attr,
+                require_full=True,
+            )
+
+        preset = "Custom" if self.state.preset_index < 0 else PRESETS[self.state.preset_index][0]
+        self._safe_add(
+            screen,
+            top + 17,
+            2,
+            f"PRESET {preset}  ·  P CYCLE  ·  E EXACT HEX  ·  X DISCARD DRAFT",
+            curses.A_DIM,
+            require_full=True,
+        )
+        self._safe_add(
+            screen,
+            top + 18,
+            2,
+            self.state.message,
+            good if not self.state.dirty else warn,
+        )
+        commands_edit = (
+            "←/→ ZONE  ↑/↓ RGB  +/- FINE  [/] COARSE  P PRESET  E HEX  X DISCARD"
+        )
+        commands_global = (
+            "A APPLY NOW  M PROFILES  O ORIGINAL  R REFRESH  ? HELP  Q QUIT"
+        )
+        self._safe_add(
+            screen,
+            top + 20,
+            2,
+            commands_edit,
+            curses.A_DIM,
+            require_full=True,
+        )
+        self._safe_add(
+            screen,
+            top + 21,
+            2,
+            commands_global,
+            curses.A_BOLD,
+            require_full=True,
+        )
 
         if self.state.help_visible:
             self._draw_help(screen)
         try:
             screen.refresh()
         except curses.error:
-            pass
+            self._render_failed = True
+        return not self._render_failed
 
-    def _draw_editor_panel(
+    @staticmethod
+    def _compact_key_legend(item: ProjectedKey, interior: int) -> str:
+        legend = item.key.legend
+        if len(legend) <= interior:
+            return legend
+        aliases = {
+            "ESC": "E",
+            "PWR": "P",
+            "DEL": "D",
+            "CALC": "C",
+            "INS": "I",
+            "PRTSC": "PRT",
+            "NUMLK": "NUM",
+            "BKSP": "BSP",
+            "ENTER": "ENT",
+            "SHIFT": "SFT",
+            "CTRL": "CTL",
+        }
+        compact = aliases.get(legend, legend)
+        if compact.startswith("F") and compact[1:].isdigit():
+            number = int(compact[1:])
+            if interior == 1:
+                compact = str(number) if number < 10 else chr(ord("A") + number - 10)
+            else:
+                compact = compact[1:]
+        return compact[:interior]
+
+    def _key_attr(self, zone: Zone) -> int:
+        selected = zone is self.state.selected_zone
+        fallback = curses.A_REVERSE if selected else curses.A_DIM
+        if not self.colors_enabled or getattr(curses, "COLORS", 0) < 256:
+            return fallback
+        color = getattr(self.state.draft, zone.value)
+        pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
+        background = rgb_to_xterm_index(color)
+        luminance = sum(
+            int(color[offset : offset + 2], 16) * weight
+            for offset, weight in zip((0, 2, 4), (299, 587, 114))
+        ) / 1000
+        foreground = 16 if luminance > 145 else 231
+        try:
+            curses.init_pair(pair_number, foreground, background)
+            attr = curses.color_pair(pair_number)
+            return attr | (curses.A_BOLD if selected else 0)
+        except curses.error:
+            return fallback
+
+    def _draw_projected_key(
         self,
         screen: Any,
-        frame: WorkspaceFrame,
-        accent: int,
-        warning: int,
+        item: ProjectedKey,
+        origin_x: int,
+        origin_y: int,
+        *,
+        continuation: bool = False,
     ) -> None:
-        x = frame.x + 2
-        y = frame.y + 12
-        width = frame.width - 4
-        selected = self.state.selected_zone
-        draft = self.state.selected_color
-        live = getattr(self.state.current, selected.value)
-        dirty = draft != live
-        border_attr = accent if dirty else curses.A_DIM
-        interior_right = x + width - 2
-
-        def panel_add(row: int, column: int, text: str, attr: int = 0) -> None:
-            available = max(0, interior_right - column)
-            self._safe_add(screen, row, column, text[:available], attr)
-
-        self._safe_add(screen, y, x, "╭" + "─" * (width - 2) + "╮", border_attr)
-        for row in range(1, 8):
+        if item.width < 3:
+            token = item.key.legend[: item.width].center(item.width)
             self._safe_add(
                 screen,
-                y + row,
-                x,
-                "│" + " " * (width - 2) + "│",
-                border_attr,
+                origin_y + item.screen_row,
+                origin_x + item.screen_x,
+                token,
+                self._key_attr(item.zone),
+                require_full=True,
             )
-        self._safe_add(
-            screen,
-            y + 8,
-            x,
-            "╰" + "─" * (width - 2) + "╯",
-            border_attr,
-        )
-
-        zone_name = selected.value.upper()
-        if selected is Zone.RIGHT:
-            zone_name = "RIGHT / ARROWS / NUMPAD"
-        title = f" COLOR EDITOR  ·  ZONE {FIRMWARE_ZONE_ORDER.index(selected) + 1}  {zone_name} "
-        state_label = "* UNAPPLIED" if dirty else "SYNCED"
-        state_x = x + width - len(state_label) - 3
-        title_available = max(0, state_x - (x + 2) - 1)
-        self._safe_add(
-            screen,
-            y,
-            x + 2,
-            title[:title_available],
-            accent | curses.A_BOLD,
-        )
-        self._safe_add(
-            screen,
-            y,
-            state_x,
-            f" {state_label} ",
-            warning if dirty else curses.A_BOLD,
-        )
-
-        panel_add(y + 2, x + 3, f"DRAFT #{draft}", curses.A_BOLD)
-        panel_add(y + 2, x + 23, f"LIVE  #{live}", curses.A_DIM)
-        if width < 100:
-            action_hint = "A applies immediately" if dirty else "Draft matches device"
+            return
+        interior = item.width - 2
+        legend = self._compact_key_legend(item, interior)
+        if continuation:
+            token = "│" + legend.center(interior) + "│"
         else:
-            action_hint = (
-                "A applies all four zones immediately"
-                if dirty
-                else "Device and draft match"
-            )
-        panel_add(y + 2, x + 43, action_hint, curses.A_DIM)
-
-        channels = ("RED", "GREEN", "BLUE")
-        track_width = min(28, max(12, width - 35))
-        for row, (name, offset) in enumerate(zip(channels, (0, 2, 4))):
-            value = int(draft[offset : offset + 2], 16)
-            active = row == self.state.selected_channel
-            attr = accent | curses.A_BOLD if active else 0
-            marker = "▶" if active else " "
-            filled = round(value / 255 * track_width)
-            bar = "█" * filled + "░" * (track_width - filled)
-            panel_add(
-                y + 4 + row,
-                x + 3,
-                f"{marker} {name:<5} {value:3d}  {value:02X}  [{bar}]",
-                attr,
-            )
-
-        preset = "Custom" if self.state.preset_index < 0 else PRESETS[self.state.preset_index][0]
-        panel_add(y + 7, x + 3, f"PRESET  {preset}", curses.A_BOLD)
-        preset_help = (
-            "[P] preset  [E] hex  [X] discard"
-            if width < 100
-            else "[P] cycle preset   [E] exact hex   [X] discard draft"
-        )
-        panel_add(
-            y + 7,
-            x + 25,
-            preset_help,
-            curses.A_DIM,
+            token = "[" + legend.center(interior) + "]"
+        self._safe_add(
+            screen,
+            origin_y + item.screen_row,
+            origin_x + item.screen_x,
+            token,
+            self._key_attr(item.zone),
+            require_full=True,
         )
 
     def _draw_keyboard_visualization(
-        self, screen: Any, width: int, *, top: int = 0
+        self, screen: Any, width: int, origin_y: int
     ) -> None:
-        regions = keyboard_region_geometry(width, top=top)
-        labels = {
-            Zone.LEFT: (
-                "3 LEFT" if regions[Zone.LEFT].width < 22 else "3 · LEFT REGION"
-            ),
-            Zone.CENTER: (
-                "2 CENTER"
-                if regions[Zone.CENTER].width < 25
-                else "2 · CENTER REGION"
-            ),
-            Zone.RIGHT: (
-                "1 RIGHT+ARROWS+NUMPAD"
-                if regions[Zone.RIGHT].width < 36
-                else "1 · RIGHT + ARROWS + NUMPAD"
-            ),
-            Zone.WASD: "WASD REGION",
-        }
-        for zone in (Zone.LEFT, Zone.CENTER, Zone.RIGHT):
-            self._draw_visual_region(screen, regions[zone], zone, labels[zone])
-        self._draw_visual_region(
-            screen,
-            regions[Zone.WASD],
-            Zone.WASD,
-            labels[Zone.WASD],
-            compact=True,
-        )
-
-    def _draw_visual_region(
-        self,
-        screen: Any,
-        region: VisualRegion,
-        zone: Zone,
-        label: str,
-        *,
-        compact: bool = False,
-    ) -> None:
-        selected = zone is self.state.selected_zone
-        color = getattr(self.state.draft, zone.value)
-        live = getattr(self.state.current, zone.value)
-        dirty = color != live
-        inner_width = max(1, region.width - (0 if compact else 4))
-
-        def fit(text: str) -> str:
-            return text[:inner_width]
-        if selected and self.colors_enabled:
-            border_attr = curses.color_pair(1) | curses.A_BOLD
-        else:
-            border_attr = curses.A_BOLD if selected else curses.A_DIM
-
-        if compact:
-            compact_attr = curses.A_REVERSE if selected else curses.A_BOLD
+        projection = project_keyboard(width)
+        origin_x = max(1, (width - projection.width) // 2)
+        rows: dict[int, list[ProjectedKey]] = {}
+        for item in projection.keys:
+            rows.setdefault(item.screen_row, []).append(item)
+            for continuation_row in self._continuation_rows(item):
+                rows.setdefault(continuation_row, []).append(item)
+        for screen_row in range(7):
+            row_items = rows[6] if screen_row == 5 else rows.get(screen_row, [])
+            if not row_items:
+                continue
+            left = min(item.screen_x for item in row_items) - 1
+            right = max(item.screen_x + item.width for item in row_items)
             self._safe_add(
                 screen,
-                region.y,
-                region.x,
-                fit(
-                    f"{'>' if selected else ''}WASD REGION 4"
-                    f"{'*' if dirty else ''}"
-                ),
-                compact_attr,
-            )
-            self._safe_add(
-                screen,
-                region.y + 1,
-                region.x,
-                fit(f"#{color}{' DRAFT' if dirty else ' SYNCED'}"),
-                compact_attr,
-            )
-            if self.colors_enabled and getattr(curses, "COLORS", 0) >= 256:
-                background = rgb_to_xterm_index(color)
-                try:
-                    curses.init_pair(33, 231, background)
-                    swatch_width = max(3, region.width - 9)
-                    self._safe_add(
-                        screen,
-                        region.y + 1,
-                        region.x + region.width - swatch_width,
-                        " " * swatch_width,
-                        curses.color_pair(33),
-                    )
-                except curses.error:
-                    pass
-            return
-
-        top = "╭" + "─" * (region.width - 2) + "╮"
-        bottom = "╰" + "─" * (region.width - 2) + "╯"
-        self._safe_add(screen, region.y, region.x, top, border_attr)
-        for row in range(1, region.height - 1):
-            self._safe_add(
-                screen,
-                region.y + row,
-                region.x,
-                "│" + " " * (region.width - 2) + "│",
-                border_attr,
-            )
-        self._safe_add(
-            screen,
-            region.y + region.height - 1,
-            region.x,
-            bottom,
-            border_attr,
-        )
-
-        title = f"{'▶' if selected else ' '} {label}{' *' if dirty else ''}"
-        self._safe_add(
-            screen,
-            region.y + 1,
-            region.x + 2,
-            fit(title),
-            curses.A_BOLD,
-        )
-
-        if zone is not Zone.LEFT:
-            live_text = f"LIVE #{live}" if inner_width >= 13 else f"L #{live}"
-            if dirty:
-                draft_text = (
-                    f"DRAFT #{color} *" if inner_width >= 15 else f"D #{color} *"
-                )
-            else:
-                draft_text = (
-                    f"DRAFT #{color} SYNCED"
-                    if inner_width >= 21
-                    else f"D #{color} OK"
-                )
-            self._safe_add(
-                screen,
-                region.y + 2,
-                region.x + 2,
-                fit(live_text),
+                origin_y + screen_row,
+                origin_x + left,
+                "╱",
                 curses.A_DIM,
+                require_full=True,
             )
             self._safe_add(
                 screen,
-                region.y + 3,
-                region.x + 2,
-                fit(draft_text),
-                curses.A_BOLD if dirty else curses.A_DIM,
+                origin_y + screen_row,
+                origin_x + right,
+                "╲",
+                curses.A_DIM,
+                require_full=True,
             )
-
+        for item in sorted(
+            projection.keys, key=lambda projected: (projected.screen_row, projected.screen_x)
+        ):
+            self._draw_projected_key(screen, item, origin_x, origin_y)
+            for continuation_row in self._continuation_rows(item):
+                continuation = ProjectedKey(
+                    key=item.key,
+                    screen_x=item.screen_x,
+                    screen_row=continuation_row,
+                    width=item.width,
+                    row_span=1,
+                    zone=item.zone,
+                )
+                self._draw_projected_key(
+                    screen,
+                    continuation,
+                    origin_x,
+                    origin_y,
+                    continuation=True,
+                )
+        bottom_items = rows[6]
+        left = min(item.screen_x for item in bottom_items) - 1
+        right = max(item.screen_x + item.width for item in bottom_items)
+        base_width = right - left + 1
         self._safe_add(
             screen,
-            region.y + region.height - 2,
-            region.x + 2,
-            fit(
-                (
-                    f"D #{color} *"
-                    if dirty and inner_width < 22
-                    else f"LIVE #{live} → DRAFT #{color}{' *' if dirty else ''}"
-                )
-                if zone is Zone.LEFT
-                else f"#{color}"
-            ),
-            curses.A_BOLD,
+            origin_y + 7,
+            origin_x + left,
+            "╰" + "═" * (base_width - 2) + "╯",
+            curses.A_DIM,
+            require_full=True,
         )
-        if self.colors_enabled and getattr(curses, "COLORS", 0) >= 256:
-            pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
-            background = rgb_to_xterm_index(color)
-            luminance = sum(
-                int(color[offset : offset + 2], 16) * weight
-                for offset, weight in zip((0, 2, 4), (299, 587, 114))
-            ) / 1000
-            foreground = 16 if luminance > 145 else 231
-            try:
-                curses.init_pair(pair_number, foreground, background)
-                swatch_width = max(3, region.width - 13)
-                self._safe_add(
-                    screen,
-                    region.y + region.height - 2,
-                    region.x + region.width - swatch_width - 2,
-                    " " * swatch_width,
-                    curses.color_pair(pair_number),
-                )
-            except curses.error:
-                pass
+
+    @staticmethod
+    def _continuation_rows(item: ProjectedKey) -> tuple[int, ...]:
+        if item.row_span != 2:
+            return ()
+        if item.key.id == "KP_ENTER":
+            return (5, 6)
+        return (item.screen_row + 1,)
 
     def _draw_help(self, screen: Any) -> None:
         try:
@@ -691,8 +614,30 @@ class CursesTui:
             ):
                 self.state.message = "Profile manager closed after terminal rendering error"
                 return
+            rendered_geometry = self._profile_rendered_geometry
+            if rendered_geometry is None:
+                self.state.message = "Profile manager closed after terminal error"
+                return
+            try:
+                if screen.getmaxyx() != rendered_geometry:
+                    self.state.message = (
+                        "Profile manager closed after terminal rendering error"
+                    )
+                    return
+            except curses.error:
+                self.state.message = "Profile manager closed after terminal error"
+                return
             try:
                 key = screen.getch()
+            except curses.error:
+                self.state.message = "Profile manager closed after terminal error"
+                return
+            try:
+                if screen.getmaxyx() != rendered_geometry:
+                    self.state.message = (
+                        "Profile manager closed after terminal rendering error"
+                    )
+                    return
             except curses.error:
                 self.state.message = "Profile manager closed after terminal error"
                 return
@@ -751,9 +696,12 @@ class CursesTui:
                 )
             screen.refresh()
             final_height, final_width = screen.getmaxyx()
-            if final_height < 5 or final_width < box_width + 2:
+            if (final_height, final_width) != (height, width):
                 return False
-            return screen.getch() in (ord("y"), ord("Y"))
+            key = screen.getch()
+            if screen.getmaxyx() != (final_height, final_width):
+                return False
+            return key in (ord("y"), ord("Y"))
         except curses.error:
             return False
 
@@ -764,10 +712,12 @@ class CursesTui:
         selected: int,
         pending_delete: str | None = None,
     ) -> bool:
+        self._profile_rendered_geometry = None
         try:
             height, width = screen.getmaxyx()
         except curses.error:
             return False
+        self._profile_rendered_geometry = (height, width)
         box_width = min(56, width - 6)
         visible = min(10, max(1, height - 10))
         box_height = visible + 7
@@ -868,9 +818,13 @@ class CursesTui:
             ):
                 raise curses.error
             screen.refresh()
+            if screen.getmaxyx() != (height, width):
+                raise curses.error
             curses.echo()
             set_cursor_visibility(1)
             raw = screen.getstr(row, 2 + len(prompt), 32).decode("ascii")
+            if screen.getmaxyx() != (height, width):
+                raise curses.error
             return raw or None
         except (UnicodeDecodeError, curses.error):
             self.state.message = "Profile name entry cancelled"
@@ -896,7 +850,12 @@ class CursesTui:
         try:
             self.state.draft = self.profile_store.load(name)
             self.state.preset_index = -1
-            self.state.message = f"Profile loaded locally: {name} — press A to apply"
+            if self.state.dirty:
+                self.state.message = (
+                    f"Profile loaded locally: {name} — press A to apply"
+                )
+            else:
+                self.state.message = f"Profile already active: {name}"
         except ProfileError as exc:
             self.state.message = f"Profile load failed: {exc}"
 
@@ -915,13 +874,36 @@ class CursesTui:
             self.state.message = f"Profile delete failed: {exc}"
 
     def _restore(self) -> None:
-        if self.state.current == self.state.original and not self.state.dirty:
-            self.state.message = "Original layout is already active"
+        try:
+            status = self.backend.status()
+            live = ColorLayout.from_wire(",".join(status["colors"]))
+            live_original = ColorLayout.from_wire(",".join(status["original"]))
+        except (SysfsError, ValidationError) as exc:
+            self.state.message = f"Restore failed: {exc}"
+            return
+        if live == live_original:
+            had_dirty_draft = self.state.dirty
+            self.state.original = live_original
+            self.state.mark_restored()
+            if had_dirty_draft:
+                self.state.message = (
+                    "Original layout already active; local draft discarded"
+                )
+            else:
+                self.state.message = "Original layout is already active"
             return
         try:
             self.backend.restore()
+            verified = self.backend.status()
+            restored = ColorLayout.from_wire(",".join(verified["colors"]))
+            verified_original = ColorLayout.from_wire(",".join(verified["original"]))
+            if restored != verified_original:
+                raise ValidationError(
+                    "restored colors no longer match the saved original"
+                )
+            self.state.original = verified_original
             self.state.mark_restored()
-        except SysfsError as exc:
+        except (SysfsError, ValidationError) as exc:
             self.state.message = f"Restore failed: {exc}"
 
     def _refresh(self) -> None:
@@ -938,7 +920,7 @@ class CursesTui:
     def _edit_color(self, screen: Any) -> None:
         prompt = f"Enter {self.state.selected_zone.value.upper()} color (RRGGBB): "
         try:
-            height, _ = screen.getmaxyx()
+            height, width = screen.getmaxyx()
             if not self._safe_add(
                 screen,
                 height - 3,
@@ -957,9 +939,13 @@ class CursesTui:
             ):
                 raise curses.error
             screen.refresh()
+            if screen.getmaxyx() != (height, width):
+                raise curses.error
             curses.echo()
             set_cursor_visibility(1)
             raw = screen.getstr(height - 3, 2 + len(prompt), 6).decode("ascii")
+            if screen.getmaxyx() != (height, width):
+                raise curses.error
             self.state.set_selected_color(raw)
             self.state.message = f"Local {self.state.selected_zone.value} color set to #{self.state.selected_color}"
         except (UnicodeDecodeError, ValidationError):

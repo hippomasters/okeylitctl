@@ -9,10 +9,8 @@ from okeylitctl.tui import (
     TuiCommand,
     handle_key,
     initialize_colors,
-    keyboard_region_geometry,
     rgb_to_xterm_index,
     set_cursor_visibility,
-    workspace_frame,
 )
 from okeylitctl.tui_state import TuiState
 
@@ -64,6 +62,15 @@ class TuiInteractionTests(unittest.TestCase):
         handle_key(self.state, ord("p"))
         self.assertEqual(self.state.draft, PRESETS[1][1])
 
+    def test_active_preset_does_not_claim_it_needs_apply(self):
+        state = TuiState(current=PRESETS[0][1], original=PRESETS[0][1])
+
+        handle_key(state, ord("p"))
+
+        self.assertFalse(state.dirty)
+        self.assertNotIn("press A", state.message)
+        self.assertIn("already active", state.message)
+
     def test_discard_and_help_are_local_actions(self):
         self.state.set_selected_color("FFFFFF")
         handle_key(self.state, ord("x"))
@@ -80,32 +87,6 @@ class TuiInteractionTests(unittest.TestCase):
         self.assertEqual(rgb_to_xterm_index("FF0000"), 196)
         self.assertEqual(rgb_to_xterm_index("FFFFFF"), 231)
 
-    def test_keyboard_visualization_uses_regions_not_individual_keys(self):
-        regions = keyboard_region_geometry(100)
-        left = regions[Zone.LEFT]
-        center = regions[Zone.CENTER]
-        right = regions[Zone.RIGHT]
-        wasd = regions[Zone.WASD]
-
-        self.assertLess(left.x + left.width, center.x)
-        self.assertLess(center.x + center.width, right.x)
-        self.assertGreater(right.width, left.width)
-        self.assertGreaterEqual(wasd.x, left.x)
-        self.assertLessEqual(wasd.x + wasd.width, left.x + left.width)
-        self.assertGreaterEqual(wasd.y, left.y)
-        self.assertLessEqual(wasd.y + wasd.height, left.y + left.height)
-
-    def test_workspace_is_centered_and_width_capped_on_large_terminals(self):
-        minimum = workspace_frame(24, 78)
-        self.assertEqual((minimum.x, minimum.y, minimum.width), (0, 0, 78))
-
-        large = workspace_frame(60, 180)
-        self.assertEqual(large.width, 132)
-        self.assertEqual(large.x, 24)
-        self.assertEqual(large.y, 18)
-
-        medium = workspace_frame(30, 100)
-        self.assertEqual(medium.y, 3)
 
     def test_cursor_visibility_is_an_optional_terminal_capability(self):
         with mock.patch("okeylitctl.tui.curses.curs_set", side_effect=curses.error):
@@ -146,6 +127,7 @@ class FakeBackend:
 
     def restore(self):
         self.restores += 1
+        self.status_value["colors"] = list(self.status_value["original"])
 
 
 class FakeProfileStore:
@@ -248,6 +230,30 @@ class TuiDeviceActionTests(unittest.TestCase):
             app._confirm_action(truncated, "Apply complete four-zone layout?")
         )
         self.assertEqual(truncated.reads, 0)
+
+    def test_confirmation_fails_closed_if_terminal_resizes_while_yes_is_read(self):
+        app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
+
+        class ResizingConfirmationScreen:
+            def __init__(self):
+                self.width = 100
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                self.width = 10
+                return ord("y")
+
+        self.assertFalse(
+            app._confirm_action(ResizingConfirmationScreen(), "Restore?")
+        )
 
     def test_apply_is_immediate_and_quits_cleanly(self):
         backend = FakeBackend()
@@ -396,10 +402,20 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertIn("Y=yes; else=no", confirmable.rendered)
         self.assertEqual(confirmable.reads, 4)
 
-        too_small = NarrowScreen(19, (ord("q"),))
+        class RecoveringNarrowScreen(NarrowScreen):
+            def getch(self):
+                self.reads += 1
+                key = next(self.keys)
+                if key == curses.KEY_RESIZE:
+                    self.width = 20
+                return key
+
+        too_small = RecoveringNarrowScreen(
+            19, (ord("q"), curses.KEY_RESIZE, ord("q"), ord("y"))
+        )
         with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
             app._main(too_small)
-        self.assertEqual(too_small.reads, 1)
+        self.assertEqual(too_small.reads, 4)
 
     def test_main_and_draw_exit_safely_on_terminal_io_errors(self):
         app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
@@ -450,6 +466,127 @@ class TuiDeviceActionTests(unittest.TestCase):
         with mock.patch.object(app, "_draw"):
             app._main(FailingGeometryScreen())
 
+    def test_failed_workspace_render_disables_apply(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("A1B2C3")
+
+        class HiddenWorkspaceScreen:
+            def __init__(self):
+                self.keys = iter((ord("a"),))
+
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                raise curses.error("workspace hidden")
+
+            def refresh(self):
+                raise curses.error("workspace hidden")
+
+            def getch(self):
+                try:
+                    return next(self.keys)
+                except StopIteration as exc:
+                    raise curses.error("stop") from exc
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(HiddenWorkspaceScreen())
+
+        self.assertEqual(backend.writes, [])
+        self.assertTrue(app.state.dirty)
+
+    def test_unannounced_resize_cancels_action_from_stale_workspace(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("A1B2C3")
+
+        class ResizeDuringInputScreen:
+            def __init__(self):
+                self.width = 110
+                self.keys = iter((ord("a"), ord("q"), ord("y")))
+
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                key = next(self.keys)
+                if key == ord("a"):
+                    self.width = 78
+                return key
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(ResizeDuringInputScreen())
+
+        self.assertEqual(backend.writes, [])
+
+    def test_resize_during_refresh_forces_redraw_before_apply(self):
+        class RefreshAwareBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.screen = None
+                self.refreshes_at_write = 0
+
+            def write_colors(self, value):
+                self.refreshes_at_write = self.screen.refreshes
+                super().write_colors(value)
+
+        backend = RefreshAwareBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("A1B2C3")
+
+        class ResizeDuringRefreshScreen:
+            def __init__(self):
+                self.width = 110
+                self.refreshes = 0
+                self.keys = iter((ord("a"), ord("q")))
+
+            def keypad(self, _enabled):
+                return None
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                self.refreshes += 1
+                if self.refreshes == 1:
+                    self.width = 78
+
+            def getch(self):
+                return next(self.keys)
+
+        screen = ResizeDuringRefreshScreen()
+        backend.screen = screen
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(screen)
+
+        self.assertEqual(backend.writes, ["A1B2C3,222222,333333,444444"])
+        self.assertGreaterEqual(backend.refreshes_at_write, 2)
+
     def test_profile_load_changes_only_the_local_draft(self):
         backend = FakeBackend()
         profiles = FakeProfileStore()
@@ -466,6 +603,18 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertEqual(backend.writes, [])
         self.assertEqual(profiles.calls, [("load", "Work")])
         self.assertIn("locally", app.state.message)
+
+    def test_profile_equal_to_current_does_not_claim_it_needs_apply(self):
+        backend = FakeBackend()
+        profiles = FakeProfileStore()
+        app = CursesTui(backend, profile_store=profiles)
+        profiles.layouts["Current"] = app.state.current
+
+        app._load_profile("Current")
+
+        self.assertFalse(app.state.dirty)
+        self.assertNotIn("press A", app.state.message)
+        self.assertIn("already active", app.state.message)
 
     def test_profile_save_persists_the_local_draft_without_applying(self):
         backend = FakeBackend()
@@ -638,7 +787,65 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertEqual(screen.reads, 1)
         self.assertIn("rendering error", app.state.message)
 
-    def test_workspace_draws_coarse_keyboard_regions(self):
+    def test_profile_delete_fails_closed_if_terminal_resizes_while_yes_is_read(self):
+        profiles = FakeProfileStore()
+        app = CursesTui(FakeBackend(), profile_store=profiles)
+
+        class ResizeDuringYesScreen:
+            def __init__(self):
+                self.width = 100
+                self.keys = iter((ord("d"), ord("y")))
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                key = next(self.keys)
+                if key == ord("y"):
+                    self.width = 20
+                return key
+
+        app._profile_manager(ResizeDuringYesScreen())
+
+        self.assertNotIn(("delete", "Work"), profiles.calls)
+        self.assertIn("rendering error", app.state.message)
+
+    def test_profile_delete_fails_closed_if_resize_occurs_during_refresh(self):
+        profiles = FakeProfileStore()
+        app = CursesTui(FakeBackend(), profile_store=profiles)
+
+        class ResizeDuringRefreshScreen:
+            def __init__(self):
+                self.width = 100
+                self.refreshes = 0
+                self.keys = iter((ord("d"), ord("y")))
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                self.refreshes += 1
+                if self.refreshes == 2:
+                    self.width = 20
+
+            def getch(self):
+                return next(self.keys)
+
+        app._profile_manager(ResizeDuringRefreshScreen())
+
+        self.assertNotIn(("delete", "Work"), profiles.calls)
+        self.assertIn("rendering error", app.state.message)
+
+    def test_workspace_draws_the_photo_matched_keyboard(self):
         backend = FakeBackend()
         app = CursesTui(backend)
 
@@ -662,125 +869,22 @@ class TuiDeviceActionTests(unittest.TestCase):
         app._draw(screen)
         rendered = " ".join(screen.text)
 
-        self.assertIn("LEFT REGION", rendered)
-        self.assertIn("WASD REGION", rendered)
-        self.assertIn("CENTER REGION", rendered)
-        self.assertIn("RIGHT + ARROWS + NUMPAD", rendered)
-        self.assertNotIn("BACKSPACE", rendered)
+        for legend in ("ESC", "F12", "PWR", "BKSP", "NUM", "ENTER"):
+            self.assertIn(legend, rendered)
+        self.assertIn("╱", rendered)
+        self.assertIn("═", rendered)
+        self.assertIn("APPROX.", rendered)
+        self.assertIn("NOT PER-KEY", rendered)
+        self.assertNotIn("REGION", rendered)
 
-    def test_large_workspace_is_centered_with_live_draft_editor_and_command_bars(self):
-        backend = FakeBackend()
-        app = CursesTui(backend)
-        app.state.set_selected_color("A1B2C3")
-
-        class BufferScreen:
-            def __init__(self):
-                self.width = 180
-                self.height = 60
-                self.cells = [
-                    [" " for _ in range(self.width)] for _ in range(self.height)
-                ]
-
-            def getmaxyx(self):
-                return (self.height, self.width)
-
-            def erase(self):
-                self.cells = [
-                    [" " for _ in range(self.width)] for _ in range(self.height)
-                ]
-
-            def addnstr(self, y, x, text, limit, _attr):
-                for offset, character in enumerate(text[:limit]):
-                    if 0 <= y < self.height and 0 <= x + offset < self.width:
-                        self.cells[y][x + offset] = character
-
-            def refresh(self):
-                return None
-
-            def row(self, y):
-                return "".join(self.cells[y])
-
-        screen = BufferScreen()
-        app._draw(screen)
-        frame = workspace_frame(screen.height, screen.width)
-        visible = "\n".join(screen.row(y) for y in range(frame.y, frame.y + 24))
-        zone_area = "\n".join(
-            screen.row(y) for y in range(frame.y + 5, frame.y + 11)
-        )
-
-        self.assertIn("OKEYLITCTL", screen.row(frame.y))
-        self.assertNotIn("OKEYLITCTL", screen.row(1))
-        self.assertIn("▶ 1 · RIGHT + ARROWS + NUMPAD", zone_area)
-        self.assertIn("LIVE #111111", zone_area)
-        self.assertIn("DRAFT #A1B2C3", zone_area)
-        self.assertIn("COLOR EDITOR", visible)
-        self.assertIn("DRAFT #A1B2C3", visible)
-        self.assertIn("LIVE  #111111", visible)
-        self.assertIn("[A] APPLY", visible)
-        self.assertIn("[M] PROFILES", visible)
-
-    def test_minimum_workspace_preserves_borders_and_complete_safety_labels(self):
-        backend = FakeBackend()
-        app = CursesTui(backend)
-        app.state.draft = app.state.draft.with_zone(Zone.LEFT, "ABCDEF")
-
-        class BufferScreen:
-            def __init__(self):
-                self.width = 78
-                self.height = 24
-                self.cells = [
-                    [" " for _ in range(self.width)] for _ in range(self.height)
-                ]
-
-            def getmaxyx(self):
-                return (self.height, self.width)
-
-            def erase(self):
-                self.cells = [
-                    [" " for _ in range(self.width)] for _ in range(self.height)
-                ]
-
-            def addnstr(self, y, x, text, limit, _attr):
-                for offset, character in enumerate(text[:limit]):
-                    if 0 <= y < self.height and 0 <= x + offset < self.width:
-                        self.cells[y][x + offset] = character
-
-            def refresh(self):
-                return None
-
-            def row(self, y):
-                return "".join(self.cells[y])
-
-        screen = BufferScreen()
-        app._draw(screen)
-        zone_area = "\n".join(screen.row(y) for y in range(5, 11))
-
-        self.assertIn("NOT PER-KEY", screen.row(2))
-        self.assertIn("3 LEFT *", zone_area)
-        self.assertIn("D #ABCDEF *", zone_area)
-        self.assertIn("1 RIGHT+ARROWS+NUMPAD", zone_area)
-
-        app.state.selected_zone = Zone.LEFT
-        app._draw(screen)
-        editor = "\n".join(screen.row(y) for y in range(12, 21))
-        self.assertIn("A applies immediately", editor)
-        self.assertIn("[P] preset  [E] hex  [X] discard", editor)
-        self.assertEqual(screen.cells[12][2], "╭")
-        self.assertEqual(screen.cells[12][75], "╮")
-        for row in range(13, 20):
-            self.assertEqual(screen.cells[row][2], "│")
-            self.assertEqual(screen.cells[row][75], "│")
-        self.assertEqual(screen.cells[20][2], "╰")
-        self.assertEqual(screen.cells[20][75], "╯")
-
-    def test_keyboard_region_rendering_preserves_boundaries_and_all_four_colors(self):
+    def test_minimum_screen_keeps_every_primary_action_and_zone_visible(self):
         backend = FakeBackend()
         app = CursesTui(backend)
 
         class BufferScreen:
-            def __init__(self, width):
+            def __init__(self, width, height=24):
                 self.width = width
-                self.height = 30
+                self.height = height
                 self.cells = [[" " for _ in range(width)] for _ in range(self.height)]
 
             def getmaxyx(self):
@@ -805,24 +909,40 @@ class TuiDeviceActionTests(unittest.TestCase):
         for width in (78, 79, 100, 140):
             with self.subTest(width=width):
                 screen = BufferScreen(width)
-                app._draw(screen)
-                top = workspace_frame(screen.height, width).y
-                regions = keyboard_region_geometry(width, top=top)
+                self.assertTrue(app._draw(screen))
+                rendered = "\n".join(screen.row(y) for y in range(screen.height))
 
-                for zone in (Zone.LEFT, Zone.CENTER, Zone.RIGHT):
-                    region = regions[zone]
-                    for y in range(region.y + 1, region.y + region.height - 1):
-                        self.assertEqual(screen.cells[y][region.x], "│")
-                        self.assertEqual(
-                            screen.cells[y][region.x + region.width - 1], "│"
+                for action in (
+                    "A APPLY NOW",
+                    "M PROFILES",
+                    "O ORIGINAL",
+                    "R REFRESH",
+                    "? HELP",
+                    "Q QUIT",
+                ):
+                    self.assertIn(action, rendered)
+                for color in ("#111111", "#222222", "#333333", "#444444"):
+                    self.assertIn(color, rendered)
+                self.assertIn("NOT PER-KEY", rendered)
+                if width == 100:
+                    self.assertEqual(rendered.count("[F1]"), 1)
+                    for function_key in ("[10]", "[11]", "[12]"):
+                        self.assertIn(function_key, rendered)
+                if width <= 79:
+                    for continuation in ("│+│", "│E│"):
+                        row = next(
+                            screen.row(y)
+                            for y in range(screen.height)
+                            if continuation in screen.row(y)
                         )
-
-                visualization = "\n".join(
-                    screen.row(y) for y in range(top + 5, top + 11)
-                )
-                self.assertIn("#333333", visualization)
-                self.assertIn("#444444", visualization)
-                self.assertIn("WASD REGION", visualization)
+                        self.assertLess(row.index(continuation), row.rindex("╲"))
+                    enter_rows = [
+                        y
+                        for y in range(screen.height)
+                        if "│E│" in screen.row(y)
+                    ]
+                    self.assertEqual(len(enter_rows), 2)
+                    self.assertEqual(enter_rows[1], enter_rows[0] + 1)
 
     def test_apply_refuses_to_write_when_draft_is_unchanged(self):
         backend = FakeBackend()
@@ -841,6 +961,80 @@ class TuiDeviceActionTests(unittest.TestCase):
 
         self.assertEqual(backend.restores, 0)
         self.assertIn("already active", app.state.message)
+
+    def test_restore_discards_only_local_draft_when_original_is_active(self):
+        backend = FakeBackend(same_as_original=True)
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+
+        app._restore()
+
+        self.assertEqual(backend.restores, 0)
+        self.assertFalse(app.state.dirty)
+        self.assertEqual(app.state.draft, app.state.original)
+        self.assertIn("local draft", app.state.message)
+
+    def test_restore_rechecks_live_device_before_skipping_firmware_restore(self):
+        backend = FakeBackend(same_as_original=True)
+        app = CursesTui(backend)
+        backend.status_value["colors"] = [
+            "999999",
+            "888888",
+            "777777",
+            "666666",
+        ]
+
+        app._restore()
+
+        self.assertEqual(backend.restores, 1)
+
+    def test_restore_uses_new_module_original_after_external_reload(self):
+        backend = FakeBackend(same_as_original=True)
+        app = CursesTui(backend)
+        new_original = ["555555", "666666", "777777", "888888"]
+        backend.status_value["original"] = new_original
+
+        app._restore()
+
+        expected = ColorLayout.from_wire(",".join(new_original))
+        self.assertEqual(backend.restores, 1)
+        self.assertEqual(app.state.original, expected)
+        self.assertEqual(app.state.current, expected)
+        self.assertEqual(app.state.draft, expected)
+
+    def test_restore_noop_adopts_new_live_original_after_external_reload(self):
+        backend = FakeBackend(same_as_original=True)
+        app = CursesTui(backend)
+        new_original = ["555555", "666666", "777777", "888888"]
+        backend.status_value["colors"] = new_original
+        backend.status_value["original"] = new_original
+
+        app._restore()
+
+        expected = ColorLayout.from_wire(",".join(new_original))
+        self.assertEqual(backend.restores, 0)
+        self.assertEqual(app.state.original, expected)
+        self.assertEqual(app.state.current, expected)
+        self.assertEqual(app.state.draft, expected)
+
+    def test_restore_records_original_verified_after_restore_write(self):
+        class ReloadingBackend(FakeBackend):
+            def restore(self):
+                self.restores += 1
+                new_original = ["555555", "666666", "777777", "888888"]
+                self.status_value["original"] = new_original
+                self.status_value["colors"] = new_original
+
+        backend = ReloadingBackend()
+        app = CursesTui(backend)
+
+        app._restore()
+
+        expected = ColorLayout.from_wire("555555,666666,777777,888888")
+        self.assertEqual(backend.restores, 1)
+        self.assertEqual(app.state.original, expected)
+        self.assertEqual(app.state.current, expected)
+        self.assertEqual(app.state.draft, expected)
 
     def test_apply_writes_one_complete_layout_then_marks_it_current(self):
         backend = FakeBackend()
@@ -892,6 +1086,69 @@ class TuiDeviceActionTests(unittest.TestCase):
 
         app._edit_color(RefreshFailingScreen())
 
+        self.assertIn("cancelled", app.state.message.lower())
+
+    def test_profile_name_prompt_rejects_resize_during_refresh(self):
+        app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
+
+        class ResizeDuringRefreshScreen:
+            def __init__(self):
+                self.width = 100
+                self.reads = 0
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                self.width = 20
+
+            def getstr(self, *_args):
+                self.reads += 1
+                return b"HiddenSave"
+
+        screen = ResizeDuringRefreshScreen()
+        with mock.patch("okeylitctl.tui.curses.echo"), mock.patch(
+            "okeylitctl.tui.curses.noecho"
+        ), mock.patch("okeylitctl.tui.curses.curs_set"):
+            name = app._prompt_profile_name(screen)
+
+        self.assertIsNone(name)
+        self.assertEqual(screen.reads, 0)
+        self.assertIn("cancelled", app.state.message.lower())
+
+    def test_color_prompt_rejects_resize_during_refresh(self):
+        app = CursesTui(FakeBackend())
+        original = app.state.draft
+
+        class ResizeDuringRefreshScreen:
+            def __init__(self):
+                self.width = 100
+                self.reads = 0
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                self.width = 20
+
+            def getstr(self, *_args):
+                self.reads += 1
+                return b"ABCDEF"
+
+        screen = ResizeDuringRefreshScreen()
+        with mock.patch("okeylitctl.tui.curses.echo"), mock.patch(
+            "okeylitctl.tui.curses.noecho"
+        ), mock.patch("okeylitctl.tui.curses.curs_set"):
+            app._edit_color(screen)
+
+        self.assertEqual(screen.reads, 0)
+        self.assertEqual(app.state.draft, original)
         self.assertIn("cancelled", app.state.message.lower())
 
     def test_truncated_text_entry_prompts_do_not_accept_hidden_input(self):
