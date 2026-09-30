@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from okeylitctl.models import ColorLayout
-from okeylitctl.profiles import ProfileError, ProfileExists, ProfileStore
+from okeylitctl.profiles import ProfileError, ProfileExists, ProfileNotFound, ProfileStore
 
 
 class ProfileStoreTests(unittest.TestCase):
@@ -20,7 +20,12 @@ class ProfileStoreTests(unittest.TestCase):
 
             self.assertEqual(store.list_names(), ("Gaming_1",))
             self.assertEqual(store.load("Gaming_1"), layout)
-            store.delete("Gaming_1")
+            store.rename("Gaming_1", "Work")
+            self.assertEqual(store.list_names(), ("Work",))
+            self.assertEqual(store.load("Work"), layout)
+            with self.assertRaises(ProfileNotFound):
+                store.load("Gaming_1")
+            store.delete("Work")
             self.assertEqual(store.list_names(), ())
 
     def test_rejects_invalid_names_and_implicit_overwrite(self):

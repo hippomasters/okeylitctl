@@ -50,6 +50,44 @@ class KeyboardProjection:
     keys: tuple[ProjectedKey, ...]
 
 
+@dataclass(frozen=True)
+class BlockProjectedKey:
+    key: KeyboardKey
+    x: int
+    y: int
+    width: int
+    height: int
+    zone: Zone
+
+    @property
+    def right(self) -> int:
+        return self.x + self.width
+
+    @property
+    def bottom(self) -> int:
+        return self.y + self.height
+
+
+@dataclass(frozen=True)
+class BlockKeyboardProjection:
+    width: int
+    height: int
+    unit_x: int
+    unit_y: int
+    used_width: int
+    keys: tuple[BlockProjectedKey, ...]
+
+
+@dataclass(frozen=True)
+class BlockKeyboardBuffer:
+    width: int
+    height: int
+    lines: tuple[str, ...]
+    key_ids: tuple[tuple[str | None, ...], ...]
+    zones: tuple[tuple[Zone | None, ...], ...]
+    selected: tuple[tuple[bool, ...], ...]
+
+
 def _key(
     row: str,
     key_id: str,
@@ -167,19 +205,159 @@ KEYBOARD_ROWS = {
     "bottom": BOTTOM_ROW,
 }
 KEYBOARD_KEYS = tuple(key for row in KEYBOARD_ROWS.values() for key in row)
+KEYBOARD_KEYS_BY_ID = {key.id: key for key in KEYBOARD_KEYS}
 
 _WASD_IDS = frozenset({"W", "A", "S", "D"})
+_CENTER_BOUNDARY_IDS = frozenset(
+    {"F12", "EQUAL", "RBRACKET", "APOSTROPHE", "SLASH", "RCTRL"}
+)
 
 
 def key_zone(key: KeyboardKey) -> Zone:
     """Return an approximate fixed display zone, never a control capability."""
     if key.id in _WASD_IDS:
         return Zone.WASD
+    if key.id in _CENTER_BOUNDARY_IDS:
+        return Zone.CENTER
     if key.x < 5.25:
         return Zone.LEFT
     if key.x < 11.25:
         return Zone.CENTER
     return Zone.RIGHT
+
+
+def key_zone_by_id(key_id: str) -> Zone:
+    """Resolve a physical key identifier through the authoritative zone model."""
+    return key_zone(KEYBOARD_KEYS_BY_ID[key_id])
+
+
+def block_key_legend(key: KeyboardKey, interior_width: int) -> str:
+    """Return an unambiguous legend that fits a filled block keycap."""
+    aliases = {
+        "ESC": "Esc",
+        "OMEN": "◆",
+        "CALCULATOR": "CALC",
+        "PRINT": "PRT",
+        "NUMLOCK": "NUM",
+        "BACKSPACE": "Bksp",
+        "CAPSLOCK": "Caps",
+        "LSHIFT": "Shift",
+        "RSHIFT": "Shift",
+        "LCTRL": "Ctrl",
+        "RCTRL": "Ctrl",
+        "POWER": "Pwr",
+        "DELETE": "Del",
+        "INSERT": "Ins",
+        "KP_ENTER": "Ent",
+    }
+    legend = aliases.get(key.id, key.legend)
+    if len(legend) <= interior_width:
+        return legend
+    if key.id.startswith("F") and key.id[1:].isdigit():
+        number = key.id[1:]
+        legend = number if interior_width <= 2 else key.id
+    return legend[: max(0, interior_width)]
+
+
+def project_block_keyboard(width: int, height: int) -> BlockKeyboardProjection:
+    """Project the photo geometry into filled rectangular keycaps.
+
+    One-cell gutters are removed from the right and bottom of each normalized
+    footprint.  Key coordinates always come from the physical model; the
+    renderer never repacks rows to make them fit.
+    """
+    if width < 39 or height < 7:
+        raise ValueError("keyboard block projection needs at least 39 x 7 cells")
+
+    model_right = max(key.x + key.width for key in KEYBOARD_KEYS)
+    model_bottom = max(key.y + key.height for key in KEYBOARD_KEYS)
+    unit_x = max(
+        2,
+        min(
+            5,
+            max(
+                unit
+                for unit in range(2, 6)
+                if int(model_right * unit + 0.5) <= width
+            ),
+        ),
+    )
+    unit_y = 3 if int(model_bottom * 3 + 0.5) <= height else 2
+    if int(model_bottom * unit_y + 0.5) > height:
+        unit_y = 1
+
+    raw_width = int(model_right * unit_x + 0.5)
+    origin_x = max(0, (width - raw_width) // 2)
+
+    def scale_x(value: float) -> int:
+        return origin_x + int(value * unit_x + 0.5)
+
+    def scale_y(value: float) -> int:
+        return int(value * unit_y + 0.5)
+
+    projected = []
+    for key in KEYBOARD_KEYS:
+        left = scale_x(key.x)
+        right = scale_x(key.x + key.width)
+        top = scale_y(key.y)
+        bottom = scale_y(key.y + key.height)
+        projected.append(
+            BlockProjectedKey(
+                key=key,
+                x=left,
+                y=top,
+                width=max(1, right - left - 1),
+                height=max(1, bottom - top - 1),
+                zone=key_zone(key),
+            )
+        )
+
+    return BlockKeyboardProjection(
+        width=width,
+        height=height,
+        unit_x=unit_x,
+        unit_y=unit_y,
+        used_width=max(item.right for item in projected),
+        keys=tuple(projected),
+    )
+
+
+def render_block_keyboard(
+    width: int,
+    height: int,
+    selected_zone: Zone,
+) -> BlockKeyboardBuffer:
+    """Render filled keycaps while retaining cell-level key and zone identity."""
+    projection = project_block_keyboard(width, height)
+    characters = [[" " for _ in range(width)] for _ in range(height)]
+    key_ids: list[list[str | None]] = [[None for _ in range(width)] for _ in range(height)]
+    zones: list[list[Zone | None]] = [[None for _ in range(width)] for _ in range(height)]
+    selected = [[False for _ in range(width)] for _ in range(height)]
+
+    for item in projection.keys:
+        is_selected = item.zone is selected_zone
+        for row in range(item.y, item.bottom):
+            for column in range(item.x, item.right):
+                characters[row][column] = "█"
+                key_ids[row][column] = item.key.id
+                zones[row][column] = item.zone
+                selected[row][column] = is_selected
+
+        legend = block_key_legend(item.key, item.width)
+        legend_row = item.y + (item.height - 1) // 2
+        legend_column = item.x + max(0, (item.width - len(legend)) // 2)
+        for offset, character in enumerate(legend[: item.width]):
+            column = legend_column + offset
+            characters[legend_row][column] = character
+
+    return BlockKeyboardBuffer(
+        width=width,
+        height=height,
+        lines=tuple("".join(row) for row in characters),
+        key_ids=tuple(tuple(row) for row in key_ids),
+        zones=tuple(tuple(row) for row in zones),
+        selected=tuple(tuple(row) for row in selected),
+    )
 
 
 def project_keyboard(terminal_width: int) -> KeyboardProjection:

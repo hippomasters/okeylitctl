@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import curses
 from enum import Enum, auto
+from time import monotonic
 from typing import Any
 
 from . import __version__
-from .keyboard_layout import ProjectedKey, project_keyboard
+from .effect_runtime import EffectRuntime
+from .effects import EffectKind
+from .keyboard_layout import ProjectedKey, key_zone_by_id, project_keyboard
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
 from .profiles import ProfileError, ProfileStore
 from .sysfs import SysfsBackend, SysfsError
+from .tui_compositor import compose_editor, compose_exact_hex_modal, compose_profiles
 from .tui_state import TuiState
 from .validation import ValidationError
 
@@ -32,6 +36,7 @@ class TuiCommand(Enum):
     REFRESH = auto()
     EDIT = auto()
     PROFILES = auto()
+    STOP = auto()
     QUIT = auto()
 
 
@@ -79,6 +84,53 @@ def initialize_colors() -> bool:
     return True
 
 
+_CHARACTER_KEY_IDS = {
+    "`": "GRAVE", "~": "GRAVE",
+    **{str(number): f"DIGIT{number}" for number in range(1, 10)},
+    "0": "DIGIT0",
+    "!": "DIGIT1", "@": "DIGIT2", "#": "DIGIT3", "$": "DIGIT4",
+    "%": "DIGIT5", "^": "DIGIT6", "&": "DIGIT7", "*": "DIGIT8",
+    "(": "DIGIT9", ")": "DIGIT0",
+    "-": "MINUS", "_": "MINUS", "=": "EQUAL", "+": "EQUAL",
+    "[": "LBRACKET", "{": "LBRACKET", "]": "RBRACKET", "}": "RBRACKET",
+    "\\": "BACKSLASH", "|": "BACKSLASH",
+    ";": "SEMICOLON", ":": "SEMICOLON", "'": "APOSTROPHE", '"': "APOSTROPHE",
+    ",": "COMMA", "<": "COMMA", ".": "PERIOD", ">": "PERIOD",
+    "/": "SLASH", "?": "SLASH", " ": "SPACE", "\t": "TAB",
+    "\n": "ENTER", "\r": "ENTER", "\b": "BACKSPACE", "\x7f": "BACKSPACE",
+}
+_CHARACTER_KEY_IDS.update({letter.lower(): letter for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"})
+_CHARACTER_KEY_IDS.update({letter: letter for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"})
+
+_SPECIAL_KEY_IDS = {
+    curses.KEY_LEFT: "LEFT",
+    curses.KEY_RIGHT: "RIGHT",
+    curses.KEY_UP: "UP",
+    curses.KEY_DOWN: "DOWN",
+    curses.KEY_HOME: "KP7",
+    curses.KEY_END: "KP1",
+    curses.KEY_NPAGE: "KP3",
+    curses.KEY_PPAGE: "KP9",
+    curses.KEY_DC: "DELETE",
+    curses.KEY_IC: "INSERT",
+    curses.KEY_BACKSPACE: "BACKSPACE",
+    curses.KEY_ENTER: "ENTER",
+}
+_SPECIAL_KEY_IDS.update(
+    {curses.KEY_F0 + number: f"F{number}" for number in range(1, 13)}
+)
+
+
+def effect_zone_for_key(key: int, selected_zone: Zone) -> Zone:
+    """Resolve terminal input through the authoritative physical-key zone model."""
+    key_id = _SPECIAL_KEY_IDS.get(key)
+    if key_id is None and 0 <= key < 256:
+        key_id = _CHARACTER_KEY_IDS.get(chr(key))
+    if key_id is None:
+        return selected_zone
+    return key_zone_by_id(key_id)
+
+
 def handle_key(
     state: TuiState, key: int, *, actions_enabled: bool = True
 ) -> TuiCommand:
@@ -91,10 +143,14 @@ def handle_key(
             state.help_visible = False
         return TuiCommand.NONE
 
-    if key in (curses.KEY_RIGHT, ord("l"), 9):
+    if key in (curses.KEY_RIGHT, ord("l")):
         state.select_next_zone()
-    elif key in (curses.KEY_LEFT, ord("h"), curses.KEY_BTAB):
+    elif key == 9:
+        state.select_next_effect()
+    elif key in (curses.KEY_LEFT, ord("h")):
         state.select_previous_zone()
+    elif key == curses.KEY_BTAB:
+        state.select_previous_effect()
     elif key == curses.KEY_DOWN:
         state.selected_channel = (state.selected_channel + 1) % 3
     elif key == curses.KEY_UP:
@@ -104,9 +160,15 @@ def handle_key(
     elif key == ord("-"):
         state.adjust_selected_channel(-1)
     elif key == ord("]"):
-        state.adjust_selected_channel(16)
+        state.adjust_effect_speed(0.05)
     elif key == ord("["):
-        state.adjust_selected_channel(-16)
+        state.adjust_effect_speed(-0.05)
+    elif key == ord("}"):
+        state.adjust_effect_light(0.05)
+    elif key == ord("{"):
+        state.adjust_effect_light(-0.05)
+    elif key == ord("d"):
+        state.toggle_effect_direction()
     elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
         state.selected_zone = FIRMWARE_ZONE_ORDER[key - ord("1")]
     elif key == ord("p"):
@@ -131,6 +193,8 @@ def handle_key(
         return TuiCommand.EDIT
     elif key == ord("m"):
         return TuiCommand.PROFILES
+    elif key == ord("s"):
+        return TuiCommand.STOP
     elif key == ord("q"):
         return TuiCommand.QUIT
     return TuiCommand.NONE
@@ -147,6 +211,7 @@ class CursesTui:
         self._render_failed = False
         self._rendered_geometry: tuple[int, int] | None = None
         self._profile_rendered_geometry: tuple[int, int] | None = None
+        self.effect_runtime: EffectRuntime | None = None
         self.state = self._load_state()
 
     def _load_state(self) -> TuiState:
@@ -165,61 +230,98 @@ class CursesTui:
             screen.keypad(True)
         except curses.error:
             return
+        try:
+            screen.timeout(50)
+        except (AttributeError, curses.error):
+            pass
         set_cursor_visibility(0)
         self.colors_enabled = initialize_colors()
 
-        while True:
-            workspace_visible = self._draw(screen)
-            rendered_geometry = self._rendered_geometry
-            if rendered_geometry is None:
-                return
-            try:
-                if screen.getmaxyx() != rendered_geometry:
-                    self.state.message = (
-                        "Terminal resized — workspace redrawn before accepting input"
-                    )
-                    continue
-            except curses.error:
-                return
-            try:
-                key = screen.getch()
-            except curses.error:
-                return
-            if key == curses.KEY_RESIZE:
-                continue
-            try:
-                height, width = screen.getmaxyx()
-            except curses.error:
-                return
-            if (height, width) != rendered_geometry:
-                self.state.message = "Terminal resized — action cancelled; press again"
-                continue
-            command = handle_key(
-                self.state,
-                key,
-                actions_enabled=(
-                    workspace_visible and height >= 24 and width >= 78
-                ),
-            )
-            if command is TuiCommand.QUIT:
-                if self.state.dirty:
-                    if not self._confirm_action(screen, "Quit?"):
-                        self.state.message = "Quit cancelled — local changes preserved"
+        try:
+            while True:
+                workspace_visible = self._draw(screen)
+                rendered_geometry = self._rendered_geometry
+                if rendered_geometry is None:
+                    return
+                try:
+                    if screen.getmaxyx() != rendered_geometry:
+                        self.state.message = (
+                            "Terminal resized — workspace redrawn before accepting input"
+                        )
                         continue
-                return
-            if command is TuiCommand.APPLY:
-                self._apply()
-            elif command is TuiCommand.RESTORE:
-                if self._confirm_action(screen, "Restore the original module layout?"):
-                    self._restore()
-                else:
-                    self.state.message = "Restore cancelled"
-            elif command is TuiCommand.REFRESH:
-                self._refresh()
-            elif command is TuiCommand.EDIT:
-                self._edit_color(screen)
-            elif command is TuiCommand.PROFILES:
-                self._profile_manager(screen)
+                except curses.error:
+                    return
+                try:
+                    height, width = screen.getmaxyx()
+                except curses.error:
+                    return
+                actions_enabled = workspace_visible and height >= 24 and width >= 78
+                if self.state.effect_running:
+                    self._tick_effect(now=monotonic(), authorized=actions_enabled)
+                try:
+                    key = screen.getch()
+                except curses.error:
+                    self.state.message = "Terminal input failed; waiting to restore effect base"
+                    if self.effect_runtime is not None and not self._stop_effect():
+                        continue
+                    return
+                except StopIteration:
+                    return
+                if key == -1:
+                    continue
+                if key == curses.KEY_RESIZE:
+                    continue
+                try:
+                    height, width = screen.getmaxyx()
+                except curses.error:
+                    return
+                if (height, width) != rendered_geometry:
+                    self.state.message = "Terminal resized — action cancelled; press again"
+                    continue
+                if self.state.effect_running and key not in (
+                    ord("s"),
+                    ord("q"),
+                    ord("?"),
+                    27,
+                ):
+                    if self._trigger_effect_input(key, now=monotonic()):
+                        continue
+                    self.state.message = "Stop the running effect before editing"
+                    continue
+                command = handle_key(
+                    self.state,
+                    key,
+                    actions_enabled=actions_enabled,
+                )
+                if command is TuiCommand.QUIT:
+                    if self.state.dirty:
+                        if not self._confirm_action(screen, "Quit?"):
+                            self.state.message = "Quit cancelled — local changes preserved"
+                            continue
+                    if self.effect_runtime is not None and not self._stop_effect():
+                        continue
+                    return
+                if command is TuiCommand.APPLY:
+                    if self.state.effect_kind.value == "Static":
+                        self._apply()
+                    else:
+                        self._start_effect(now=monotonic())
+                elif command is TuiCommand.STOP:
+                    self._stop_effect()
+                elif command is TuiCommand.RESTORE:
+                    if self._confirm_action(screen, "Restore the original module layout?"):
+                        self._restore()
+                    else:
+                        self.state.message = "Restore cancelled"
+                elif command is TuiCommand.REFRESH:
+                    self._refresh()
+                elif command is TuiCommand.EDIT:
+                    self._edit_color(screen)
+                elif command is TuiCommand.PROFILES:
+                    self._profile_manager(screen)
+        finally:
+            if self.effect_runtime is not None:
+                self._stop_effect()
 
     def _safe_add(
         self,
@@ -265,6 +367,9 @@ class CursesTui:
                 self._render_failed = True
             return not self._render_failed
 
+        if height >= 55 and width >= 160:
+            return self._draw_reference_editor(screen, height, width)
+
         cyan = curses.color_pair(1) if self.colors_enabled else curses.A_BOLD
         chip = curses.color_pair(2) if self.colors_enabled else curses.A_REVERSE
         good = curses.color_pair(3) if self.colors_enabled else curses.A_BOLD
@@ -276,7 +381,7 @@ class CursesTui:
             screen,
             top + 1,
             14,
-            f"v{__version__}  ·  SAFE KEYBOARD LIGHTING",
+            f"v{__version__}",
             curses.A_DIM,
         )
         state_text = f" ● DEVICE {self.power_state.upper()} "
@@ -291,7 +396,7 @@ class CursesTui:
             screen,
             top + 2,
             2,
-            "PHOTO-MATCHED 100-KEY KEYBOARD",
+            "KEYBOARD",
             curses.A_BOLD,
         )
         dirty = "UNAPPLIED CHANGES" if self.state.dirty else "SYNCHRONIZED"
@@ -306,7 +411,7 @@ class CursesTui:
             screen,
             top + 3,
             2,
-            "APPROX. FOUR-ZONE SHADING · NOT PER-KEY",
+            "ZONES",
             curses.A_DIM,
             require_full=True,
         )
@@ -376,11 +481,34 @@ class CursesTui:
             self.state.message,
             good if not self.state.dirty else warn,
         )
+        effect_action = (
+            "S STOP"
+            if self.state.effect_running
+            else ("A APPLY" if self.state.effect_kind is EffectKind.STATIC else "A START")
+        )
+        direction = "L→R" if self.state.effect_direction == 1 else "R→L"
+        effect_status = (
+            f"EFFECT {self.state.effect_kind.value.upper()} "
+            f"{self.state.effect_index + 1}/16 · "
+            f"SPEED {round(self.state.effect_speed * 100)}% · "
+            f"LIGHT {round(self.state.effect_light * 100)}% · "
+            f"DIR {direction} · {effect_action}"
+        )
+        self._safe_add(
+            screen,
+            top + 19,
+            2,
+            effect_status,
+            cyan | curses.A_BOLD,
+            require_full=True,
+        )
         commands_edit = (
-            "←/→ ZONE  ↑/↓ RGB  +/- FINE  [/] COARSE  P PRESET  E HEX  X DISCARD"
+            "←/→ ZONE ↑/↓ RGB +/- COLOR [/] SPEED {/} LIGHT D DIR TAB EFFECT"
         )
         commands_global = (
-            "A APPLY NOW  M PROFILES  O ORIGINAL  R REFRESH  ? HELP  Q QUIT"
+            "S STOP  Q QUIT"
+            if self.state.effect_running
+            else "A APPLY NOW  M PROFILES  O ORIGINAL  R REFRESH  ? HELP  Q QUIT"
         )
         self._safe_add(
             screen,
@@ -406,6 +534,136 @@ class CursesTui:
         except curses.error:
             self._render_failed = True
         return not self._render_failed
+
+    def _reference_role_attr(self, role: str) -> int:
+        if role.startswith("dimmed_"):
+            return self._reference_role_attr(role.removeprefix("dimmed_")) | curses.A_DIM
+        if role.startswith("profile_color_"):
+            zone_name, color = role.removeprefix("profile_color_").split("_", 1)
+            zone = Zone(zone_name)
+            pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
+            return self._color_attr(color, pair_number=pair_number)
+        if role.startswith("key_"):
+            zone_name = role.removeprefix("key_").removesuffix("_selected")
+            try:
+                return self._key_attr(Zone(zone_name))
+            except ValueError:
+                return curses.A_REVERSE
+        if role.startswith("swatch_live_"):
+            return self._color_attr(role.rsplit("_", 1)[1], pair_number=14)
+        if role.startswith("swatch_draft_"):
+            return self._color_attr(role.rsplit("_", 1)[1], pair_number=15)
+        if role.startswith("modal_swatch_live_"):
+            return self._color_attr(role.rsplit("_", 1)[1], pair_number=17)
+        if role.startswith("modal_swatch_new_"):
+            return self._color_attr(role.rsplit("_", 1)[1], pair_number=18)
+        if role.startswith("swatch_"):
+            for zone in Zone:
+                if f"_{zone.value}" in role:
+                    return self._key_attr(zone)
+        if role in {
+            "dirty_badge",
+            "error",
+            "dirty",
+            "modal_error",
+            "profile_error",
+        }:
+            base = curses.color_pair(4) if self.colors_enabled else 0
+            return base | curses.A_REVERSE | curses.A_BOLD
+        if role in {"modal_border", "modal_title", "modal_input", "modal_shortcut"}:
+            base = curses.color_pair(1) if self.colors_enabled else 0
+            return base | curses.A_BOLD
+        if role in {"modal_fill", "modal_swatch_live", "modal_swatch_new"}:
+            return curses.A_REVERSE
+        if role == "modal_ready":
+            base = curses.color_pair(3) if self.colors_enabled else 0
+            return base | curses.A_BOLD
+        if role == "modal_muted":
+            return curses.A_DIM
+        if role == "synced_badge":
+            base = curses.color_pair(3) if self.colors_enabled else 0
+            return base | curses.A_REVERSE | curses.A_BOLD
+        if role in {
+            "device_badge",
+            "effect_selected",
+            "focus",
+            "profile_selected",
+        }:
+            base = curses.color_pair(2) if self.colors_enabled else 0
+            return base | curses.A_REVERSE | curses.A_BOLD
+        if role in {"brand", "panel_title", "draft"}:
+            base = curses.color_pair(1) if self.colors_enabled else 0
+            return base | curses.A_BOLD
+        if role == "channel_red":
+            return (curses.color_pair(5) if self.colors_enabled else 0) | curses.A_BOLD
+        if role == "channel_green":
+            return (curses.color_pair(3) if self.colors_enabled else 0) | curses.A_BOLD
+        if role == "channel_blue" or role.startswith("effect_preview"):
+            return (curses.color_pair(1) if self.colors_enabled else 0) | curses.A_BOLD
+        if role in {"border", "muted"}:
+            return curses.A_DIM
+        if role == "footer":
+            return curses.A_DIM
+        return 0
+
+    def _draw_composed_screen(
+        self,
+        screen: Any,
+        composed: Any,
+        height: int,
+        width: int,
+    ) -> bool:
+        origin_y = max(0, (height - composed.height) // 2)
+        origin_x = max(0, (width - composed.width) // 2)
+        for row_index, line in enumerate(composed.lines):
+            roles = composed.roles[row_index]
+            start = 0
+            while start < composed.width:
+                role = roles[start]
+                end = start + 1
+                while end < composed.width and roles[end] == role:
+                    end += 1
+                draw_y = origin_y + row_index
+                draw_x = origin_x + start
+                text = line[start:end]
+                attr = self._reference_role_attr(role)
+                if (
+                    draw_y < 0
+                    or draw_y >= height
+                    or draw_x < 0
+                    or draw_x + len(text) > width
+                ):
+                    self._render_failed = True
+                    return False
+                try:
+                    if draw_y == height - 1 and draw_x + len(text) == width and text:
+                        if len(text) > 1:
+                            screen.addnstr(draw_y, draw_x, text[:-1], len(text) - 1, attr)
+                        try:
+                            screen.insstr(draw_y, width - 1, text[-1], attr)
+                        except AttributeError:
+                            screen.addnstr(draw_y, width - 1, text[-1], 1, attr)
+                    else:
+                        screen.addnstr(draw_y, draw_x, text, len(text), attr)
+                except (curses.error, OverflowError):
+                    self._render_failed = True
+                    return False
+                start = end
+        if self._render_failed:
+            return False
+        try:
+            screen.refresh()
+        except curses.error:
+            self._render_failed = True
+        return not self._render_failed
+
+    def _draw_reference_editor(self, screen: Any, height: int, width: int) -> bool:
+        composed = compose_editor(
+            self.state,
+            power_state=self.power_state,
+            version=__version__,
+        )
+        return self._draw_composed_screen(screen, composed, height, width)
 
     @staticmethod
     def _compact_key_legend(item: ProjectedKey, interior: int) -> str:
@@ -434,13 +692,16 @@ class CursesTui:
                 compact = compact[1:]
         return compact[:interior]
 
-    def _key_attr(self, zone: Zone) -> int:
-        selected = zone is self.state.selected_zone
+    def _color_attr(
+        self,
+        color: str,
+        *,
+        pair_number: int,
+        selected: bool = False,
+    ) -> int:
         fallback = curses.A_REVERSE if selected else curses.A_DIM
         if not self.colors_enabled or getattr(curses, "COLORS", 0) < 256:
             return fallback
-        color = getattr(self.state.draft, zone.value)
-        pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
         background = rgb_to_xterm_index(color)
         luminance = sum(
             int(color[offset : offset + 2], 16) * weight
@@ -453,6 +714,12 @@ class CursesTui:
             return attr | (curses.A_BOLD if selected else 0)
         except curses.error:
             return fallback
+
+    def _key_attr(self, zone: Zone) -> int:
+        selected = zone is self.state.selected_zone
+        color = getattr(self.state.draft, zone.value)
+        pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
+        return self._color_attr(color, pair_number=pair_number, selected=selected)
 
     def _draw_projected_key(
         self,
@@ -572,7 +839,12 @@ class CursesTui:
             "",
             "1–4 / ← →    Select a named keyboard zone",
             "↑ ↓           Select red, green, or blue channel",
-            "+ -           Adjust by one    [ ] adjust by sixteen",
+            "+ -           Adjust the selected RGB channel by one",
+            "Tab / Shift-Tab  Select next or previous effect",
+            "[ ]           Adjust effect speed",
+            "{ }           Adjust effect light",
+            "D             Reverse effect direction",
+            "S             Stop a running effect and restore its base",
             "E             Enter an exact six-digit hex color",
             "P             Cycle curated local presets",
             "M             Open the local profile manager",
@@ -598,19 +870,37 @@ class CursesTui:
     def _profile_manager(self, screen: Any) -> None:
         selected = 0
         pending_delete: str | None = None
-        while True:
-            try:
-                names = self.profile_store.list_names()
-            except ProfileError as exc:
-                self.state.message = f"Profile manager failed: {exc}"
-                return
+        names: tuple[str, ...] = ()
+        preview_layout: ColorLayout | None = None
+        preview_error = ""
+        preview_name: str | None = None
+        try:
+            names = self.profile_store.list_names()
+        except ProfileError as exc:
+            preview_error = f"Profile manager failed: {exc}"
 
+        while True:
             if names:
                 selected = min(selected, len(names) - 1)
             else:
                 selected = 0
+            current_name = names[selected] if names else None
+            if current_name != preview_name:
+                preview_name = current_name
+                preview_layout = None
+                if current_name is not None:
+                    try:
+                        preview_layout = self.profile_store.load(current_name)
+                        preview_error = ""
+                    except ProfileError as exc:
+                        preview_error = f"Profile preview failed: {exc}"
             if not self._draw_profile_manager(
-                screen, names, selected, pending_delete
+                screen,
+                names,
+                selected,
+                pending_delete,
+                preview_layout=preview_layout,
+                preview_error=preview_error,
             ):
                 self.state.message = "Profile manager closed after terminal rendering error"
                 return
@@ -646,6 +936,13 @@ class CursesTui:
                 if key in (ord("y"), ord("Y")):
                     self._delete_profile(pending_delete)
                     pending_delete = None
+                    try:
+                        names = self.profile_store.list_names()
+                        preview_error = ""
+                    except ProfileError as exc:
+                        names = ()
+                        preview_error = f"Profile manager failed: {exc}"
+                    preview_name = None
                 elif key in (ord("n"), ord("N"), 27):
                     pending_delete = None
                 continue
@@ -656,19 +953,50 @@ class CursesTui:
                 continue
             if key == curses.KEY_UP and names:
                 selected = (selected - 1) % len(names)
+                preview_name = None
             elif key == curses.KEY_DOWN and names:
                 selected = (selected + 1) % len(names)
+                preview_name = None
             elif key in (10, 13, curses.KEY_ENTER) and names:
-                self._load_profile(names[selected])
+                try:
+                    action_layout = self.profile_store.load(names[selected])
+                except ProfileError as exc:
+                    preview_layout = None
+                    preview_error = f"Profile load failed: {exc}"
+                    self.state.message = preview_error
+                    continue
+                self._load_profile(names[selected], layout=action_layout)
                 return
             elif key == ord("s"):
                 name = self._prompt_profile_name(screen)
                 if name:
                     self._save_profile(name)
+                    try:
+                        names = self.profile_store.list_names()
+                        preview_error = ""
+                    except ProfileError as exc:
+                        names = ()
+                        preview_error = f"Profile manager failed: {exc}"
+                    preview_name = None
+            elif key == ord("n") and names:
+                old_name = names[selected]
+                new_name = self._prompt_profile_name(screen)
+                if new_name:
+                    try:
+                        self.profile_store.rename(old_name, new_name)
+                        names = self.profile_store.list_names()
+                        selected = names.index(new_name)
+                        preview_error = ""
+                        self.state.message = f"Profile renamed: {old_name} → {new_name}"
+                    except ProfileError as exc:
+                        preview_error = f"Profile rename failed: {exc}"
+                        self.state.message = preview_error
+                    preview_name = None
             elif key == ord("d") and names:
                 pending_delete = names[selected]
 
     def _confirm_action(self, screen: Any, prompt: str) -> bool:
+        blocking_input = False
         try:
             height, width = screen.getmaxyx()
             lines = (prompt, "Y=yes; else=no")
@@ -698,12 +1026,23 @@ class CursesTui:
             final_height, final_width = screen.getmaxyx()
             if (final_height, final_width) != (height, width):
                 return False
+            try:
+                screen.timeout(-1)
+                blocking_input = True
+            except (AttributeError, curses.error):
+                pass
             key = screen.getch()
             if screen.getmaxyx() != (final_height, final_width):
                 return False
             return key in (ord("y"), ord("Y"))
         except curses.error:
             return False
+        finally:
+            if blocking_input:
+                try:
+                    screen.timeout(50)
+                except (AttributeError, curses.error):
+                    pass
 
     def _draw_profile_manager(
         self,
@@ -711,13 +1050,34 @@ class CursesTui:
         names: tuple[str, ...],
         selected: int,
         pending_delete: str | None = None,
+        *,
+        preview_layout: ColorLayout | None = None,
+        preview_error: str = "",
     ) -> bool:
+        self._render_failed = False
         self._profile_rendered_geometry = None
         try:
             height, width = screen.getmaxyx()
         except curses.error:
             return False
         self._profile_rendered_geometry = (height, width)
+        if height >= 43 and width >= 160:
+            try:
+                screen.erase()
+            except curses.error:
+                return False
+            composed = compose_profiles(
+                self.state,
+                names=names,
+                selected=selected,
+                preview_layout=preview_layout,
+                preview_error=preview_error,
+                pending_delete=pending_delete,
+                power_state=self.power_state,
+                version=__version__,
+                message=self.state.message,
+            )
+            return self._draw_composed_screen(screen, composed, height, width)
         box_width = min(56, width - 6)
         visible = min(10, max(1, height - 10))
         box_height = visible + 7
@@ -781,11 +1141,12 @@ class CursesTui:
                 curses.A_REVERSE | curses.A_BOLD,
             )
         else:
+            status_message = preview_error or self.state.message
             add(
                 y + box_height - 2,
                 x + 2,
-                self.state.message,
-                curses.A_REVERSE | curses.A_DIM,
+                status_message[: max(0, box_width - 4)],
+                curses.A_REVERSE | (curses.A_BOLD if preview_error else curses.A_DIM),
             )
         if not rendered:
             return False
@@ -797,6 +1158,7 @@ class CursesTui:
 
     def _prompt_profile_name(self, screen: Any) -> str | None:
         prompt = "Profile name (letters, digits, _ or -): "
+        blocking_input = False
         try:
             height, width = screen.getmaxyx()
             row = max(1, height - 3)
@@ -822,6 +1184,11 @@ class CursesTui:
                 raise curses.error
             curses.echo()
             set_cursor_visibility(1)
+            try:
+                screen.timeout(-1)
+                blocking_input = True
+            except (AttributeError, curses.error):
+                pass
             raw = screen.getstr(row, 2 + len(prompt), 32).decode("ascii")
             if screen.getmaxyx() != (height, width):
                 raise curses.error
@@ -830,11 +1197,146 @@ class CursesTui:
             self.state.message = "Profile name entry cancelled"
             return None
         finally:
+            if blocking_input:
+                try:
+                    screen.timeout(50)
+                except (AttributeError, curses.error):
+                    pass
             try:
                 curses.noecho()
             except curses.error:
                 pass
             set_cursor_visibility(0)
+
+    def _trigger_effect_input(self, key: int, *, now: float | None = None) -> bool:
+        runtime = self.effect_runtime
+        if runtime is None or runtime.spec.kind not in (
+            EffectKind.REACTIVE,
+            EffectKind.RIPPLE,
+        ):
+            return False
+        zone = effect_zone_for_key(key, self.state.selected_zone)
+        triggered = runtime.trigger(zone, now=monotonic() if now is None else now)
+        if triggered:
+            self.state.message = (
+                f"{runtime.spec.kind.value} input: {zone.value.upper()} zone"
+            )
+        return triggered
+
+    def _start_effect(self, *, now: float | None = None) -> bool:
+        if self.state.effect_running:
+            self.state.message = "Effect is already running"
+            return False
+        runtime = EffectRuntime(
+            backend=self.backend,
+            spec=self.state.effect_spec,
+            rate_hz=2.0,
+        )
+        runtime.start(now=monotonic() if now is None else now)
+        self.effect_runtime = runtime
+        self.state.effect_running = True
+        self.state.message = f"{self.state.effect_kind.value} effect started at 2 Hz"
+        return True
+
+    def _tick_effect(self, *, now: float | None = None, authorized: bool) -> bool:
+        runtime = self.effect_runtime
+        if runtime is None:
+            return False
+        try:
+            wrote = runtime.tick(
+                now=monotonic() if now is None else now,
+                authorized=authorized,
+            )
+        except SysfsError as exc:
+            needs_restore = (
+                runtime.write_state_uncertain
+                or (
+                    runtime.last_written is not None
+                    and runtime.last_written != runtime.spec.base
+                )
+            )
+            self.state.effect_running = needs_restore
+            if needs_restore:
+                detail = (
+                    "base restoration is pending, but device state is uncertain; "
+                    "explicit Stop must verify it before restoration"
+                    if runtime.write_state_uncertain
+                    else "base restoration is pending"
+                )
+                self.state.message = f"Effect stopped after firmware error: {exc}; {detail}"
+            else:
+                self.effect_runtime = None
+                self.state.message = f"Effect stopped after firmware error: {exc}"
+            return False
+        if not runtime.active and runtime.observed_power_off:
+            self.power_state = "off"
+            needs_restore = (
+                runtime.last_written is not None
+                and runtime.last_written != runtime.spec.base
+            )
+            self.state.effect_running = needs_restore
+            if needs_restore:
+                self.state.message = (
+                    "Keyboard power is off; effect base restoration is pending"
+                )
+            else:
+                self.effect_runtime = None
+                self.state.message = "Effect stopped because keyboard power is off"
+        return wrote
+
+    def _stop_effect(self) -> bool:
+        runtime = self.effect_runtime
+        if runtime is None:
+            self.state.effect_running = False
+            self.state.message = "No effect is running"
+            return False
+        had_verified_frame = runtime.last_written is not None
+        needs_restore = (
+            runtime.write_state_uncertain
+            or (
+                runtime.last_written is not None
+                and runtime.last_written != runtime.spec.base
+            )
+        )
+        try:
+            restored = runtime.stop()
+        except SysfsError as exc:
+            self.state.effect_running = needs_restore
+            self.state.message = f"Effect base restoration is still pending: {exc}"
+            return False
+        if runtime.write_state_uncertain:
+            self.state.effect_running = needs_restore
+            self.state.message = (
+                "Effect device state remains uncertain; restoration is blocked"
+            )
+            return False
+        if runtime.last_written == runtime.spec.base and (
+            had_verified_frame or needs_restore
+        ):
+            self.state.effect_running = False
+            self.state.draft = runtime.spec.base
+            self.state.mark_applied()
+            self.power_state = "on"
+            self.state.message = (
+                "Effect stopped; base layout restored"
+                if restored
+                else "Effect stopped; verified base layout active"
+            )
+            self.effect_runtime = None
+            return True
+        if needs_restore and not restored:
+            self.state.effect_running = True
+            if runtime.observed_power_off:
+                self.state.message = "Effect base restoration is pending while power is off"
+            else:
+                self.state.message = (
+                    "Effect state verified; press S again to restore the base layout"
+                )
+            return False
+        self.state.effect_running = False
+        self.state.message = "Effect stopped"
+        self.effect_runtime = None
+        return True
 
     def _apply(self) -> None:
         if not self.state.dirty:
@@ -846,9 +1348,9 @@ class CursesTui:
         except SysfsError as exc:
             self.state.message = f"Apply failed: {exc}"
 
-    def _load_profile(self, name: str) -> None:
+    def _load_profile(self, name: str, *, layout: ColorLayout | None = None) -> None:
         try:
-            self.state.draft = self.profile_store.load(name)
+            self.state.draft = self.profile_store.load(name) if layout is None else layout
             self.state.preset_index = -1
             if self.state.dirty:
                 self.state.message = (
@@ -917,8 +1419,103 @@ class CursesTui:
         except SysfsError as exc:
             self.state.message = f"Refresh failed: {exc}"
 
+    def _edit_color_modal(
+        self,
+        screen: Any,
+        geometry: tuple[int, int],
+    ) -> None:
+        height, width = geometry
+        input_text = ""
+        error = ""
+        blocking_input = False
+        set_cursor_visibility(1)
+        try:
+            try:
+                screen.timeout(-1)
+                blocking_input = True
+            except (AttributeError, curses.error):
+                pass
+            while True:
+                self._render_failed = False
+                composed = compose_exact_hex_modal(
+                    self.state,
+                    power_state=self.power_state,
+                    version=__version__,
+                    input_text=input_text,
+                    error=error,
+                )
+                if not self._draw_composed_screen(screen, composed, height, width):
+                    raise curses.error
+                if screen.getmaxyx() != geometry:
+                    raise curses.error
+                origin_y = max(0, (height - composed.height) // 2)
+                origin_x = max(0, (width - composed.width) // 2)
+                try:
+                    screen.move(origin_y + 20, origin_x + 51 + len(input_text))
+                except (AttributeError, curses.error):
+                    pass
+                key = screen.getch()
+                if screen.getmaxyx() != geometry:
+                    raise curses.error
+                if key in (27,):
+                    self.state.message = "Exact color entry cancelled"
+                    return
+                if key == curses.KEY_RESIZE:
+                    raise curses.error
+                if key in (10, 13, curses.KEY_ENTER):
+                    if len(input_text) == 6:
+                        self.state.set_selected_color(input_text)
+                        self.state.message = (
+                            f"Local {self.state.selected_zone.value} color set to "
+                            f"#{self.state.selected_color}"
+                        )
+                        return
+                    missing = 6 - len(input_text)
+                    suffix = "digit" if missing == 1 else "digits"
+                    error = f"needs {missing} more {suffix}"
+                    continue
+                if key == 21:
+                    input_text = ""
+                    error = ""
+                    continue
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    input_text = input_text[:-1]
+                    error = ""
+                    continue
+                if 0 <= key < 256:
+                    character = chr(key).upper()
+                    if character in "0123456789ABCDEF":
+                        if len(input_text) < 6:
+                            input_text += character
+                            error = ""
+                        else:
+                            error = "six digits only"
+                    elif character.isprintable():
+                        error = "use hexadecimal digits 0-9 and A-F"
+        except (ValidationError, curses.error, StopIteration):
+            self.state.message = (
+                "Color entry cancelled after terminal resize or capability error"
+            )
+        finally:
+            if blocking_input:
+                try:
+                    screen.timeout(50)
+                except (AttributeError, curses.error):
+                    pass
+            set_cursor_visibility(0)
+
     def _edit_color(self, screen: Any) -> None:
+        try:
+            geometry = screen.getmaxyx()
+        except curses.error:
+            self.state.message = "Color entry cancelled after terminal resize or capability error"
+            return
+        if geometry[0] >= 55 and geometry[1] >= 160:
+            self._edit_color_modal(screen, geometry)
+            return
+
         prompt = f"Enter {self.state.selected_zone.value.upper()} color (RRGGBB): "
+        blocking_input = False
         try:
             height, width = screen.getmaxyx()
             if not self._safe_add(
@@ -943,6 +1540,11 @@ class CursesTui:
                 raise curses.error
             curses.echo()
             set_cursor_visibility(1)
+            try:
+                screen.timeout(-1)
+                blocking_input = True
+            except (AttributeError, curses.error):
+                pass
             raw = screen.getstr(height - 3, 2 + len(prompt), 6).decode("ascii")
             if screen.getmaxyx() != (height, width):
                 raise curses.error
@@ -953,6 +1555,11 @@ class CursesTui:
         except curses.error:
             self.state.message = "Color entry cancelled after terminal resize or capability error"
         finally:
+            if blocking_input:
+                try:
+                    screen.timeout(50)
+                except (AttributeError, curses.error):
+                    pass
             try:
                 curses.noecho()
             except curses.error:

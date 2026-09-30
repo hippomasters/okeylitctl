@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .effects import EffectKind, EffectSpec
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
 from .validation import normalize_color
 
@@ -17,6 +18,11 @@ class TuiState:
     draft: ColorLayout = field(init=False)
     selected_zone: Zone = Zone.RIGHT
     selected_channel: int = 0
+    effect_index: int = 0
+    effect_speed: float = 0.6
+    effect_light: float = 0.8
+    effect_direction: int = 1
+    effect_running: bool = False
     preset_index: int = -1
     help_visible: bool = False
     message: str = "Ready"
@@ -31,6 +37,35 @@ class TuiState:
     @property
     def selected_color(self) -> str:
         return getattr(self.draft, self.selected_zone.value)
+
+    @property
+    def effect_kind(self) -> EffectKind:
+        return tuple(EffectKind)[self.effect_index]
+
+    @property
+    def effect_spec(self) -> EffectSpec:
+        return EffectSpec(
+            kind=self.effect_kind,
+            base=self.draft,
+            speed=self.effect_speed,
+            light=self.effect_light,
+            direction=self.effect_direction,
+        )
+
+    def select_next_effect(self) -> None:
+        self.effect_index = (self.effect_index + 1) % len(EffectKind)
+
+    def select_previous_effect(self) -> None:
+        self.effect_index = (self.effect_index - 1) % len(EffectKind)
+
+    def adjust_effect_speed(self, delta: float) -> None:
+        self.effect_speed = round(max(0.1, min(1.0, self.effect_speed + delta)), 2)
+
+    def adjust_effect_light(self, delta: float) -> None:
+        self.effect_light = round(max(0.1, min(1.0, self.effect_light + delta)), 2)
+
+    def toggle_effect_direction(self) -> None:
+        self.effect_direction *= -1
 
     def select_next_zone(self) -> None:
         index = FIRMWARE_ZONE_ORDER.index(self.selected_zone)

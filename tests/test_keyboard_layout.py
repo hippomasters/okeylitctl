@@ -4,8 +4,11 @@ from okeylitctl.models import Zone
 from okeylitctl.keyboard_layout import (
     KEYBOARD_KEYS,
     KEYBOARD_ROWS,
+    block_key_legend,
     key_zone,
+    project_block_keyboard,
     project_keyboard,
+    render_block_keyboard,
 )
 
 
@@ -45,6 +48,70 @@ class KeyboardGeometryTests(unittest.TestCase):
         self.assertEqual(by_id["UP"].height, 0.48)
         self.assertGreater(by_id["DOWN"].y, by_id["UP"].y)
 
+    def test_special_key_legends_are_unambiguous_in_block_renderer(self):
+        by_id = {key.id: key for key in KEYBOARD_KEYS}
+        self.assertEqual(block_key_legend(by_id["OMEN"], 5), "◆")
+        self.assertEqual(block_key_legend(by_id["CALCULATOR"], 5), "CALC")
+        self.assertEqual(block_key_legend(by_id["PRINT"], 5), "PRT")
+        self.assertEqual(block_key_legend(by_id["NUMLOCK"], 5), "NUM")
+        self.assertEqual(block_key_legend(by_id["BACKSPACE"], 8), "Bksp")
+
+    def test_block_projection_fills_reference_panel_without_repacking_photo(self):
+        projection = project_block_keyboard(103, 19)
+        self.assertEqual((projection.width, projection.height), (103, 19))
+        self.assertEqual(len(projection.keys), 100)
+        self.assertGreaterEqual(projection.used_width, 98)
+        self.assertLessEqual(projection.used_width, 103)
+        self.assertEqual(projection.unit_x, 5)
+        self.assertEqual(projection.unit_y, 3)
+
+        by_id = {item.key.id: item for item in projection.keys}
+        self.assertEqual(by_id["UP"].x, by_id["DOWN"].x)
+        self.assertLess(by_id["UP"].y, by_id["DOWN"].y)
+        self.assertLess(by_id["LEFT"].x, by_id["DOWN"].x)
+        self.assertLess(by_id["DOWN"].x, by_id["RIGHT"].x)
+        self.assertLess(by_id["RIGHT"].right, by_id["KP0"].x)
+        self.assertGreater(by_id["KP_ADD"].height, by_id["KP7"].height)
+        self.assertGreater(by_id["KP_ENTER"].height, by_id["KP3"].height)
+
+    def test_block_projection_rectangles_are_in_bounds_and_do_not_overlap(self):
+        projection = project_block_keyboard(103, 19)
+        for item in projection.keys:
+            self.assertGreaterEqual(item.x, 0)
+            self.assertGreaterEqual(item.y, 0)
+            self.assertLessEqual(item.right, projection.width)
+            self.assertLessEqual(item.bottom, projection.height)
+        for index, left in enumerate(projection.keys):
+            for right in projection.keys[index + 1 :]:
+                overlaps = (
+                    left.x < right.right
+                    and right.x < left.right
+                    and left.y < right.bottom
+                    and right.y < left.bottom
+                )
+                self.assertFalse(overlaps, f"{left.key.id} overlaps {right.key.id}")
+
+    def test_block_renderer_preserves_key_identity_zone_and_selected_treatment(self):
+        rendered = render_block_keyboard(103, 19, Zone.WASD)
+        self.assertEqual(len(rendered.lines), 19)
+        self.assertTrue(all(len(line) == 103 for line in rendered.lines))
+        self.assertEqual(len(rendered.key_ids), 19)
+        self.assertEqual(len(rendered.zones), 19)
+
+        selected_ids = {
+            rendered.key_ids[row][column]
+            for row in range(rendered.height)
+            for column in range(rendered.width)
+            if rendered.selected[row][column]
+        }
+        self.assertEqual(selected_ids, {"W", "A", "S", "D"})
+
+        visible = "\n".join(rendered.lines)
+        for legend in ("Esc", "F12", "Pwr", "Del", "◆", "CALC", "Ins", "PRT"):
+            self.assertIn(legend, visible)
+        self.assertIn("Bksp", visible)
+        self.assertIn("Shift", visible)
+
     def test_zone_shading_is_coarse_and_wasd_only_overrides_four_keys(self):
         by_id = {key.id: key for key in KEYBOARD_KEYS}
         self.assertEqual(key_zone(by_id["W"]), Zone.WASD)
@@ -55,6 +122,20 @@ class KeyboardGeometryTests(unittest.TestCase):
         self.assertEqual(key_zone(by_id["G"]), Zone.CENTER)
         self.assertEqual(key_zone(by_id["RIGHT"]), Zone.RIGHT)
         self.assertEqual(key_zone(by_id["KP_ENTER"]), Zone.RIGHT)
+
+    def test_photo_verified_boundary_keys_belong_to_center_zone(self):
+        by_id = {key.id: key for key in KEYBOARD_KEYS}
+        for key_id in (
+            "F12",
+            "EQUAL",
+            "RBRACKET",
+            "APOSTROPHE",
+            "SLASH",
+            "RCTRL",
+        ):
+            with self.subTest(key_id=key_id):
+                self.assertEqual(key_zone(by_id[key_id]), Zone.CENTER)
+        self.assertEqual(key_zone(by_id["LCTRL"]), Zone.LEFT)
 
     def test_projection_is_responsive_and_keeps_perspective_and_spans(self):
         compact = project_keyboard(78)

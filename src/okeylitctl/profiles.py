@@ -80,6 +80,20 @@ class ProfileStore:
             profiles[name] = layout
             self._write(profiles)
 
+    def rename(self, old_name: str, new_name: str) -> None:
+        old_name = normalize_profile_name(old_name)
+        new_name = normalize_profile_name(new_name)
+        with self._lock(exclusive=True):
+            profiles = self._read()
+            if old_name not in profiles:
+                raise ProfileNotFound(f"profile not found: {old_name}")
+            if new_name != old_name and new_name in profiles:
+                raise ProfileExists(f"profile already exists: {new_name}")
+            if new_name == old_name:
+                return
+            profiles[new_name] = profiles.pop(old_name)
+            self._write(profiles)
+
     def delete(self, name: str) -> None:
         name = normalize_profile_name(name)
         with self._lock(exclusive=True):
