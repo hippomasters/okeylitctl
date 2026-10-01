@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from math import inf, nan
+import sys
 from unittest import mock
 import unittest
 
@@ -167,6 +168,183 @@ class EffectRuntimeSchedulingTests(unittest.TestCase):
         self.assertFalse(runtime.active)
         self.assertEqual(runtime.last_written, successful_frame)
         self.assertNotEqual(runtime.last_written, runtime.spec.base)
+
+    def test_interrupt_during_write_marks_attempted_frame_uncertain(self):
+        class InterruptAfterWriteBackend(RecordingBackend):
+            def write_colors(self, canonical_colors: str) -> None:
+                self.write_attempts += 1
+                self.writes.append(canonical_colors)
+                raise KeyboardInterrupt
+
+        backend = InterruptAfterWriteBackend()
+        runtime = EffectRuntime(
+            backend=backend,
+            spec=EffectSpec(kind=EffectKind.CYCLE, base=BASE),
+            rate_hz=2.0,
+        )
+        runtime.start(now=0.0)
+
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.tick(now=0.0)
+
+        self.assertFalse(runtime.active)
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertIsNotNone(runtime.attempted_frame)
+        self.assertEqual(runtime.attempted_frame.to_wire(), backend.writes[-1])
+
+    def test_interrupt_after_effect_write_returns_still_marks_state_uncertain(self):
+        armed = False
+
+        class InterruptGapBackend(RecordingBackend):
+            def __init__(self):
+                super().__init__()
+                self.live = BASE.to_wire().split(",")
+
+            def status(self):
+                self.status_calls += 1
+                return {
+                    "state": "on",
+                    "colors": list(self.live),
+                    "original": BASE.to_wire().split(","),
+                }
+
+            def write_colors(self, canonical_colors: str) -> None:
+                nonlocal armed
+                self.write_attempts += 1
+                self.writes.append(canonical_colors)
+                self.live = canonical_colors.split(",")
+                armed = True
+
+        backend = InterruptGapBackend()
+        runtime = EffectRuntime(
+            backend=backend,
+            spec=EffectSpec(kind=EffectKind.CYCLE, base=BASE),
+            rate_hz=2.0,
+        )
+        runtime.start(now=0.0)
+
+        def interrupt_after_return(frame, event, _arg):
+            nonlocal armed
+            if armed and event == "line" and frame.f_code is EffectRuntime.tick.__code__:
+                armed = False
+                raise KeyboardInterrupt
+            return interrupt_after_return
+
+        sys.settrace(interrupt_after_return)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                runtime.tick(now=0.0)
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertIsNotNone(runtime.attempted_frame)
+        attempted = runtime.attempted_frame
+        self.assertFalse(runtime.stop())
+        self.assertFalse(runtime.write_state_uncertain)
+        self.assertEqual(runtime.last_written, attempted)
+        self.assertNotEqual(runtime.last_written, BASE)
+
+    def test_interrupt_after_restore_write_returns_never_duplicates_base_write(self):
+        armed = False
+
+        class InterruptGapBackend(RecordingBackend):
+            def __init__(self):
+                super().__init__()
+                self.live = BASE.to_wire().split(",")
+
+            def status(self):
+                self.status_calls += 1
+                return {
+                    "state": "on",
+                    "colors": list(self.live),
+                    "original": BASE.to_wire().split(","),
+                }
+
+            def write_colors(self, canonical_colors: str) -> None:
+                nonlocal armed
+                self.write_attempts += 1
+                self.writes.append(canonical_colors)
+                self.live = canonical_colors.split(",")
+                if canonical_colors == BASE.to_wire():
+                    armed = True
+
+        backend = InterruptGapBackend()
+        runtime = EffectRuntime(
+            backend=backend,
+            spec=EffectSpec(kind=EffectKind.CYCLE, base=BASE),
+            rate_hz=2.0,
+        )
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+
+        def interrupt_after_return(frame, event, _arg):
+            nonlocal armed
+            if armed and event == "line" and frame.f_code is EffectRuntime.stop.__code__:
+                armed = False
+                raise KeyboardInterrupt
+            return interrupt_after_return
+
+        sys.settrace(interrupt_after_return)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                runtime.stop()
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertEqual(runtime.attempted_frame, BASE)
+        self.assertEqual(backend.writes.count(BASE.to_wire()), 1)
+        self.assertFalse(runtime.stop())
+        self.assertFalse(runtime.write_state_uncertain)
+        self.assertEqual(runtime.last_written, BASE)
+        self.assertEqual(backend.writes.count(BASE.to_wire()), 1)
+
+    def test_interrupt_during_restore_write_marks_base_attempt_uncertain(self):
+        class InterruptAfterRestoreBackend(RecordingBackend):
+            def __init__(self):
+                super().__init__()
+                self.live = BASE.to_wire().split(",")
+                self.interrupted_restore = False
+
+            def status(self):
+                self.status_calls += 1
+                return {
+                    "state": self.state,
+                    "colors": list(self.live),
+                    "original": BASE.to_wire().split(","),
+                }
+
+            def write_colors(self, canonical_colors: str) -> None:
+                self.write_attempts += 1
+                self.writes.append(canonical_colors)
+                self.live = canonical_colors.split(",")
+                if canonical_colors == BASE.to_wire() and not self.interrupted_restore:
+                    self.interrupted_restore = True
+                    raise KeyboardInterrupt
+
+        backend = InterruptAfterRestoreBackend()
+        runtime = EffectRuntime(
+            backend=backend,
+            spec=EffectSpec(kind=EffectKind.CYCLE, base=BASE),
+            rate_hz=2.0,
+        )
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        effect_frame = runtime.last_written
+
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.stop()
+
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertEqual(runtime.last_written, effect_frame)
+        self.assertEqual(runtime.attempted_frame, BASE)
+        self.assertEqual(backend.writes.count(BASE.to_wire()), 1)
+
+        self.assertFalse(runtime.stop())
+        self.assertFalse(runtime.write_state_uncertain)
+        self.assertEqual(runtime.last_written, BASE)
+        self.assertEqual(backend.writes.count(BASE.to_wire()), 1)
 
     def test_first_status_failure_stops_without_writing(self):
         backend = RecordingBackend(fail_status=True)

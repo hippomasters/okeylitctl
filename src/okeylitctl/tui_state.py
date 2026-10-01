@@ -23,6 +23,9 @@ class TuiState:
     effect_light: float = 0.8
     effect_direction: int = 1
     effect_running: bool = False
+    effect_frame: ColorLayout | None = None
+    effect_frame_uncertain: bool = False
+    effect_restore_pending: bool = False
     preset_index: int = -1
     help_visible: bool = False
     message: str = "Ready"

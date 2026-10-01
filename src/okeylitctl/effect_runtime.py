@@ -97,8 +97,16 @@ class EffectRuntime:
             self.observed_power_off = True
             return False
         self.observed_power_off = False
-        self.backend.write_colors(self.spec.base.to_wire())
+        self.attempted_frame = self.spec.base
+        self.write_state_uncertain = True
+        try:
+            self.backend.write_colors(self.spec.base.to_wire())
+        except BaseException:
+            self.write_state_uncertain = True
+            raise
         self.last_written = self.spec.base
+        self.write_state_uncertain = False
+        self.attempted_frame = None
         return True
 
     def tick(self, *, now: float, authorized: bool = True) -> bool:
@@ -126,9 +134,10 @@ class EffectRuntime:
             and frame == self.spec.base
         )
         self.attempted_frame = frame
+        self.write_state_uncertain = True
         try:
             self.backend.write_colors(frame.to_wire())
-        except SysfsError:
+        except BaseException:
             self.active = False
             self.write_state_uncertain = True
             raise

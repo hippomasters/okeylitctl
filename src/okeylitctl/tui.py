@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import curses
 from enum import Enum, auto
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 
 from . import __version__
@@ -212,6 +212,7 @@ class CursesTui:
         self._rendered_geometry: tuple[int, int] | None = None
         self._profile_rendered_geometry: tuple[int, int] | None = None
         self.effect_runtime: EffectRuntime | None = None
+        self._terminal_cleanup_forced = False
         self.state = self._load_state()
 
     def _load_state(self) -> TuiState:
@@ -225,7 +226,37 @@ class CursesTui:
     def run(self) -> None:
         curses.wrapper(self._main)
 
+    def _cleanup_after_terminal_failure(self) -> bool:
+        delay = 0.05
+        while self.effect_runtime is not None:
+            runtime = self.effect_runtime
+            was_uncertain = runtime.write_state_uncertain
+            if self._stop_effect():
+                return True
+            runtime = self.effect_runtime
+            if (
+                was_uncertain
+                and runtime is not None
+                and not runtime.write_state_uncertain
+                and runtime.last_written is not None
+                and runtime.last_written != runtime.spec.base
+            ):
+                self.state.message = (
+                    "Effect state verified; restoring base on the next bounded cleanup retry"
+                )
+            try:
+                sleep(delay)
+            except KeyboardInterrupt:
+                self.state.message = (
+                    "Exit forced with effect restoration unresolved; no unsafe write issued"
+                )
+                self._terminal_cleanup_forced = True
+                return False
+            delay = min(1.0, delay * 2.0)
+        return True
+
     def _main(self, screen: Any) -> None:
+        self._terminal_cleanup_forced = False
         try:
             screen.keypad(True)
         except curses.error:
@@ -242,6 +273,8 @@ class CursesTui:
                 workspace_visible = self._draw(screen)
                 rendered_geometry = self._rendered_geometry
                 if rendered_geometry is None:
+                    if self.effect_runtime is not None:
+                        self._cleanup_after_terminal_failure()
                     return
                 try:
                     if screen.getmaxyx() != rendered_geometry:
@@ -250,18 +283,35 @@ class CursesTui:
                         )
                         continue
                 except curses.error:
+                    if self.effect_runtime is not None:
+                        self._cleanup_after_terminal_failure()
                     return
                 try:
                     height, width = screen.getmaxyx()
                 except curses.error:
+                    if self.effect_runtime is not None:
+                        self._cleanup_after_terminal_failure()
                     return
                 actions_enabled = workspace_visible and height >= 24 and width >= 78
                 if self.state.effect_running:
-                    self._tick_effect(now=monotonic(), authorized=actions_enabled)
+                    try:
+                        self._tick_effect(now=monotonic(), authorized=actions_enabled)
+                    except KeyboardInterrupt:
+                        self.state.message = (
+                            "Interrupt requested during firmware I/O; verifying state before exit"
+                        )
+                        if self.effect_runtime is not None and not self._stop_effect():
+                            continue
+                        return
                 try:
                     key = screen.getch()
                 except curses.error:
                     self.state.message = "Terminal input failed; waiting to restore effect base"
+                    if self.effect_runtime is not None:
+                        self._cleanup_after_terminal_failure()
+                    return
+                except KeyboardInterrupt:
+                    self.state.message = "Interrupt requested; restoring effect base before exit"
                     if self.effect_runtime is not None and not self._stop_effect():
                         continue
                     return
@@ -274,6 +324,8 @@ class CursesTui:
                 try:
                     height, width = screen.getmaxyx()
                 except curses.error:
+                    if self.effect_runtime is not None:
+                        self._cleanup_after_terminal_failure()
                     return
                 if (height, width) != rendered_geometry:
                     self.state.message = "Terminal resized — action cancelled; press again"
@@ -320,7 +372,7 @@ class CursesTui:
                 elif command is TuiCommand.PROFILES:
                     self._profile_manager(screen)
         finally:
-            if self.effect_runtime is not None:
+            if self.effect_runtime is not None and not self._terminal_cleanup_forced:
                 self._stop_effect()
 
     def _safe_add(
@@ -399,7 +451,27 @@ class CursesTui:
             "KEYBOARD",
             curses.A_BOLD,
         )
-        dirty = "UNAPPLIED CHANGES" if self.state.dirty else "SYNCHRONIZED"
+        dirty = (
+            "RESTORE PENDING"
+            if self.state.effect_running and self.state.effect_restore_pending
+            else (
+                "RESTORE PENDING"
+                if self.state.effect_running and self.power_state == "off"
+                else (
+                    "EFFECT UNKNOWN"
+                    if self.state.effect_running and self.state.effect_frame_uncertain
+                    else (
+                        "EFFECT ACTIVE"
+                        if self.state.effect_running
+                        else (
+                            "UNAPPLIED CHANGES"
+                            if self.state.dirty
+                            else "SYNCHRONIZED"
+                        )
+                    )
+                )
+            )
+        )
         self._safe_add(
             screen,
             top + 2,
@@ -434,10 +506,40 @@ class CursesTui:
             curses.A_BOLD,
             require_full=True,
         )
-        current_color = getattr(self.state.current, selected.value)
+        power_off = self.state.effect_running and self.power_state == "off"
+        uncertain = (
+            self.state.effect_running
+            and self.state.effect_frame_uncertain
+            and not power_off
+        )
+        live_layout = (
+            self.state.effect_frame
+            if self.state.effect_running
+            and self.state.effect_frame is not None
+            and not uncertain
+            and not power_off
+            else self.state.current
+        )
+        current_color = getattr(live_layout, selected.value)
+        if power_off:
+            live_text = "LIVE POWER OFF"
+            editor_suffix = "BASE RESTORE PENDING"
+        elif uncertain:
+            live_text = "LIVE UNKNOWN"
+            editor_suffix = "DEVICE STATE UNKNOWN · S VERIFY"
+        elif self.state.effect_restore_pending:
+            live_text = f"LIVE #{current_color}"
+            editor_suffix = "VERIFIED FRAME · S RESTORE"
+        else:
+            live_text = f"LIVE #{current_color}"
+            editor_suffix = (
+                "EFFECT FRAME · S STOP"
+                if self.state.effect_running and self.state.effect_frame is not None
+                else "LOCAL UNTIL A APPLY"
+            )
         editor = (
-            f"EDIT {selected.value.upper():<6}  LIVE #{current_color}  "
-            f"DRAFT #{color}  ·  LOCAL UNTIL A APPLY"
+            f"EDIT {selected.value.upper():<6}  {live_text}  "
+            f"DRAFT #{color}  ·  {editor_suffix}"
         )
         self._safe_add(
             screen,
@@ -585,6 +687,7 @@ class CursesTui:
             return base | curses.A_REVERSE | curses.A_BOLD
         if role in {
             "device_badge",
+            "effect_badge",
             "effect_selected",
             "focus",
             "profile_selected",
@@ -1235,6 +1338,9 @@ class CursesTui:
         runtime.start(now=monotonic() if now is None else now)
         self.effect_runtime = runtime
         self.state.effect_running = True
+        self.state.effect_frame = None
+        self.state.effect_frame_uncertain = False
+        self.state.effect_restore_pending = False
         self.state.message = f"{self.state.effect_kind.value} effect started at 2 Hz"
         return True
 
@@ -1256,6 +1362,8 @@ class CursesTui:
                 )
             )
             self.state.effect_running = needs_restore
+            self.state.effect_restore_pending = needs_restore
+            self.state.effect_frame_uncertain = needs_restore
             if needs_restore:
                 detail = (
                     "base restoration is pending, but device state is uncertain; "
@@ -1266,8 +1374,15 @@ class CursesTui:
                 self.state.message = f"Effect stopped after firmware error: {exc}; {detail}"
             else:
                 self.effect_runtime = None
+                self.state.effect_frame = None
+                self.state.effect_frame_uncertain = False
+                self.state.effect_restore_pending = False
                 self.state.message = f"Effect stopped after firmware error: {exc}"
             return False
+        if wrote and runtime.last_written is not None:
+            self.state.effect_frame = runtime.last_written
+            self.state.effect_frame_uncertain = False
+            self.state.effect_restore_pending = False
         if not runtime.active and runtime.observed_power_off:
             self.power_state = "off"
             needs_restore = (
@@ -1275,12 +1390,16 @@ class CursesTui:
                 and runtime.last_written != runtime.spec.base
             )
             self.state.effect_running = needs_restore
+            self.state.effect_restore_pending = needs_restore
             if needs_restore:
                 self.state.message = (
                     "Keyboard power is off; effect base restoration is pending"
                 )
             else:
                 self.effect_runtime = None
+                self.state.effect_frame = None
+                self.state.effect_frame_uncertain = False
+                self.state.effect_restore_pending = False
                 self.state.message = "Effect stopped because keyboard power is off"
         return wrote
 
@@ -1288,6 +1407,9 @@ class CursesTui:
         runtime = self.effect_runtime
         if runtime is None:
             self.state.effect_running = False
+            self.state.effect_frame = None
+            self.state.effect_frame_uncertain = False
+            self.state.effect_restore_pending = False
             self.state.message = "No effect is running"
             return False
         had_verified_frame = runtime.last_written is not None
@@ -1302,10 +1424,20 @@ class CursesTui:
             restored = runtime.stop()
         except SysfsError as exc:
             self.state.effect_running = needs_restore
+            self.state.effect_restore_pending = needs_restore
+            self.state.effect_frame_uncertain = needs_restore
             self.state.message = f"Effect base restoration is still pending: {exc}"
             return False
+        if runtime.observed_power_off:
+            self.power_state = "off"
+        elif needs_restore:
+            self.power_state = "on"
+        self.state.effect_frame_uncertain = runtime.write_state_uncertain
+        if not runtime.write_state_uncertain and runtime.last_written is not None:
+            self.state.effect_frame = runtime.last_written
         if runtime.write_state_uncertain:
             self.state.effect_running = needs_restore
+            self.state.effect_restore_pending = needs_restore
             self.state.message = (
                 "Effect device state remains uncertain; restoration is blocked"
             )
@@ -1323,10 +1455,15 @@ class CursesTui:
                 else "Effect stopped; verified base layout active"
             )
             self.effect_runtime = None
+            self.state.effect_frame = None
+            self.state.effect_frame_uncertain = False
+            self.state.effect_restore_pending = False
             return True
         if needs_restore and not restored:
             self.state.effect_running = True
+            self.state.effect_restore_pending = True
             if runtime.observed_power_off:
+                self.power_state = "off"
                 self.state.message = "Effect base restoration is pending while power is off"
             else:
                 self.state.message = (
@@ -1334,6 +1471,9 @@ class CursesTui:
                 )
             return False
         self.state.effect_running = False
+        self.state.effect_frame = None
+        self.state.effect_frame_uncertain = False
+        self.state.effect_restore_pending = False
         self.state.message = "Effect stopped"
         self.effect_runtime = None
         return True

@@ -238,9 +238,13 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertTrue(app.state.effect_running)
 
         self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertEqual(app.state.effect_frame, app.effect_runtime.last_written)
+        self.assertNotEqual(app.state.effect_frame, chosen_base)
         self.assertNotEqual(backend.writes[-1], chosen_base.to_wire())
 
         self.assertTrue(app._stop_effect())
+        self.assertIsNone(app.state.effect_frame)
         self.assertEqual(backend.writes[-1], chosen_base.to_wire())
         self.assertEqual(app.state.current, chosen_base)
         self.assertFalse(app.state.effect_running)
@@ -269,9 +273,13 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertIsNotNone(app.effect_runtime)
         self.assertTrue(app.effect_runtime.write_state_uncertain)
         self.assertTrue(app.state.effect_running)
+        self.assertTrue(app.state.effect_frame_uncertain)
         self.assertNotEqual(backend.status_value["colors"], app.effect_runtime.spec.base.to_wire().split(","))
         self.assertFalse(app._stop_effect())
         self.assertTrue(app.state.effect_running)
+        self.assertFalse(app.state.effect_frame_uncertain)
+        self.assertEqual(app.state.effect_frame, app.effect_runtime.last_written)
+        self.assertEqual(app.state.effect_frame.to_wire().split(","), backend.status_value["colors"])
         self.assertIn("press s again", app.state.message.lower())
         self.assertTrue(app._stop_effect())
         self.assertFalse(app.state.effect_running)
@@ -303,6 +311,8 @@ class TuiDeviceActionTests(unittest.TestCase):
 
         self.assertIsNotNone(app.effect_runtime)
         self.assertTrue(app.state.effect_running)
+        self.assertTrue(app.state.effect_restore_pending)
+        self.assertTrue(app.state.effect_frame_uncertain)
         original_message = app.state.message
         self.assertIn("restoration is pending", original_message.lower())
 
@@ -358,6 +368,44 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertEqual(backend.writes[-1], base)
         self.assertIsNone(app.effect_runtime)
         self.assertFalse(app.state.effect_running)
+
+    def test_stop_observing_power_off_updates_device_badge_without_writing(self):
+        backend = FakeBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        writes_before_stop = list(backend.writes)
+        backend.status_value["state"] = "off"
+
+        self.assertFalse(app._stop_effect())
+
+        self.assertEqual(app.power_state, "off")
+        self.assertEqual(backend.writes, writes_before_stop)
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertTrue(app.state.effect_running)
+
+    def test_uncertain_stop_observing_power_off_updates_device_badge(self):
+        class ReadbackFailureAfterWriteBackend(FakeBackend):
+            def write_colors(self, value):
+                self.writes.append(value)
+                self.status_value["colors"] = value.split(",")
+                raise BackendIOError("readback failed")
+
+        backend = ReadbackFailureAfterWriteBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        self.assertFalse(app._tick_effect(now=0.0, authorized=True))
+        writes_before_stop = list(backend.writes)
+        backend.status_value["state"] = "off"
+
+        self.assertFalse(app._stop_effect())
+
+        self.assertEqual(app.power_state, "off")
+        self.assertEqual(backend.writes, writes_before_stop)
+        self.assertTrue(app.state.effect_running)
+        self.assertTrue(app.state.effect_frame_uncertain)
 
     def test_reactive_tui_input_triggers_runtime_without_direct_device_access(self):
         backend = FakeBackend()
@@ -560,6 +608,176 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertIsNone(app.effect_runtime)
         self.assertFalse(app.state.effect_running)
 
+    def test_keyboard_interrupt_keeps_tui_alive_until_pending_restore_succeeds(self):
+        class TransientCleanupFailureBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail_next_status = False
+
+            def status(self):
+                if self.fail_next_status:
+                    self.fail_next_status = False
+                    raise BackendIOError("transient cleanup status failure")
+                return super().status()
+
+        backend = TransientCleanupFailureBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        backend.fail_next_status = True
+
+        class InterruptingScreen:
+            def __init__(self):
+                self.reads = 0
+
+            def keypad(self, _enabled):
+                return None
+
+            def timeout(self, _milliseconds):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                self.reads += 1
+                raise KeyboardInterrupt
+
+        screen = InterruptingScreen()
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), mock.patch(
+            "okeylitctl.tui.monotonic", return_value=0.1
+        ):
+            app._main(screen)
+
+        self.assertEqual(screen.reads, 2)
+        self.assertEqual(backend.writes[-1], base)
+        self.assertIsNone(app.effect_runtime)
+        self.assertFalse(app.state.effect_running)
+
+    def test_interrupt_during_effect_write_resolves_then_restores_before_exit(self):
+        class InterruptAfterWriteBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.interrupt_once = True
+
+            def write_colors(self, value):
+                self.writes.append(value)
+                self.status_value["colors"] = value.split(",")
+                if self.interrupt_once:
+                    self.interrupt_once = False
+                    raise KeyboardInterrupt
+
+        backend = InterruptAfterWriteBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+
+        class InterruptingScreen:
+            def __init__(self):
+                self.reads = 0
+
+            def keypad(self, _enabled):
+                return None
+
+            def timeout(self, _milliseconds):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                self.reads += 1
+                raise KeyboardInterrupt
+
+        screen = InterruptingScreen()
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), mock.patch(
+            "okeylitctl.tui.monotonic", return_value=0.0
+        ):
+            app._main(screen)
+
+        self.assertEqual(screen.reads, 1)
+        self.assertEqual(backend.status_value["colors"], base.split(","))
+        self.assertEqual(backend.writes[-1], base)
+        self.assertIsNone(app.effect_runtime)
+        self.assertFalse(app.state.effect_running)
+
+    def test_interrupt_after_restore_write_never_duplicates_base_write(self):
+        class InterruptAfterRestoreBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.interrupt_restore_once = True
+
+            def write_colors(self, value):
+                self.writes.append(value)
+                self.status_value["colors"] = value.split(",")
+                base = "111111,222222,333333,444444"
+                if value == base and self.interrupt_restore_once:
+                    self.interrupt_restore_once = False
+                    raise KeyboardInterrupt
+
+        backend = InterruptAfterRestoreBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+
+        class StopScreen:
+            def __init__(self):
+                self.keys = iter((ord("s"),))
+
+            def keypad(self, _enabled):
+                return None
+
+            def timeout(self, _milliseconds):
+                return None
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, *_args):
+                return None
+
+            def refresh(self):
+                return None
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), self.assertRaises(
+            KeyboardInterrupt
+        ):
+            app._main(StopScreen())
+
+        self.assertEqual(backend.writes.count(base), 1)
+        self.assertEqual(backend.status_value["colors"], base.split(","))
+        self.assertIsNone(app.effect_runtime)
+        self.assertFalse(app.state.effect_running)
+
     def test_terminal_input_failure_waits_for_pending_power_off_restore(self):
         backend = FakeBackend()
         app = CursesTui(backend, profile_store=FakeProfileStore())
@@ -598,12 +816,16 @@ class TuiDeviceActionTests(unittest.TestCase):
                 raise curses.error
 
         screen = RecoveringInputScreen()
+
+        def restore_power(_delay):
+            backend.status_value["state"] = "on"
+
         with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), mock.patch(
             "okeylitctl.tui.monotonic", return_value=0.1
-        ):
+        ), mock.patch("okeylitctl.tui.sleep", side_effect=restore_power):
             app._main(screen)
 
-        self.assertEqual(screen.reads, 2)
+        self.assertEqual(screen.reads, 1)
         self.assertEqual(backend.writes[-1], base)
         self.assertIsNone(app.effect_runtime)
         self.assertFalse(app.state.effect_running)
@@ -890,6 +1112,123 @@ class TuiDeviceActionTests(unittest.TestCase):
         with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
             app._main(too_small)
         self.assertEqual(too_small.reads, 4)
+
+    def test_render_failure_retries_pending_effect_restoration_before_exit(self):
+        class TransientCleanupFailureBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail_next_status = False
+
+            def status(self):
+                if self.fail_next_status:
+                    self.fail_next_status = False
+                    raise BackendIOError("transient cleanup status failure")
+                return super().status()
+
+        backend = TransientCleanupFailureBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        backend.fail_next_status = True
+
+        class FailingRenderScreen:
+            def __init__(self):
+                self.erases = 0
+
+            def keypad(self, _enabled):
+                return None
+
+            def timeout(self, _milliseconds):
+                return None
+
+            def erase(self):
+                self.erases += 1
+                raise curses.error("render failed")
+
+        screen = FailingRenderScreen()
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(screen)
+
+        self.assertEqual(screen.erases, 1)
+        self.assertEqual(backend.writes[-1], base)
+        self.assertIsNone(app.effect_runtime)
+        self.assertFalse(app.state.effect_running)
+
+    def test_terminal_cleanup_restores_after_uncertain_frame_is_verified(self):
+        class ReadbackFailureAfterWriteBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail_first_write = True
+
+            def write_colors(self, value):
+                self.writes.append(value)
+                self.status_value["colors"] = value.split(",")
+                if self.fail_first_write:
+                    self.fail_first_write = False
+                    raise BackendIOError("effect readback failed")
+
+        backend = ReadbackFailureAfterWriteBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+        self.assertFalse(app._tick_effect(now=0.0, authorized=True))
+        self.assertTrue(app.state.effect_frame_uncertain)
+
+        with mock.patch(
+            "okeylitctl.tui.sleep", side_effect=(None, AssertionError("cleanup stalled"))
+        ) as sleeper:
+            self.assertTrue(app._cleanup_after_terminal_failure())
+
+        self.assertEqual(sleeper.call_count, 1)
+        self.assertEqual(backend.writes[-1], base)
+        self.assertEqual(backend.writes.count(base), 1)
+        self.assertIsNone(app.effect_runtime)
+        self.assertFalse(app.state.effect_running)
+
+    def test_persistent_cleanup_failure_backs_off_until_explicit_interrupt(self):
+        class PersistentCleanupFailureBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail_status = False
+                self.status_attempts = 0
+
+            def status(self):
+                self.status_attempts += 1
+                if self.fail_status:
+                    raise BackendIOError("persistent cleanup status failure")
+                return super().status()
+
+        backend = PersistentCleanupFailureBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        writes_before_cleanup = list(backend.writes)
+        backend.fail_status = True
+
+        class FailingRenderScreen:
+            def keypad(self, _enabled):
+                return None
+
+            def timeout(self, _milliseconds):
+                return None
+
+            def erase(self):
+                raise curses.error("render failed")
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), mock.patch(
+            "okeylitctl.tui.sleep", side_effect=(None, None, KeyboardInterrupt)
+        ) as sleeper:
+            app._main(FailingRenderScreen())
+
+        self.assertEqual(sleeper.call_count, 3)
+        self.assertEqual(backend.writes, writes_before_cleanup)
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertTrue(app.state.effect_running)
+        self.assertIn("forced", app.state.message.lower())
 
     def test_main_and_draw_exit_safely_on_terminal_io_errors(self):
         app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
@@ -1527,6 +1866,40 @@ class TuiDeviceActionTests(unittest.TestCase):
         for rejected_label in ("PHOTO-MATCHED", "APPROX.", "NOT PER-KEY", "SAFE KEYBOARD LIGHTING"):
             self.assertNotIn(rejected_label, rendered)
         self.assertNotIn("REGION", rendered)
+
+    def test_compact_power_off_effect_state_does_not_claim_stale_live_frame(self):
+        app = CursesTui(FakeBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app.state.effect_running = True
+        app.state.effect_frame = ColorLayout.from_wire(
+            "AA0000,00BB00,0000CC,DDDD00"
+        )
+        app.power_state = "off"
+
+        class RecordingScreen:
+            def __init__(self):
+                self.text = []
+
+            def getmaxyx(self):
+                return (30, 110)
+
+            def erase(self):
+                return None
+
+            def addnstr(self, _y, _x, text, _limit, _attr):
+                self.text.append(text)
+
+            def refresh(self):
+                return None
+
+        screen = RecordingScreen()
+        self.assertTrue(app._draw(screen))
+        rendered = " ".join(screen.text)
+
+        self.assertIn("RESTORE PENDING", rendered)
+        self.assertIn("LIVE POWER OFF", rendered)
+        self.assertNotIn("LIVE #AA0000", rendered)
+        self.assertNotIn("EFFECT FRAME", rendered)
 
     def test_compact_workspace_exposes_effect_selection_and_controls(self):
         app = CursesTui(FakeBackend())

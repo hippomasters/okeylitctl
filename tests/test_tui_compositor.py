@@ -88,6 +88,75 @@ class EditorCompositorTests(unittest.TestCase):
         self.assertEqual(composed.roles[17][128], "swatch_live_wasd_E8F7FF")
         self.assertEqual(composed.roles[18][128], "swatch_draft_wasd_4DF0C8")
 
+    def test_running_effect_displays_verified_live_frame_not_saved_base(self):
+        self.state.effect_running = True
+        self.state.effect_frame = ColorLayout.from_wire(
+            "AA0000,00BB00,0000CC,DDDD00"
+        )
+        self.state.selected_zone = Zone.RIGHT
+
+        composed = compose_editor(self.state, power_state="on", version="0.2.0")
+        visible = "\n".join(composed.lines)
+
+        self.assertIn("EFFECT ACTIVE", composed.lines[1])
+        self.assertNotIn("IN SYNC", composed.lines[1])
+        self.assertIn("#AA0000", visible)
+        self.assertIn(f"#{self.state.draft.right}", visible)
+        self.assertIn("Effect frame active", visible)
+        self.assertEqual(composed.roles[17][128], "swatch_live_right_AA0000")
+
+    def test_uncertain_effect_state_never_labels_stale_frame_as_live(self):
+        self.state.effect_running = True
+        self.state.effect_frame = ColorLayout.from_wire(
+            "AA0000,00BB00,0000CC,DDDD00"
+        )
+        self.state.effect_frame_uncertain = True
+        self.state.selected_zone = Zone.RIGHT
+
+        composed = compose_editor(self.state, power_state="on", version="0.2.0")
+        visible = "\n".join(composed.lines)
+
+        self.assertIn("EFFECT UNKNOWN", composed.lines[1])
+        self.assertIn("UNKNOWN", visible)
+        self.assertIn("Device state unknown", visible)
+        self.assertNotIn("#AA0000", visible)
+        self.assertNotIn("Effect frame active", visible)
+
+    def test_restore_pending_status_failure_never_claims_cached_frame_is_live(self):
+        self.state.effect_running = True
+        self.state.effect_restore_pending = True
+        self.state.effect_frame = ColorLayout.from_wire(
+            "AA0000,00BB00,0000CC,DDDD00"
+        )
+        self.state.effect_frame_uncertain = True
+        self.state.selected_zone = Zone.RIGHT
+
+        composed = compose_editor(self.state, power_state="on", version="0.2.0")
+        visible = "\n".join(composed.lines)
+
+        self.assertIn("RESTORE PENDING", composed.lines[1])
+        self.assertNotIn("EFFECT ACTIVE", composed.lines[1])
+        self.assertIn("UNKNOWN", visible)
+        self.assertNotIn("#AA0000", visible)
+        self.assertNotIn("Effect frame active", visible)
+
+    def test_power_off_effect_state_never_claims_stale_frame_is_live(self):
+        self.state.effect_running = True
+        self.state.effect_frame = ColorLayout.from_wire(
+            "AA0000,00BB00,0000CC,DDDD00"
+        )
+        self.state.selected_zone = Zone.RIGHT
+
+        composed = compose_editor(self.state, power_state="off", version="0.2.0")
+        visible = "\n".join(composed.lines)
+
+        self.assertIn("RESTORE PENDING", composed.lines[1])
+        self.assertIn("DEVICE OFF", composed.lines[1])
+        self.assertIn("POWER OFF", visible)
+        self.assertIn("Base restore pending", visible)
+        self.assertNotIn("#AA0000", visible)
+        self.assertNotIn("Effect frame active", visible)
+
     def test_running_effect_exposes_a_visible_stop_shortcut(self):
         self.state.effect_running = True
 

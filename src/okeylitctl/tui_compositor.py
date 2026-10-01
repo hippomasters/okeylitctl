@@ -79,8 +79,21 @@ def _draw_outer_frame(canvas: _Canvas) -> None:
 def _draw_header(canvas: _Canvas, state: TuiState, power_state: str, version: str) -> None:
     canvas.put(1, 3, "◆ okeylitctl", "brand")
     canvas.put(1, 16, f"v{version}", "muted")
-    status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
-    status_role = "dirty_badge" if state.dirty else "synced_badge"
+    if state.effect_running and state.effect_restore_pending:
+        status = "RESTORE PENDING"
+        status_role = "error"
+    elif state.effect_running and power_state == "off":
+        status = "RESTORE PENDING"
+        status_role = "error"
+    elif state.effect_running and state.effect_frame_uncertain:
+        status = "EFFECT UNKNOWN"
+        status_role = "error"
+    elif state.effect_running:
+        status = "EFFECT ACTIVE"
+        status_role = "effect_badge"
+    else:
+        status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
+        status_role = "dirty_badge" if state.dirty else "synced_badge"
     status_text = f" ◆ {status} "
     canvas.put(1, 111, status_text.ljust(23), status_role)
     device = f" ● DEVICE {power_state.upper()} "
@@ -131,19 +144,44 @@ def _rgb_delta(live: str, draft: str) -> tuple[int, int, int]:
     return tuple(draft_value - live_value for live_value, draft_value in zip(live_values, draft_values))
 
 
-def _draw_live_draft(canvas: _Canvas, state: TuiState) -> None:
+def _draw_live_draft(canvas: _Canvas, state: TuiState, power_state: str) -> None:
     rect = EDITOR_LAYOUT.panel("live_draft")
     canvas.box(rect, "LIVE ▸ DRAFT")
     zone = state.selected_zone
-    live = getattr(state.current, zone.value)
+    power_off = state.effect_running and power_state == "off"
+    uncertain = state.effect_running and state.effect_frame_uncertain and not power_off
+    live_layout = (
+        state.effect_frame
+        if state.effect_running
+        and state.effect_frame is not None
+        and not uncertain
+        and not power_off
+        else state.current
+    )
+    live = getattr(live_layout, zone.value)
     draft = getattr(state.draft, zone.value)
     canvas.put(rect.y + 3, rect.x + 3, "LIVE", "muted")
     canvas.put(rect.y + 4, rect.x + 3, "DRAFT", "muted")
-    canvas.put(rect.y + 3, rect.x + 12, "       ", f"swatch_live_{zone.value}_{live}")
+    if power_off:
+        canvas.put(rect.y + 3, rect.x + 12, "       ", "error")
+        canvas.put(rect.y + 3, rect.x + 21, "POWER OFF", "error")
+    elif uncertain:
+        canvas.put(rect.y + 3, rect.x + 12, "???????", "error")
+        canvas.put(rect.y + 3, rect.x + 21, "UNKNOWN", "error")
+    else:
+        canvas.put(rect.y + 3, rect.x + 12, "       ", f"swatch_live_{zone.value}_{live}")
+        canvas.put(rect.y + 3, rect.x + 21, f"#{live}", "muted")
     canvas.put(rect.y + 4, rect.x + 12, "       ", f"swatch_draft_{zone.value}_{draft}")
-    canvas.put(rect.y + 3, rect.x + 21, f"#{live}", "muted")
     canvas.put(rect.y + 4, rect.x + 21, f"#{draft}", "draft" if live != draft else "muted")
-    if live == draft:
+    if power_off:
+        canvas.put(rect.y + 7, rect.x + 3, "Base restore pending · power on", "error")
+    elif uncertain:
+        canvas.put(rect.y + 7, rect.x + 3, "Device state unknown · S Verify", "error")
+    elif state.effect_restore_pending and state.effect_frame is not None:
+        canvas.put(rect.y + 7, rect.x + 3, "Verified frame · S Restore", "focus")
+    elif state.effect_running and state.effect_frame is not None:
+        canvas.put(rect.y + 7, rect.x + 3, "Effect frame active · S Stop", "focus")
+    elif live == draft:
         canvas.put(rect.y + 7, rect.x + 3, "No changes", "muted")
     else:
         red, green, blue = _rgb_delta(live, draft)
@@ -252,7 +290,7 @@ def compose_editor(
     _draw_header(canvas, state, power_state, version)
     _draw_keyboard(canvas, state)
     _draw_zones(canvas, state)
-    _draw_live_draft(canvas, state)
+    _draw_live_draft(canvas, state, power_state)
     _draw_effects(canvas, state)
     _draw_color(canvas, state)
     _draw_motion(canvas, state)
