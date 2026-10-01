@@ -47,6 +47,25 @@ def rgb_to_xterm_index(color: str) -> int:
     return 16 + 36 * cube[0] + 6 * cube[1] + cube[2]
 
 
+def _blend_rgb(color: str, target: str, amount: float) -> str:
+    """Blend one validated RRGGBB color toward another."""
+    channels = []
+    for offset in (0, 2, 4):
+        source = int(color[offset : offset + 2], 16)
+        destination = int(target[offset : offset + 2], 16)
+        channels.append(round(source + (destination - source) * amount))
+    return "".join(f"{channel:02X}" for channel in channels)
+
+
+def _key_surface_colors(color: str) -> tuple[str, str, str]:
+    """Return body text, top highlight, and dark body colors for a keycap."""
+    return (
+        _blend_rgb(color, "FFFFFF", 0.55),
+        _blend_rgb(color, "FFFFFF", 0.15),
+        _blend_rgb(color, "0B0E18", 0.65),
+    )
+
+
 def set_cursor_visibility(visibility: int) -> None:
     """Set cursor visibility when the terminal supports it."""
     try:
@@ -640,15 +659,25 @@ class CursesTui:
     def _reference_role_attr(self, role: str) -> int:
         if role.startswith("dimmed_"):
             return self._reference_role_attr(role.removeprefix("dimmed_")) | curses.A_DIM
+        if role.startswith("profile_key_"):
+            zone_name, color = role.removeprefix("profile_key_").rsplit("_", 1)
+            top = zone_name.endswith("_top")
+            zone = Zone(zone_name.removesuffix("_top"))
+            return self._key_attr(
+                zone, top=top, selected=False, color_override=color, pair_base=38
+            )
         if role.startswith("profile_color_"):
             zone_name, color = role.removeprefix("profile_color_").split("_", 1)
             zone = Zone(zone_name)
-            pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
+            pair_number = 26 + FIRMWARE_ZONE_ORDER.index(zone)
             return self._color_attr(color, pair_number=pair_number)
         if role.startswith("key_"):
-            zone_name = role.removeprefix("key_").removesuffix("_selected")
+            selected = role.endswith("_selected")
+            key_role = role.removeprefix("key_").removesuffix("_selected")
+            top = key_role.endswith("_top")
+            zone_name = key_role.removesuffix("_top")
             try:
-                return self._key_attr(Zone(zone_name))
+                return self._key_attr(Zone(zone_name), top=top, selected=selected)
             except ValueError:
                 return curses.A_REVERSE
         if role.startswith("swatch_live_"):
@@ -662,7 +691,10 @@ class CursesTui:
         if role.startswith("swatch_"):
             for zone in Zone:
                 if f"_{zone.value}" in role:
-                    return self._key_attr(zone)
+                    color = getattr(self.state.draft, zone.value)
+                    return self._color_attr(
+                        color, pair_number=22 + FIRMWARE_ZONE_ORDER.index(zone)
+                    )
         if role in {
             "dirty_badge",
             "error",
@@ -803,7 +835,11 @@ class CursesTui:
         selected: bool = False,
     ) -> int:
         fallback = curses.A_REVERSE if selected else curses.A_DIM
-        if not self.colors_enabled or getattr(curses, "COLORS", 0) < 256:
+        if (
+            not self.colors_enabled
+            or getattr(curses, "COLORS", 0) < 256
+            or getattr(curses, "COLOR_PAIRS", 0) <= pair_number
+        ):
             return fallback
         background = rgb_to_xterm_index(color)
         luminance = sum(
@@ -818,11 +854,43 @@ class CursesTui:
         except curses.error:
             return fallback
 
-    def _key_attr(self, zone: Zone) -> int:
-        selected = zone is self.state.selected_zone
-        color = getattr(self.state.draft, zone.value)
-        pair_number = 30 + FIRMWARE_ZONE_ORDER.index(zone)
-        return self._color_attr(color, pair_number=pair_number, selected=selected)
+    def _key_attr(
+        self,
+        zone: Zone,
+        *,
+        top: bool = False,
+        selected: bool | None = None,
+        color_override: str | None = None,
+        pair_base: int = 30,
+    ) -> int:
+        if selected is None:
+            selected = zone is self.state.selected_zone
+        color = (
+            color_override
+            if color_override is not None
+            else getattr(self.state.draft, zone.value)
+        )
+        fallback = (
+            curses.A_REVERSE | curses.A_BOLD
+            if selected and not top
+            else curses.A_BOLD if top else 0
+        )
+        if not self.colors_enabled or getattr(curses, "COLORS", 0) < 256:
+            return fallback
+        body_foreground, top_foreground, background = _key_surface_colors(color)
+        zone_index = FIRMWARE_ZONE_ORDER.index(zone)
+        pair_number = pair_base + zone_index + (4 if top else 0)
+        if getattr(curses, "COLOR_PAIRS", 0) <= pair_number:
+            return fallback
+        try:
+            curses.init_pair(
+                pair_number,
+                rgb_to_xterm_index(top_foreground if top else body_foreground),
+                rgb_to_xterm_index(background),
+            )
+            return curses.color_pair(pair_number) | (curses.A_BOLD if selected else 0)
+        except curses.error:
+            return fallback
 
     def _draw_projected_key(
         self,

@@ -112,6 +112,21 @@ class KeyboardGeometryTests(unittest.TestCase):
         self.assertIn("Bksp", visible)
         self.assertIn("Shift", visible)
 
+    def test_block_renderer_uses_dark_body_and_top_highlight_instead_of_full_blocks(self):
+        projection = project_block_keyboard(103, 19)
+        rendered = render_block_keyboard(103, 19, Zone.RIGHT)
+        q_key = next(item for item in projection.keys if item.key.id == "Q")
+
+        self.assertGreaterEqual(q_key.height, 2)
+        self.assertEqual(
+            rendered.lines[q_key.y][q_key.x : q_key.right],
+            "▀" * q_key.width,
+        )
+        body = rendered.lines[q_key.bottom - 1][q_key.x : q_key.right]
+        self.assertIn("Q", body)
+        self.assertNotIn("█", body)
+        self.assertNotIn("█", "\n".join(rendered.lines))
+
     def test_zone_shading_is_coarse_and_wasd_only_overrides_four_keys(self):
         by_id = {key.id: key for key in KEYBOARD_KEYS}
         self.assertEqual(key_zone(by_id["W"]), Zone.WASD)

@@ -2,6 +2,7 @@ import curses
 import unittest
 from unittest import mock
 
+from okeylitctl import tui as tui_module
 from okeylitctl.models import ColorLayout, Zone
 from okeylitctl.keyboard_layout import key_zone_by_id
 from okeylitctl.profiles import ProfileError
@@ -153,6 +154,169 @@ class TuiInteractionTests(unittest.TestCase):
         self.assertEqual(rgb_to_xterm_index("000000"), 16)
         self.assertEqual(rgb_to_xterm_index("FF0000"), 196)
         self.assertEqual(rgb_to_xterm_index("FFFFFF"), 231)
+
+    def test_key_surface_palette_uses_zone_tint_not_white_full_block_fill(self):
+        body_foreground, top_foreground, background = tui_module._key_surface_colors(
+            "710FFA"
+        )
+
+        self.assertNotEqual(top_foreground, "FFFFFF")
+        self.assertNotEqual(background, "710FFA")
+        self.assertGreater(
+            sum(int(body_foreground[offset : offset + 2], 16) for offset in (0, 2, 4)),
+            sum(int(background[offset : offset + 2], 16) for offset in (0, 2, 4)),
+        )
+
+    def test_key_roles_use_separate_pairs_and_zone_swatches_keep_exact_color(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 32767, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair, mock.patch(
+            "okeylitctl.tui.curses.color_pair", return_value=0
+        ):
+            app._reference_role_attr("key_right")
+            key_call = init_pair.call_args
+            app._reference_role_attr("swatch_right")
+            swatch_call = init_pair.call_args
+
+        self.assertEqual(key_call.args[0], 30)
+        self.assertNotEqual(key_call.args[2], rgb_to_xterm_index("710FFA"))
+        self.assertNotEqual(swatch_call.args[0], key_call.args[0])
+        self.assertEqual(swatch_call.args[2], rgb_to_xterm_index("710FFA"))
+
+    def test_profile_preview_color_pair_does_not_redefine_a_keycap(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 32767, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair, mock.patch(
+            "okeylitctl.tui.curses.color_pair", return_value=0
+        ):
+            app._reference_role_attr("key_right")
+            key_pair = init_pair.call_args.args[0]
+            app._reference_role_attr("profile_color_right_FF0000")
+            profile_call = init_pair.call_args
+
+        self.assertNotEqual(profile_call.args[0], key_pair)
+        self.assertEqual(profile_call.args[2], rgb_to_xterm_index("FF0000"))
+
+    def test_profile_preview_keycap_uses_dark_body_tinted_top_and_unique_pairs(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+        _, top, body = tui_module._key_surface_colors("FF0000")
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 32767, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair, mock.patch(
+            "okeylitctl.tui.curses.color_pair", return_value=0
+        ):
+            app._reference_role_attr("profile_key_right_top_FF0000")
+            self.assertTrue(init_pair.called, "profile top must initialize its own color pair")
+            top_call = init_pair.call_args
+            app._reference_role_attr("profile_key_right_FF0000")
+            body_call = init_pair.call_args
+            app._reference_role_attr("profile_color_right_FF0000")
+            swatch_call = init_pair.call_args
+        self.assertEqual(top_call.args[1:], (
+            rgb_to_xterm_index(top), rgb_to_xterm_index(body)
+        ))
+        self.assertEqual(body_call.args[2], rgb_to_xterm_index(body))
+        self.assertEqual(swatch_call.args[2], rgb_to_xterm_index("FF0000"))
+        self.assertEqual(len({top_call.args[0], body_call.args[0], swatch_call.args[0], 30, 34}), 5)
+
+    def test_swatch_pair_falls_back_without_redefining_an_unavailable_pair(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 22, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair:
+            self.assertEqual(app._reference_role_attr("swatch_right"), curses.A_DIM)
+        init_pair.assert_not_called()
+
+    def test_key_top_role_uses_zone_tint_and_distinct_pair(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+        _, top_foreground, background = tui_module._key_surface_colors("710FFA")
+
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 32767, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair, mock.patch(
+            "okeylitctl.tui.curses.color_pair", return_value=0
+        ):
+            app._reference_role_attr("key_right_top_selected")
+
+        init_pair.assert_called_once_with(
+            34,
+            rgb_to_xterm_index(top_foreground),
+            rgb_to_xterm_index(background),
+        )
+
+    def test_monochrome_keycaps_show_top_and_legend_without_reversing_every_body(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = False
+
+        self.assertEqual(app._reference_role_attr("key_right_top"), curses.A_BOLD)
+        self.assertEqual(app._reference_role_attr("key_right"), 0)
+        self.assertEqual(
+            app._reference_role_attr("key_right_selected"),
+            curses.A_REVERSE | curses.A_BOLD,
+        )
+
+    def test_key_pair_falls_back_when_terminal_has_too_few_color_pairs(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 34, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair:
+            attr = app._reference_role_attr("key_right_top")
+
+        self.assertEqual(attr, curses.A_BOLD)
+        init_pair.assert_not_called()
 
 
     def test_cursor_visibility_is_an_optional_terminal_capability(self):

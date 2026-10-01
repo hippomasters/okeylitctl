@@ -113,6 +113,8 @@ def _draw_keyboard(canvas: _Canvas, state: TuiState) -> None:
                 continue
             zone = keyboard.zones[row][column]
             role = f"key_{zone.value}"
+            if keyboard.lines[row][column] == "▀":
+                role += "_top"
             if keyboard.selected[row][column]:
                 role += "_selected"
             canvas.put(
@@ -362,11 +364,12 @@ def _draw_profile_preview(
                     continue
                 zone = keyboard.zones[row][column]
                 color = getattr(layout, zone.value)
+                top = "_top" if keyboard.lines[row][column] == "▀" else ""
                 canvas.put(
                     origin_y + row,
                     origin_x + column,
                     keyboard.lines[row][column],
-                    f"profile_color_{zone.value}_{color}",
+                    f"profile_key_{zone.value}{top}_{color}",
                 )
         for index, zone in enumerate(FIRMWARE_ZONE_ORDER):
             column = rect.x + 3 + index * 24

@@ -1,6 +1,7 @@
 import unittest
 
 from okeylitctl.effects import EffectKind
+from okeylitctl.keyboard_layout import project_block_keyboard
 from okeylitctl.models import ColorLayout, Zone
 from okeylitctl.tui_compositor import (
     _Canvas,
@@ -53,6 +54,44 @@ class EditorCompositorTests(unittest.TestCase):
             self.assertIn(effect, visible)
         for forbidden in ("PHOTO-MATCHED", "APPROX.", "NOT PER-KEY", "SAFE KEYBOARD LIGHTING"):
             self.assertNotIn(forbidden, visible)
+
+    def test_keyboard_top_and_single_row_keycaps_have_distinct_composed_roles(self):
+        composed = compose_editor(self.state, power_state="on", version="0.2.0")
+        projection = project_block_keyboard(103, 19)
+        tall = next(item for item in projection.keys if item.key.id == "Q")
+        single = next(item for item in projection.keys if item.key.id == "F1")
+
+        # The reference keyboard's projected origin is (4, 5).
+        self.assertEqual(composed.lines[5 + tall.y][4 + tall.x], "▀")
+        self.assertEqual(
+            composed.roles[5 + tall.y][4 + tall.x], f"key_{tall.zone.value}_top"
+        )
+        self.assertEqual(
+            composed.roles[5 + tall.bottom - 1][4 + tall.x],
+            f"key_{tall.zone.value}",
+        )
+        self.assertNotIn(
+            "_top", composed.roles[5 + single.y][4 + single.x]
+        )
+
+    def test_profiles_keyboard_uses_saved_colors_with_separate_top_and_body(self):
+        saved = ColorLayout.from_wire("FF5E5A,FF9E3D,FFD23F,FFF1D6")
+        composed = compose_profiles(
+            self.state, names=("Sunset",), selected=0,
+            preview_layout=saved, power_state="on", version="0.2.0",
+        )
+        projection = project_block_keyboard(100, 19)
+        key = next(item for item in projection.keys if item.key.id == "Q")
+        origin_x, origin_y = 55, 6
+        self.assertEqual(composed.lines[origin_y + key.y][origin_x + key.x], "▀")
+        self.assertEqual(
+            composed.roles[origin_y + key.y][origin_x + key.x],
+            f"profile_key_{key.zone.value}_top_{getattr(saved, key.zone.value)}",
+        )
+        self.assertEqual(
+            composed.roles[origin_y + key.bottom - 1][origin_x + key.x],
+            f"profile_key_{key.zone.value}_{getattr(saved, key.zone.value)}",
+        )
 
     def test_zones_live_draft_color_motion_and_footer_match_mockup(self):
         composed = compose_editor(self.state, power_state="on", version="0.2.0")

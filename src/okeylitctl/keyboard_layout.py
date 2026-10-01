@@ -338,13 +338,13 @@ def render_block_keyboard(
         is_selected = item.zone is selected_zone
         for row in range(item.y, item.bottom):
             for column in range(item.x, item.right):
-                characters[row][column] = "█"
+                characters[row][column] = "▀" if item.height > 1 and row == item.y else " "
                 key_ids[row][column] = item.key.id
                 zones[row][column] = item.zone
                 selected[row][column] = is_selected
 
         legend = block_key_legend(item.key, item.width)
-        legend_row = item.y + (item.height - 1) // 2
+        legend_row = item.bottom - 1
         legend_column = item.x + max(0, (item.width - len(legend)) // 2)
         for offset, character in enumerate(legend[: item.width]):
             column = legend_column + offset
