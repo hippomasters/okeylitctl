@@ -10,11 +10,15 @@ from typing import Any
 from . import __version__
 from .effect_runtime import EffectRuntime
 from .effects import EffectKind
-from .keyboard_layout import ProjectedKey, key_zone_by_id, project_keyboard
+from .keyboard_layout import key_zone_by_id
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
 from .profiles import ProfileError, ProfileStore
 from .sysfs import SysfsBackend, SysfsError
-from .tui_compositor import compose_editor, compose_exact_hex_modal, compose_profiles
+from .tui_compositor import (
+    compose_adaptive_editor, compose_editor, compose_exact_hex_modal,
+    compose_narrow_editor, compose_profiles, compose_responsive_hex_modal,
+    compose_responsive_profiles,
+)
 from .tui_state import TuiState
 from .validation import ValidationError
 
@@ -349,6 +353,9 @@ class CursesTui:
                 if (height, width) != rendered_geometry:
                     self.state.message = "Terminal resized — action cancelled; press again"
                     continue
+                if self.state.help_visible:
+                    handle_key(self.state, key, actions_enabled=actions_enabled)
+                    continue
                 if self.state.effect_running and key not in (
                     ord("s"),
                     ord("q"),
@@ -441,220 +448,18 @@ class CursesTui:
         if height >= 55 and width >= 160:
             return self._draw_reference_editor(screen, height, width)
 
-        cyan = curses.color_pair(1) if self.colors_enabled else curses.A_BOLD
-        chip = curses.color_pair(2) if self.colors_enabled else curses.A_REVERSE
-        good = curses.color_pair(3) if self.colors_enabled else curses.A_BOLD
-        warn = curses.color_pair(4) if self.colors_enabled else curses.A_BOLD
-        top = max(0, (height - 24) // 2)
-
-        self._safe_add(screen, top + 1, 2, "OKEYLITCTL", cyan | curses.A_BOLD)
-        self._safe_add(
-            screen,
-            top + 1,
-            14,
-            f"v{__version__}",
-            curses.A_DIM,
-        )
-        state_text = f" ● DEVICE {self.power_state.upper()} "
-        self._safe_add(
-            screen,
-            top + 1,
-            max(2, width - len(state_text) - 3),
-            state_text,
-            chip,
-        )
-        self._safe_add(
-            screen,
-            top + 2,
-            2,
-            "KEYBOARD",
-            curses.A_BOLD,
-        )
-        dirty = (
-            "RESTORE PENDING"
-            if self.state.effect_running and self.state.effect_restore_pending
-            else (
-                "RESTORE PENDING"
-                if self.state.effect_running and self.power_state == "off"
-                else (
-                    "EFFECT UNKNOWN"
-                    if self.state.effect_running and self.state.effect_frame_uncertain
-                    else (
-                        "EFFECT ACTIVE"
-                        if self.state.effect_running
-                        else (
-                            "UNAPPLIED CHANGES"
-                            if self.state.dirty
-                            else "SYNCHRONIZED"
-                        )
-                    )
-                )
+        if height >= 30 and width >= 100:
+            composed = compose_adaptive_editor(
+                self.state, width=width, height=height,
+                power_state=self.power_state, version=__version__,
             )
-        )
-        self._safe_add(
-            screen,
-            top + 2,
-            width - len(dirty) - 3,
-            dirty,
-            warn if self.state.dirty else good,
-        )
-        self._safe_add(
-            screen,
-            top + 3,
-            2,
-            "ZONES",
-            curses.A_DIM,
-            require_full=True,
-        )
+            return self._draw_composed_screen(screen, composed, height, width)
 
-        self._draw_keyboard_visualization(screen, width, top + 4)
-
-        selected = self.state.selected_zone
-        color = self.state.selected_color
-        zones = (
-            f"1 RIGHT #{self.state.draft.right}  "
-            f"2 CENTER #{self.state.draft.center}  "
-            f"3 LEFT #{self.state.draft.left}  "
-            f"4 WASD #{self.state.draft.wasd}"
+        composed = compose_narrow_editor(
+            self.state, width=width, height=height,
+            power_state=self.power_state, version=__version__,
         )
-        self._safe_add(
-            screen,
-            top + 12,
-            2,
-            zones,
-            curses.A_BOLD,
-            require_full=True,
-        )
-        power_off = self.state.effect_running and self.power_state == "off"
-        uncertain = (
-            self.state.effect_running
-            and self.state.effect_frame_uncertain
-            and not power_off
-        )
-        live_layout = (
-            self.state.effect_frame
-            if self.state.effect_running
-            and self.state.effect_frame is not None
-            and not uncertain
-            and not power_off
-            else self.state.current
-        )
-        current_color = getattr(live_layout, selected.value)
-        if power_off:
-            live_text = "LIVE POWER OFF"
-            editor_suffix = "BASE RESTORE PENDING"
-        elif uncertain:
-            live_text = "LIVE UNKNOWN"
-            editor_suffix = "DEVICE STATE UNKNOWN · S VERIFY"
-        elif self.state.effect_restore_pending:
-            live_text = f"LIVE #{current_color}"
-            editor_suffix = "VERIFIED FRAME · S RESTORE"
-        else:
-            live_text = f"LIVE #{current_color}"
-            editor_suffix = (
-                "EFFECT FRAME · S STOP"
-                if self.state.effect_running and self.state.effect_frame is not None
-                else "LOCAL UNTIL A APPLY"
-            )
-        editor = (
-            f"EDIT {selected.value.upper():<6}  {live_text}  "
-            f"DRAFT #{color}  ·  {editor_suffix}"
-        )
-        self._safe_add(
-            screen,
-            top + 13,
-            2,
-            editor,
-            cyan | curses.A_BOLD,
-            require_full=True,
-        )
-
-        channels = ("RED", "GREEN", "BLUE")
-        for row, (name, offset) in enumerate(zip(channels, (0, 2, 4))):
-            value = int(color[offset : offset + 2], 16)
-            active = row == self.state.selected_channel
-            attr = cyan | curses.A_BOLD if active else 0
-            marker = "▶" if active else " "
-            filled = round(value / 255 * 18)
-            bar = "━" * filled + "─" * (18 - filled)
-            self._safe_add(
-                screen,
-                top + 14 + row,
-                3,
-                f"{marker} {name:<5} {bar}  {value:3d}  {value:02X}",
-                attr,
-                require_full=True,
-            )
-
-        preset = "Custom" if self.state.preset_index < 0 else PRESETS[self.state.preset_index][0]
-        self._safe_add(
-            screen,
-            top + 17,
-            2,
-            f"PRESET {preset}  ·  P CYCLE  ·  E EXACT HEX  ·  X DISCARD DRAFT",
-            curses.A_DIM,
-            require_full=True,
-        )
-        self._safe_add(
-            screen,
-            top + 18,
-            2,
-            self.state.message,
-            good if not self.state.dirty else warn,
-        )
-        effect_action = (
-            "S STOP"
-            if self.state.effect_running
-            else ("A APPLY" if self.state.effect_kind is EffectKind.STATIC else "A START")
-        )
-        direction = "L→R" if self.state.effect_direction == 1 else "R→L"
-        effect_status = (
-            f"EFFECT {self.state.effect_kind.value.upper()} "
-            f"{self.state.effect_index + 1}/16 · "
-            f"SPEED {round(self.state.effect_speed * 100)}% · "
-            f"LIGHT {round(self.state.effect_light * 100)}% · "
-            f"DIR {direction} · {effect_action}"
-        )
-        self._safe_add(
-            screen,
-            top + 19,
-            2,
-            effect_status,
-            cyan | curses.A_BOLD,
-            require_full=True,
-        )
-        commands_edit = (
-            "←/→ ZONE ↑/↓ RGB +/- COLOR [/] SPEED {/} LIGHT D DIR TAB EFFECT"
-        )
-        commands_global = (
-            "S STOP  Q QUIT"
-            if self.state.effect_running
-            else "A APPLY NOW  M PROFILES  O ORIGINAL  R REFRESH  ? HELP  Q QUIT"
-        )
-        self._safe_add(
-            screen,
-            top + 20,
-            2,
-            commands_edit,
-            curses.A_DIM,
-            require_full=True,
-        )
-        self._safe_add(
-            screen,
-            top + 21,
-            2,
-            commands_global,
-            curses.A_BOLD,
-            require_full=True,
-        )
-
-        if self.state.help_visible:
-            self._draw_help(screen)
-        try:
-            screen.refresh()
-        except curses.error:
-            self._render_failed = True
-        return not self._render_failed
+        return self._draw_composed_screen(screen, composed, height, width)
 
     def _reference_role_attr(self, role: str) -> int:
         if role.startswith("dimmed_"):
@@ -800,33 +605,6 @@ class CursesTui:
         )
         return self._draw_composed_screen(screen, composed, height, width)
 
-    @staticmethod
-    def _compact_key_legend(item: ProjectedKey, interior: int) -> str:
-        legend = item.key.legend
-        if len(legend) <= interior:
-            return legend
-        aliases = {
-            "ESC": "E",
-            "PWR": "P",
-            "DEL": "D",
-            "CALC": "C",
-            "INS": "I",
-            "PRTSC": "PRT",
-            "NUMLK": "NUM",
-            "BKSP": "BSP",
-            "ENTER": "ENT",
-            "SHIFT": "SFT",
-            "CTRL": "CTL",
-        }
-        compact = aliases.get(legend, legend)
-        if compact.startswith("F") and compact[1:].isdigit():
-            number = int(compact[1:])
-            if interior == 1:
-                compact = str(number) if number < 10 else chr(ord("A") + number - 10)
-            else:
-                compact = compact[1:]
-        return compact[:interior]
-
     def _color_attr(
         self,
         color: str,
@@ -891,114 +669,6 @@ class CursesTui:
             return curses.color_pair(pair_number) | (curses.A_BOLD if selected else 0)
         except curses.error:
             return fallback
-
-    def _draw_projected_key(
-        self,
-        screen: Any,
-        item: ProjectedKey,
-        origin_x: int,
-        origin_y: int,
-        *,
-        continuation: bool = False,
-    ) -> None:
-        if item.width < 3:
-            token = item.key.legend[: item.width].center(item.width)
-            self._safe_add(
-                screen,
-                origin_y + item.screen_row,
-                origin_x + item.screen_x,
-                token,
-                self._key_attr(item.zone),
-                require_full=True,
-            )
-            return
-        interior = item.width - 2
-        legend = self._compact_key_legend(item, interior)
-        if continuation:
-            token = "│" + legend.center(interior) + "│"
-        else:
-            token = "[" + legend.center(interior) + "]"
-        self._safe_add(
-            screen,
-            origin_y + item.screen_row,
-            origin_x + item.screen_x,
-            token,
-            self._key_attr(item.zone),
-            require_full=True,
-        )
-
-    def _draw_keyboard_visualization(
-        self, screen: Any, width: int, origin_y: int
-    ) -> None:
-        projection = project_keyboard(width)
-        origin_x = max(1, (width - projection.width) // 2)
-        rows: dict[int, list[ProjectedKey]] = {}
-        for item in projection.keys:
-            rows.setdefault(item.screen_row, []).append(item)
-            for continuation_row in self._continuation_rows(item):
-                rows.setdefault(continuation_row, []).append(item)
-        for screen_row in range(7):
-            row_items = rows[6] if screen_row == 5 else rows.get(screen_row, [])
-            if not row_items:
-                continue
-            left = min(item.screen_x for item in row_items) - 1
-            right = max(item.screen_x + item.width for item in row_items)
-            self._safe_add(
-                screen,
-                origin_y + screen_row,
-                origin_x + left,
-                "╱",
-                curses.A_DIM,
-                require_full=True,
-            )
-            self._safe_add(
-                screen,
-                origin_y + screen_row,
-                origin_x + right,
-                "╲",
-                curses.A_DIM,
-                require_full=True,
-            )
-        for item in sorted(
-            projection.keys, key=lambda projected: (projected.screen_row, projected.screen_x)
-        ):
-            self._draw_projected_key(screen, item, origin_x, origin_y)
-            for continuation_row in self._continuation_rows(item):
-                continuation = ProjectedKey(
-                    key=item.key,
-                    screen_x=item.screen_x,
-                    screen_row=continuation_row,
-                    width=item.width,
-                    row_span=1,
-                    zone=item.zone,
-                )
-                self._draw_projected_key(
-                    screen,
-                    continuation,
-                    origin_x,
-                    origin_y,
-                    continuation=True,
-                )
-        bottom_items = rows[6]
-        left = min(item.screen_x for item in bottom_items) - 1
-        right = max(item.screen_x + item.width for item in bottom_items)
-        base_width = right - left + 1
-        self._safe_add(
-            screen,
-            origin_y + 7,
-            origin_x + left,
-            "╰" + "═" * (base_width - 2) + "╯",
-            curses.A_DIM,
-            require_full=True,
-        )
-
-    @staticmethod
-    def _continuation_rows(item: ProjectedKey) -> tuple[int, ...]:
-        if item.row_span != 2:
-            return ()
-        if item.key.id == "KP_ENTER":
-            return (5, 6)
-        return (item.screen_row + 1,)
 
     def _draw_help(self, screen: Any) -> None:
         try:
@@ -1249,9 +919,18 @@ class CursesTui:
                 message=self.state.message,
             )
             return self._draw_composed_screen(screen, composed, height, width)
+        if height >= 30 and width >= 100:
+            composed = compose_responsive_profiles(
+                self.state, width=width, height=height,
+                names=names, selected=selected, preview_layout=preview_layout,
+                preview_error=preview_error, pending_delete=pending_delete,
+                power_state=self.power_state, version=__version__,
+                message=self.state.message,
+            )
+            return self._draw_composed_screen(screen, composed, height, width)
         box_width = min(56, width - 6)
-        visible = min(10, max(1, height - 10))
-        box_height = visible + 7
+        visible = min(8, max(1, height - 12))
+        box_height = visible + 9
         y = max(1, (height - box_height) // 2)
         x = max(2, (width - box_width) // 2)
         rendered = True
@@ -1298,6 +977,13 @@ class CursesTui:
                 marker = "▶" if index == selected else " "
                 attr = curses.A_REVERSE | (curses.A_BOLD if index == selected else 0)
                 add(y + 4 + row, x + 2, f"{marker} {name}", attr)
+        if preview_layout is not None and not preview_error:
+            for row, zones in enumerate((FIRMWARE_ZONE_ORDER[:2], FIRMWARE_ZONE_ORDER[2:])):
+                preview = "  ".join(
+                    f"{zone.value.upper()} #{getattr(preview_layout, zone.value)}"
+                    for zone in zones
+                )
+                add(y + box_height - 5 + row, x + 2, preview, curses.A_REVERSE)
         if pending_delete is not None:
             add(
                 y + box_height - 3,
@@ -1645,12 +1331,18 @@ class CursesTui:
                 pass
             while True:
                 self._render_failed = False
-                composed = compose_exact_hex_modal(
-                    self.state,
-                    power_state=self.power_state,
-                    version=__version__,
-                    input_text=input_text,
-                    error=error,
+                compose = (
+                    compose_exact_hex_modal
+                    if height >= 55 and width >= 160
+                    else compose_responsive_hex_modal
+                )
+                options = {} if compose is compose_exact_hex_modal else {
+                    "width": width, "height": height,
+                }
+                composed = compose(
+                    self.state, power_state=self.power_state,
+                    version=__version__, input_text=input_text, error=error,
+                    **options,
                 )
                 if not self._draw_composed_screen(screen, composed, height, width):
                     raise curses.error
@@ -1658,8 +1350,13 @@ class CursesTui:
                     raise curses.error
                 origin_y = max(0, (height - composed.height) // 2)
                 origin_x = max(0, (width - composed.width) // 2)
+                modal_x = 43 if compose is compose_exact_hex_modal else (width - 74) // 2
+                modal_y = 17 if compose is compose_exact_hex_modal else (height - 18) // 2
                 try:
-                    screen.move(origin_y + 20, origin_x + 51 + len(input_text))
+                    screen.move(
+                        origin_y + modal_y + 3,
+                        origin_x + modal_x + 8 + len(input_text),
+                    )
                 except (AttributeError, curses.error):
                     pass
                 key = screen.getch()
@@ -1718,61 +1415,10 @@ class CursesTui:
         except curses.error:
             self.state.message = "Color entry cancelled after terminal resize or capability error"
             return
-        if geometry[0] >= 55 and geometry[1] >= 160:
-            self._edit_color_modal(screen, geometry)
+        if geometry[0] < 24 or geometry[1] < 78:
+            self.state.message = "Terminal too small for color entry"
             return
-
-        prompt = f"Enter {self.state.selected_zone.value.upper()} color (RRGGBB): "
-        blocking_input = False
-        try:
-            height, width = screen.getmaxyx()
-            if not self._safe_add(
-                screen,
-                height - 3,
-                2,
-                " " * 70,
-                require_full=True,
-            ):
-                raise curses.error
-            if not self._safe_add(
-                screen,
-                height - 3,
-                2,
-                prompt,
-                curses.A_BOLD,
-                require_full=True,
-            ):
-                raise curses.error
-            screen.refresh()
-            if screen.getmaxyx() != (height, width):
-                raise curses.error
-            curses.echo()
-            set_cursor_visibility(1)
-            try:
-                screen.timeout(-1)
-                blocking_input = True
-            except (AttributeError, curses.error):
-                pass
-            raw = screen.getstr(height - 3, 2 + len(prompt), 6).decode("ascii")
-            if screen.getmaxyx() != (height, width):
-                raise curses.error
-            self.state.set_selected_color(raw)
-            self.state.message = f"Local {self.state.selected_zone.value} color set to #{self.state.selected_color}"
-        except (UnicodeDecodeError, ValidationError):
-            self.state.message = "Invalid color — enter exactly six hexadecimal digits"
-        except curses.error:
-            self.state.message = "Color entry cancelled after terminal resize or capability error"
-        finally:
-            if blocking_input:
-                try:
-                    screen.timeout(50)
-                except (AttributeError, curses.error):
-                    pass
-            try:
-                curses.noecho()
-            except curses.error:
-                pass
-            set_cursor_visibility(0)
+        self._edit_color_modal(screen, geometry)
 
 
 def run_tui(

@@ -2022,10 +2022,11 @@ class TuiDeviceActionTests(unittest.TestCase):
         app._draw(screen)
         rendered = " ".join(screen.text)
 
-        for legend in ("ESC", "F12", "PWR", "BKSP", "NUM", "ENTER"):
+        for legend in ("Esc", "F12", "Pwr", "Bksp", "NUM", "ENTER"):
             self.assertIn(legend, rendered)
-        self.assertIn("╱", rendered)
-        self.assertIn("═", rendered)
+        self.assertIn("┌", rendered)
+        self.assertIn("└", rendered)
+        self.assertIn("LIVE ▸ DRAFT", rendered)
         self.assertIn("ZONES", rendered)
         for rejected_label in ("PHOTO-MATCHED", "APPROX.", "NOT PER-KEY", "SAFE KEYBOARD LIGHTING"):
             self.assertNotIn(rejected_label, rendered)
@@ -2061,7 +2062,7 @@ class TuiDeviceActionTests(unittest.TestCase):
         rendered = " ".join(screen.text)
 
         self.assertIn("RESTORE PENDING", rendered)
-        self.assertIn("LIVE POWER OFF", rendered)
+        self.assertIn("LIVE  POWER OFF", rendered)
         self.assertNotIn("LIVE #AA0000", rendered)
         self.assertNotIn("EFFECT FRAME", rendered)
 
@@ -2090,11 +2091,14 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertTrue(app._draw(screen))
         rendered = " ".join(screen.text)
 
-        self.assertIn("EFFECT CYCLE 6/16", rendered)
-        self.assertIn("S STOP", rendered)
-        self.assertIn("[/] SPEED", rendered)
-        self.assertIn("{/} LIGHT", rendered)
-        self.assertNotIn("[/] COARSE", rendered)
+        self.assertIn("EFFECT", rendered)
+        self.assertIn("CYCLE", rendered)
+        self.assertIn("6/16", rendered)
+        self.assertIn("S Stop", rendered)
+        self.assertIn("MOTION", rendered)
+        self.assertIn("S 60% L 80%", rendered)
+        self.assertIn("EDITOR LOCKED", rendered)
+        self.assertNotIn("[ ] speed", rendered)
 
     def test_reference_size_draws_the_approved_editor_composition(self):
         app = CursesTui(FakeBackend())
@@ -2190,12 +2194,12 @@ class TuiDeviceActionTests(unittest.TestCase):
                 rendered = "\n".join(screen.row(y) for y in range(screen.height))
 
                 for action in (
-                    "A APPLY NOW",
-                    "M PROFILES",
-                    "O ORIGINAL",
-                    "R REFRESH",
-                    "? HELP",
-                    "Q QUIT",
+                    "A apply",
+                    "M profiles",
+                    "O original",
+                    "R refresh",
+                    "? help",
+                    "Q quit",
                 ):
                     self.assertIn(action, rendered)
                 for color in ("#111111", "#222222", "#333333", "#444444"):
@@ -2209,24 +2213,12 @@ class TuiDeviceActionTests(unittest.TestCase):
                 ):
                     self.assertNotIn(rejected_label, rendered)
                 if width == 100:
-                    self.assertEqual(rendered.count("[F1]"), 1)
-                    for function_key in ("[10]", "[11]", "[12]"):
+                    for function_key in ("F1", "F10", "F11", "F12"):
                         self.assertIn(function_key, rendered)
                 if width <= 79:
-                    for continuation in ("│+│", "│E│"):
-                        row = next(
-                            screen.row(y)
-                            for y in range(screen.height)
-                            if continuation in screen.row(y)
-                        )
-                        self.assertLess(row.index(continuation), row.rindex("╲"))
-                    enter_rows = [
-                        y
-                        for y in range(screen.height)
-                        if "│E│" in screen.row(y)
-                    ]
-                    self.assertEqual(len(enter_rows), 2)
-                    self.assertEqual(enter_rows[1], enter_rows[0] + 1)
+                    self.assertIn("ZONES · LIVE ▸ DRAFT", rendered)
+                    self.assertIn("EFFECT · STATIC", rendered)
+                    self.assertEqual(screen.row(12)[2], "└")
 
     def test_apply_refuses_to_write_when_draft_is_unchanged(self):
         backend = FakeBackend()
@@ -2465,7 +2457,7 @@ class TuiDeviceActionTests(unittest.TestCase):
             def refresh(self):
                 return None
 
-            def getstr(self, *args):
+            def getch(self):
                 raise curses.error("resized")
 
         with mock.patch("okeylitctl.tui.curses.echo"), mock.patch(
@@ -2578,10 +2570,16 @@ class TuiDeviceActionTests(unittest.TestCase):
             def refresh(self):
                 return None
 
+            def getch(self):
+                if self.timeout_value != -1:
+                    raise AssertionError("modal input must block while waiting")
+                return self.keys.pop(0)
+
             def getstr(self, *_args):
-                return b"ABCDEF" if self.timeout_value == -1 else b""
+                raise AssertionError("compact color entry must use the guided modal")
 
         screen = TimedColorScreen()
+        screen.keys = [*(ord(character) for character in "ABCDEF"), 10]
         with mock.patch("okeylitctl.tui.curses.echo"), mock.patch(
             "okeylitctl.tui.curses.noecho"
         ), mock.patch("okeylitctl.tui.curses.curs_set"):

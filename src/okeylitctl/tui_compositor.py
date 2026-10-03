@@ -76,6 +76,64 @@ def _draw_outer_frame(canvas: _Canvas) -> None:
     canvas.put(canvas.height - 1, 0, "╰" + "─" * (canvas.width - 2) + "╯", "border")
 
 
+def _draw_help_overlay(canvas: _Canvas) -> None:
+    """Keep the input-locking Help screen visible at every supported size."""
+    lines = (
+        "1–4 / ← →  select a keyboard zone",
+        "↑ ↓        select red, green, or blue channel",
+        "+ -        adjust the selected channel",
+        "Tab        select the next effect",
+        "[ ]        adjust effect speed",
+        "{ }        adjust effect light",
+        "D          reverse effect direction",
+        "S          stop a running effect and restore its base",
+        "E          enter an exact six-digit hex color",
+        "P          cycle local presets",
+        "M          open local profiles",
+        "A          apply and verify the complete layout",
+        "O          confirm restoration of the original layout",
+        "X          discard unapplied edits",
+        "R          refresh from the device (unless dirty)",
+        "Q          quit; dirty drafts require confirmation",
+        "Press ? or Esc to close",
+    )
+    width = min(72, canvas.width - 6)
+    height = len(lines) + 2
+    rect = Rect("help", (canvas.width - width) // 2,
+                (canvas.height - height) // 2, width, height)
+    for row in range(rect.y, rect.bottom):
+        canvas.fill(row, rect.x, rect.width, " ", "modal_fill")
+    canvas.box(rect, "OKEYLITCTL HELP")
+    for index, line in enumerate(lines):
+        canvas.put(rect.y + index + 1, rect.x + 2, line, "modal_muted")
+
+
+def _responsive_status_role(state: TuiState, power_state: str) -> str:
+    if state.effect_running:
+        if state.effect_restore_pending or power_state == "off" or state.effect_frame_uncertain:
+            return "error"
+        return "effect_badge"
+    return "dirty_badge" if state.dirty else "synced_badge"
+
+
+def _responsive_editor_shortcuts(state: TuiState) -> str:
+    if state.effect_running:
+        return "EDITOR LOCKED · resolve the effect before editing"
+    return "↔ zone  ↑↓ RGB  + - adjust  Tab effect  [ ] speed  E hex  P preset"
+
+
+def _responsive_effect_shortcut(state: TuiState, power_state: str) -> str:
+    if not state.effect_running:
+        return "A apply  X discard  O original  M profiles  R refresh  ? help  Q quit"
+    if power_state == "off":
+        return "POWER ON, THEN S TO RESTORE  ? help"
+    if state.effect_frame_uncertain:
+        return "S Verify  ? help"
+    if state.effect_restore_pending and state.effect_frame is not None:
+        return "S Restore  ? help  Q quit"
+    return "S Stop  ? help  Q quit"
+
+
 def _draw_header(canvas: _Canvas, state: TuiState, power_state: str, version: str) -> None:
     canvas.put(1, 3, "◆ okeylitctl", "brand")
     canvas.put(1, 16, f"v{version}", "muted")
@@ -270,11 +328,18 @@ def _draw_motion(canvas: _Canvas, state: TuiState) -> None:
     canvas.put(rect.y + 7, rect.x + 3, f"DIR   ‹ {direction} ›", "muted")
 
 
-def _draw_footer(canvas: _Canvas, state: TuiState) -> None:
-    first = "↔  zone    ↑↓  channel    + -  adjust    Tab  effect    [ ]  speed    E  hex    P  preset"
+def _draw_footer(canvas: _Canvas, state: TuiState, power_state: str) -> None:
     if state.effect_running:
-        second = "S Stop    X  discard    O  original    M  profiles    R  refresh    ?  help    Q  quit"
+        if power_state == "off" or state.effect_restore_pending:
+            status = "RESTORE PENDING"
+        elif state.effect_frame_uncertain:
+            status = "EFFECT UNKNOWN"
+        else:
+            status = "EFFECT ACTIVE"
+        first = f"{status} · editor locked until the base layout is restored"
+        second = _responsive_effect_shortcut(state, power_state)
     else:
+        first = "↔  zone    ↑↓  channel    + -  adjust    Tab  effect    [ ]  speed    E  hex    P  preset"
         second = "A  apply    X  discard    O  original    M  profiles    R  refresh    ?  help    Q  quit"
     canvas.put(49, 5, first, "footer")
     canvas.put(51, 5, second, "footer")
@@ -296,7 +361,273 @@ def compose_editor(
     _draw_effects(canvas, state)
     _draw_color(canvas, state)
     _draw_motion(canvas, state)
-    _draw_footer(canvas, state)
+    _draw_footer(canvas, state, power_state)
+    if state.message and state.message != "Ready":
+        canvas.put(2, 3, state.message[: canvas.width - 6], "muted")
+    if state.help_visible:
+        _draw_help_overlay(canvas)
+    return canvas.finish()
+
+
+def compose_adaptive_editor(
+    state: TuiState,
+    *,
+    width: int,
+    height: int,
+    power_state: str,
+    version: str = __version__,
+) -> ComposedScreen:
+    """Reflow the editor at ordinary terminal sizes without changing font size."""
+    if width < 100 or height < 30:
+        raise ValueError("adaptive editor needs at least 100 columns and 30 rows")
+    canvas = _Canvas(width, height)
+    _draw_outer_frame(canvas)
+    canvas.put(1, 3, f"◆ okeylitctl v{version}", "brand")
+    if state.effect_running and state.effect_restore_pending:
+        status = "RESTORE PENDING"
+    elif state.effect_running and power_state == "off":
+        status = "RESTORE PENDING"
+    elif state.effect_running and state.effect_frame_uncertain:
+        status = "EFFECT UNKNOWN"
+    elif state.effect_running:
+        status = "EFFECT ACTIVE"
+    else:
+        status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
+    device = f"DEVICE {power_state.upper()}"
+    canvas.put(1, width - len(status) - len(device) - 7, status,
+               _responsive_status_role(state, power_state))
+    canvas.put(1, width - len(device) - 3, device, "device_badge")
+    if state.message and state.message != "Ready":
+        canvas.put(2, 3, state.message[: width - 6], "muted")
+
+    keyboard_height = min(21, height - 20)
+    spare = height - keyboard_height - 20
+    effect_height = min(11, 5 + spare // 2)
+    controls_height = height - (keyboard_height + effect_height + 12)
+    keyboard = Rect("keyboard", 2, 3, width - 4, keyboard_height)
+    info_y = keyboard.bottom
+    effect = Rect("effect", 2, info_y + 6, width - 4, effect_height)
+    controls_y = effect.bottom
+    canvas.box(keyboard, "KEYBOARD")
+    rendered = render_block_keyboard(keyboard.width - 4, keyboard.height - 2, state.selected_zone)
+    for row in range(rendered.height):
+        for column in range(rendered.width):
+            if rendered.key_ids[row][column] is None:
+                continue
+            zone = rendered.zones[row][column]
+            role = f"key_{zone.value}"
+            if rendered.lines[row][column] == "▀":
+                role += "_top"
+            if rendered.selected[row][column]:
+                role += "_selected"
+            canvas.put(keyboard.y + 1 + row, keyboard.x + 2 + column,
+                       rendered.lines[row][column], role)
+
+    left_width = max(48, (width - 5) // 2)
+    zones = Rect("zones", 2, info_y, left_width, 6)
+    live_draft = Rect("live_draft", zones.right + 1, info_y,
+                      width - zones.right - 3, 6)
+    canvas.box(zones, "ZONES")
+    canvas.box(live_draft, "LIVE ▸ DRAFT")
+    for index, zone in enumerate(FIRMWARE_ZONE_ORDER, start=1):
+        y = zones.y + index
+        chosen = zone is state.selected_zone
+        color = getattr(state.draft, zone.value)
+        canvas.put(y, zones.x + 2, "▸" if chosen else " ", "focus" if chosen else "muted")
+        canvas.put(y, zones.x + 4, f"{index} {zone.value.upper():<6}", "text")
+        canvas.put(y, zones.x + 14, "  ", f"swatch_{zone.value}")
+        canvas.put(y, zones.x + 18, f"#{color}", "draft" if chosen else "muted")
+
+    zone = state.selected_zone
+    power_off = state.effect_running and power_state == "off"
+    unknown = state.effect_running and state.effect_frame_uncertain and not power_off
+    live_layout = (
+        state.effect_frame if state.effect_running and state.effect_frame is not None
+        and not power_off and not unknown else state.current
+    )
+    live = getattr(live_layout, zone.value)
+    draft = getattr(state.draft, zone.value)
+    canvas.put(live_draft.y + 1, live_draft.x + 2,
+               "LIVE  POWER OFF" if power_off else "LIVE  UNKNOWN" if unknown else f"LIVE  #{live}",
+               "error" if power_off or unknown else "muted")
+    canvas.put(live_draft.y + 2, live_draft.x + 2, f"DRAFT #{draft}", "draft")
+    if not power_off and not unknown:
+        canvas.put(live_draft.y + 1, live_draft.x + 20, "  ", f"swatch_live_{zone.value}_{live}")
+    canvas.put(live_draft.y + 2, live_draft.x + 20, "  ", f"swatch_draft_{zone.value}_{draft}")
+    message = (
+        "Base restore pending · POWER ON TO RESTORE" if power_off else "Device state unknown" if unknown
+        else "Verified frame · S Restore"
+        if state.effect_restore_pending and state.effect_frame is not None
+        else "Effect frame active · S Stop" if state.effect_running
+        else "No changes" if live == draft else "Local draft · A apply"
+    )
+    canvas.put(live_draft.y + 4, live_draft.x + 2, message, "muted")
+
+    canvas.box(effect, "EFFECT", f"{state.effect_index + 1}/16")
+    slot = (effect.width - 4) // 8
+    for index, name in enumerate(EFFECT_NAMES):
+        canvas.put(effect.y + 1 + index // 8, effect.x + 2 + index % 8 * slot,
+                   name.upper(), "effect_selected" if index == state.effect_index else "muted")
+    if effect.height >= 5:
+        canvas.put(effect.y + 3, effect.x + 2, "█" * (effect.width - 4),
+                   f"effect_preview_{state.effect_kind.value.lower()}")
+
+    color_width = (width - 5) * 2 // 3
+    color_panel = Rect("color", 2, controls_y, color_width, controls_height)
+    motion = Rect("motion", color_panel.right + 1, controls_y,
+                  width - color_panel.right - 3, controls_height)
+    canvas.box(color_panel, f"COLOR · {zone.value.upper()}" if state.effect_kind is not EffectKind.CYCLE else "COLOR · SPECTRUM")
+    canvas.box(motion, "MOTION")
+    rgb = _channel_values(draft)
+    if controls_height < 6:
+        canvas.put(controls_y + 1, color_panel.x + 2,
+                   f"R {rgb[0]:3d}  G {rgb[1]:3d}  B {rgb[2]:3d}   #{draft}", "draft")
+        canvas.put(controls_y + 1, motion.x + 2,
+                   f"S {round(state.effect_speed * 100)}% L {round(state.effect_light * 100)}% D {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
+    else:
+        for index, (name, value) in enumerate(zip(("RED", "GREEN", "BLUE"), rgb)):
+            canvas.put(controls_y + 1 + index, color_panel.x + 2,
+                       f"{'▸' if index == state.selected_channel else ' '} {name:<5} {value:3d} {value:02X}",
+                       "focus" if index == state.selected_channel else "muted")
+        canvas.put(controls_y + 1, motion.x + 2, f"SPEED {round(state.effect_speed * 100)}%", "muted")
+        canvas.put(controls_y + 2, motion.x + 2, f"LIGHT {round(state.effect_light * 100)}%", "muted")
+        canvas.put(controls_y + 3, motion.x + 2,
+                   f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
+
+    canvas.put(height - 3, 3,
+               _responsive_editor_shortcuts(state), "footer")
+    canvas.put(height - 2, 3,
+               _responsive_effect_shortcut(state, power_state), "footer")
+    if state.help_visible:
+        _draw_help_overlay(canvas)
+    return canvas.finish()
+
+
+def compose_narrow_editor(
+    state: TuiState,
+    *,
+    width: int,
+    height: int,
+    power_state: str,
+    version: str = __version__,
+) -> ComposedScreen:
+    """Keep every editing action visible in the minimum supported viewport."""
+    if width < 78 or height < 24:
+        raise ValueError("narrow editor needs at least 78 columns and 24 rows")
+    canvas = _Canvas(width, height)
+    _draw_outer_frame(canvas)
+    canvas.put(1, 3, f"◆ okeylitctl v{version}", "brand")
+    if state.effect_running and (state.effect_restore_pending or power_state == "off"):
+        status = "RESTORE PENDING"
+    elif state.effect_running and state.effect_frame_uncertain:
+        status = "EFFECT UNKNOWN"
+    elif state.effect_running:
+        status = "EFFECT ACTIVE"
+    else:
+        status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
+    device = f"DEVICE {power_state.upper()}"
+    canvas.put(1, width - len(status) - len(device) - 7, status,
+               _responsive_status_role(state, power_state))
+    canvas.put(1, width - len(device) - 3, device, "device_badge")
+    if state.message and state.message != "Ready":
+        canvas.put(2, 3, state.message[: width - 6], "muted")
+
+    keyboard = Rect("keyboard", 2, 3, width - 4, min(21, height - 14))
+    canvas.box(keyboard, "KEYBOARD")
+    rendered = render_block_keyboard(keyboard.width - 4, keyboard.height - 2, state.selected_zone)
+    for row in range(rendered.height):
+        for column in range(rendered.width):
+            if rendered.key_ids[row][column] is None:
+                continue
+            zone = rendered.zones[row][column]
+            role = f"key_{zone.value}"
+            if rendered.lines[row][column] == "▀":
+                role += "_top"
+            if rendered.selected[row][column]:
+                role += "_selected"
+            canvas.put(keyboard.y + 1 + row, keyboard.x + 2 + column,
+                       rendered.lines[row][column], role)
+
+    info = Rect("zones", 2, keyboard.bottom, width - 4, 5)
+    canvas.box(info, "ZONES · LIVE ▸ DRAFT")
+    for index, zone in enumerate(FIRMWARE_ZONE_ORDER):
+        x = info.x + 2 + index % 2 * 36
+        y = info.y + 1 + index // 2
+        chosen = state.selected_zone is zone
+        canvas.put(y, x, "▸" if chosen else " ", "focus" if chosen else "muted")
+        canvas.put(y, x + 2, f"{index + 1} {zone.value.upper():<6}", "text")
+        canvas.put(y, x + 11, "  ", f"swatch_{zone.value}")
+        canvas.put(y, x + 14, f"#{getattr(state.draft, zone.value)}", "draft")
+    zone = state.selected_zone
+    power_off = state.effect_running and power_state == "off"
+    unknown = state.effect_running and state.effect_frame_uncertain and not power_off
+    live_layout = (
+        state.effect_frame if state.effect_running and state.effect_frame is not None
+        and not power_off and not unknown else state.current
+    )
+    live = "POWER OFF" if power_off else "UNKNOWN" if unknown else f"#{getattr(live_layout, zone.value)}"
+    draft = getattr(state.draft, zone.value)
+    canvas.put(info.y + 3, info.x + 2,
+               f"LIVE {live}  DRAFT #{draft}   RGB {'/'.join(f'{v:03d}' for v in _channel_values(draft))}",
+               "error" if power_off or unknown else "draft")
+
+    remaining = height - 3 - info.bottom
+    effect_height = (
+        remaining if remaining <= 6
+        else min(8, max(4, remaining // 2))
+    )
+    effect = Rect("effect", 2, info.bottom, width - 4, effect_height)
+    canvas.box(effect, f"EFFECT · {state.effect_kind.value.upper()}  {state.effect_index + 1}/16")
+    if effect.height < 4:
+        canvas.put(effect.y + 1, effect.x + 2,
+                   f"SPEED {round(state.effect_speed * 100)}%  LIGHT {round(state.effect_light * 100)}%  "
+                   f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}   Tab select effect", "muted")
+    else:
+        columns = 4 if effect.height >= 6 else 8
+        slot = (effect.width - 4) // columns
+        for index, name in enumerate(EFFECT_NAMES):
+            row = index // columns
+            if row >= effect.height - 2:
+                break
+            canvas.put(effect.y + 1 + row, effect.x + 2 + index % columns * slot,
+                       name.upper(), "effect_selected" if index == state.effect_index else "muted")
+        if effect.height >= 7:
+            canvas.put(effect.bottom - 2, effect.x + 2,
+                       "█" * (effect.width - 4),
+                       f"effect_preview_{state.effect_kind.value.lower()}")
+    controls_height = remaining - effect_height
+    if controls_height >= 3:
+        color_width = (width - 5) * 3 // 5
+        color_panel = Rect("color", 2, effect.bottom, color_width, controls_height)
+        motion = Rect("motion", color_panel.right + 1, effect.bottom,
+                      width - color_panel.right - 3, controls_height)
+        canvas.box(color_panel,
+                   "COLOR · SPECTRUM" if state.effect_kind is EffectKind.CYCLE
+                   else f"COLOR · {zone.value.upper()}")
+        canvas.box(motion, "MOTION")
+        rgb = _channel_values(draft)
+        if controls_height >= 6:
+            for index, (label, value) in enumerate(zip(("RED", "GREEN", "BLUE"), rgb)):
+                canvas.put(color_panel.y + 1 + index, color_panel.x + 2,
+                           f"{'▸' if index == state.selected_channel else ' '} {label:<5} {value:3d} {value:02X}",
+                           "focus" if index == state.selected_channel else "muted")
+            canvas.put(motion.y + 1, motion.x + 2,
+                       f"SPEED {round(state.effect_speed * 100)}%", "muted")
+            canvas.put(motion.y + 2, motion.x + 2,
+                       f"LIGHT {round(state.effect_light * 100)}%", "muted")
+            canvas.put(motion.y + 3, motion.x + 2,
+                       f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
+        else:
+            canvas.put(color_panel.y + 1, color_panel.x + 2,
+                       f"R {rgb[0]:3d} G {rgb[1]:3d} B {rgb[2]:3d}", "draft")
+            canvas.put(motion.y + 1, motion.x + 2,
+                       f"S {round(state.effect_speed * 100)}% L {round(state.effect_light * 100)}%", "muted")
+    canvas.put(height - 3, 3,
+               _responsive_editor_shortcuts(state), "footer")
+    canvas.put(height - 2, 3,
+               _responsive_effect_shortcut(state, power_state), "footer")
+    if state.help_visible:
+        _draw_help_overlay(canvas)
     return canvas.finish()
 
 
@@ -424,6 +755,93 @@ def compose_profiles(
     return canvas.finish()
 
 
+def compose_responsive_profiles(
+    state: TuiState,
+    *,
+    width: int,
+    height: int,
+    names: tuple[str, ...],
+    selected: int,
+    preview_layout: ColorLayout | None,
+    power_state: str,
+    preview_error: str = "",
+    message: str = "",
+    pending_delete: str | None = None,
+    version: str = __version__,
+) -> ComposedScreen:
+    """Keep the approved split profile list and keyboard preview at normal fonts."""
+    if width < 100 or height < 30:
+        raise ValueError("split profile preview needs at least 100 columns and 30 rows")
+    canvas = _Canvas(width, height)
+    _draw_outer_frame(canvas)
+    canvas.put(1, 3, f"◆ okeylitctl v{version}  ›  Profiles", "brand")
+    state_text = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
+    device = f"DEVICE {power_state.upper()}"
+    canvas.put(1, width - len(state_text) - len(device) - 7, state_text,
+               "dirty_badge" if state.dirty else "synced_badge")
+    canvas.put(1, width - len(device) - 3, device, "device_badge")
+
+    list_width = max(38, (width - 5) // 3)
+    listing = Rect("profiles", 2, 3, list_width, height - 7)
+    preview = Rect("preview", listing.right + 1, 3,
+                   width - listing.right - 3, height - 7)
+    canvas.box(listing, "PROFILES")
+    selected_name = names[selected] if names and 0 <= selected < len(names) else None
+    canvas.box(preview, f"PREVIEW · {selected_name.upper()}" if selected_name else "PREVIEW")
+    canvas.put(listing.y + 1, listing.x + 2, f"SAVED {len(names):02d}", "muted")
+    visible = listing.height - 8
+    start = max(0, min(selected - visible + 1, len(names) - visible))
+    if names:
+        for row, name in enumerate(names[start : start + visible]):
+            index = start + row
+            role = "profile_selected" if index == selected else "text"
+            canvas.put(listing.y + 3 + row, listing.x + 2,
+                       ("▸ " if index == selected else "  ") + name, role)
+    else:
+        canvas.put(listing.y + 3, listing.x + 2, "No saved profiles", "muted")
+    if pending_delete is not None:
+        canvas.put(listing.bottom - 4, listing.x + 2, "Delete profile?", "profile_error")
+        canvas.put(listing.bottom - 3, listing.x + 2, pending_delete, "profile_error")
+        canvas.put(listing.bottom - 2, listing.x + 2, "Y confirm · N cancel", "profile_selected")
+    elif preview_error:
+        canvas.put(listing.bottom - 2, listing.x + 2,
+                   "Preview error", "profile_error")
+
+    if preview_error:
+        canvas.put(preview.y + 2, preview.x + 2, "Preview unavailable", "profile_error")
+        canvas.put(preview.y + 4, preview.x + 2,
+                   preview_error[: preview.width - 4], "muted")
+    elif preview_layout is None:
+        canvas.put(preview.y + 2, preview.x + 2,
+                   "Select a saved profile to preview", "muted")
+    else:
+        key_height = min(19, preview.height - 8)
+        keyboard = render_block_keyboard(preview.width - 4, key_height, Zone.WASD)
+        for row in range(keyboard.height):
+            for column in range(keyboard.width):
+                if keyboard.key_ids[row][column] is None:
+                    continue
+                zone = keyboard.zones[row][column]
+                color = getattr(preview_layout, zone.value)
+                top = "_top" if keyboard.lines[row][column] == "▀" else ""
+                canvas.put(preview.y + 2 + row, preview.x + 2 + column,
+                           keyboard.lines[row][column],
+                           f"profile_key_{zone.value}{top}_{color}")
+        for index, zone in enumerate(FIRMWARE_ZONE_ORDER):
+            x = preview.x + 2 + index % 2 * (preview.width // 2)
+            y = preview.y + 3 + key_height + index // 2
+            color = getattr(preview_layout, zone.value)
+            canvas.put(y, x, f"{zone.value.upper():<6}", "muted")
+            canvas.put(y, x + 7, "  ", f"profile_color_{zone.value}_{color}")
+            canvas.put(y, x + 10, f"#{color}", "text")
+    if message and message != "Ready":
+        canvas.put(preview.bottom - 2, preview.x + 2,
+                   message[: preview.width - 4], "muted")
+    canvas.put(height - 3, 3,
+               "↑↓ select  Enter load  S save  N rename  D delete  Esc back", "footer")
+    return canvas.finish()
+
+
 def compose_exact_hex_modal(
     state: TuiState,
     *,
@@ -431,9 +849,26 @@ def compose_exact_hex_modal(
     input_text: str,
     error: str,
     version: str = __version__,
+    width: int | None = None,
+    height: int | None = None,
 ) -> ComposedScreen:
     """Compose the guided exact-color modal over a dimmed editor."""
-    base = compose_editor(state, power_state=power_state, version=version)
+    if width is None and height is None:
+        base = compose_editor(state, power_state=power_state, version=version)
+        rect = HEX_MODAL
+    elif width is not None and height is not None:
+        base = (
+            compose_adaptive_editor(state, width=width, height=height,
+                                    power_state=power_state, version=version)
+            if width >= 100 and height >= 30 else
+            compose_narrow_editor(state, width=width, height=height,
+                                  power_state=power_state, version=version)
+        )
+        rect = Rect("exact_hex", (width - HEX_MODAL.width) // 2,
+                    (height - HEX_MODAL.height) // 2,
+                    HEX_MODAL.width, HEX_MODAL.height)
+    else:
+        raise ValueError("terminal width and height must be supplied together")
     canvas = _Canvas(base.width, base.height)
     canvas.characters = [list(row) for row in base.lines]
     canvas.roles = [
@@ -441,7 +876,6 @@ def compose_exact_hex_modal(
         for row in base.roles
     ]
 
-    rect = HEX_MODAL
     for row in range(rect.y, rect.bottom):
         canvas.put(row, rect.x, " " * rect.width, "modal_fill")
     right = rect.right - 1
@@ -485,3 +919,20 @@ def compose_exact_hex_modal(
     canvas.put(rect.y + 15, rect.x + 38, "^U", "modal_shortcut")
     canvas.put(rect.y + 15, rect.x + 41, "clear", "modal_muted")
     return canvas.finish()
+
+
+def compose_responsive_hex_modal(
+    state: TuiState,
+    *,
+    width: int,
+    height: int,
+    power_state: str,
+    input_text: str,
+    error: str,
+    version: str = __version__,
+) -> ComposedScreen:
+    """Center the same guided modal over a reflowed terminal workspace."""
+    return compose_exact_hex_modal(
+        state, power_state=power_state, input_text=input_text,
+        error=error, version=version, width=width, height=height,
+    )
