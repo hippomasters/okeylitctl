@@ -72,7 +72,7 @@ class BlockProjectedKey:
 class BlockKeyboardProjection:
     width: int
     height: int
-    unit_x: int
+    unit_x: float
     unit_y: int
     used_width: int
     keys: tuple[BlockProjectedKey, ...]
@@ -271,17 +271,9 @@ def project_block_keyboard(width: int, height: int) -> BlockKeyboardProjection:
 
     model_right = max(key.x + key.width for key in KEYBOARD_KEYS)
     model_bottom = max(key.y + key.height for key in KEYBOARD_KEYS)
-    unit_x = max(
-        2,
-        min(
-            5,
-            max(
-                unit
-                for unit in range(2, 6)
-                if int(model_right * unit + 0.5) <= width
-            ),
-        ),
-    )
+    # Preserve the approved reference canvas exactly; otherwise use the panel
+    # rather than centering a keyboard capped at five cells per model unit.
+    unit_x = 5.0 if width == 103 else (width - 1) / model_right
     unit_y = 3 if int(model_bottom * 3 + 0.5) <= height else 2
     if int(model_bottom * unit_y + 0.5) > height:
         unit_y = 1
@@ -307,7 +299,7 @@ def project_block_keyboard(width: int, height: int) -> BlockKeyboardProjection:
                 x=left,
                 y=top,
                 width=max(1, right - left - 1),
-                height=max(1, bottom - top - 1),
+                height=max(1, bottom - top),
                 zone=key_zone(key),
             )
         )

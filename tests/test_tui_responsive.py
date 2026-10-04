@@ -3,9 +3,10 @@
 import unittest
 from unittest import mock
 
-from okeylitctl.tui import CursesTui
+from okeylitctl.tui import CursesTui, TuiCommand, handle_key
 from okeylitctl import tui_compositor
 from okeylitctl.models import ColorLayout
+from okeylitctl.effects import EffectKind, frame_at
 
 
 class ReadOnlyBackend:
@@ -46,6 +47,178 @@ class StrictScreen:
 
 
 class ResponsiveEditorTests(unittest.TestCase):
+    def test_prestart_cycle_preview_is_local_and_live_remains_verified(self):
+        backend = ReadOnlyBackend()
+        app = CursesTui(backend)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        current, draft = app.state.current, app.state.draft
+
+        app._update_preview(now=0.0)
+        first = frame_at(app.state.effect_spec, 0.0)
+        self.assertEqual(app.state.preview_frame, first)
+        composed = tui_compositor.compose_editor(app.state, power_state="on")
+        visible = "\n".join(composed.lines)
+        self.assertIn("KEYBOARD · PREVIEW", visible)
+        self.assertIn("LIVE", visible)
+        self.assertEqual(app.state.current, current)
+        self.assertEqual(app.state.draft, draft)
+        self.assertTrue(any(
+            role.startswith(f"key_right_{first.right}")
+            for row in composed.roles for role in row
+        ))
+
+        app._update_preview(now=1.0)
+        self.assertNotEqual(app.state.preview_frame, first)
+        self.assertEqual(app.state.current, current)
+        self.assertEqual(app.state.draft, draft)
+
+    def test_reactive_and_ripple_preview_pulse_without_device_events(self):
+        app = CursesTui(ReadOnlyBackend())
+        for kind in (EffectKind.REACTIVE, EffectKind.RIPPLE):
+            with self.subTest(kind=kind):
+                app.state.effect_index = tuple(EffectKind).index(kind)
+                app._update_preview(now=0.0)
+                first = app.state.preview_frame
+                self.assertIsNotNone(first)
+                self.assertNotEqual(first, app.state.draft)
+                app._update_preview(now=0.3)
+                self.assertNotEqual(app.state.preview_frame, first)
+                self.assertEqual(app.state.current, app.state.draft)
+
+    def test_cycle_input_changes_preview_and_the_spec_used_when_started(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._update_preview(now=0.9)
+        before = app.state.preview_frame
+
+        handle_key(app.state, ord("+"))
+        app._update_preview(now=0.9)
+        after = app.state.preview_frame
+        self.assertNotEqual(after, before)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertEqual(app.effect_runtime.spec.cycle_from_deg, 5)
+        self.assertEqual(frame_at(app.effect_runtime.spec, 0.9), after)
+        app._update_preview(now=1.0)
+        self.assertIsNone(app.state.preview_frame)
+        composed = tui_compositor.compose_editor(app.state, power_state="on")
+        self.assertNotIn("KEYBOARD · PREVIEW", "\n".join(composed.lines))
+        self.assertIn("key_unavailable", {
+            role for row in composed.roles for role in row
+        })
+
+    def test_short_terminal_switches_color_and_effects_without_device_access(self):
+        app = CursesTui(ReadOnlyBackend())
+        screen = StrictScreen(78, 24)
+        self.assertTrue(app._draw(screen))
+        color_view = "\n".join(screen.lines())
+        self.assertIn("COLOR · RIGHT", color_view)
+        self.assertIn("RED", color_view)
+        self.assertIn("EFFECT", color_view)
+        self.assertIn("V", color_view)
+
+        self.assertEqual(handle_key(app.state, ord("v")), TuiCommand.NONE)
+        self.assertTrue(app._draw(screen))
+        effects_view = "\n".join(screen.lines())
+        self.assertIn("EFFECT · STATIC", effects_view)
+        self.assertIn("COLOR", effects_view)
+        self.assertNotEqual(color_view, effects_view)
+        self.assertEqual(handle_key(app.state, ord("v")), TuiCommand.NONE)
+        self.assertTrue(app._draw(screen))
+        self.assertEqual(color_view, "\n".join(screen.lines()))
+
+    def test_help_explains_the_compact_panel_switch_at_minimum_size(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.help_visible = True
+        screen = StrictScreen(78, 24)
+        self.assertTrue(app._draw(screen))
+        visible = "\n".join(screen.lines())
+        self.assertIn("V", visible)
+        self.assertIn("Color / Effects panel", visible)
+        self.assertIn("Press ? or Esc to close", visible)
+
+    def test_help_explains_cycle_controls_and_deliberate_start(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app.state.help_visible = True
+        for width, height in ((78, 24), (160, 55)):
+            with self.subTest(size=(width, height)):
+                screen = StrictScreen(width, height)
+                self.assertTrue(app._draw(screen))
+                visible = "\n".join(screen.lines())
+                for label in ("Cycle FROM/TO/SAT", "base RGB", "Cycle palettes",
+                              "start an effect"):
+                    self.assertIn(label, visible)
+
+    def test_normal_font_110_by_30_focuses_colored_sliders_or_effects(self):
+        app = CursesTui(ReadOnlyBackend())
+        screen = StrictScreen(110, 30)
+        self.assertTrue(app._draw(screen))
+        visible = "\n".join(screen.lines())
+        for label in ("KEYBOARD", "ZONES", "LIVE ▸ DRAFT", "COLOR · RIGHT",
+                      "RED", "GREEN", "BLUE", "V EFFECTS"):
+            self.assertIn(label, visible)
+        self.assertNotIn("SCANNER", visible)
+
+        handle_key(app.state, ord("v"))
+        self.assertTrue(app._draw(screen))
+        visible = "\n".join(screen.lines())
+        for label in ("EFFECT · STATIC", "SCANNER", "SPEED", "LIGHT", "V COLOR"):
+            self.assertIn(label, visible)
+
+    def test_short_cycle_color_panel_shows_actual_rainbow_and_spectrum_controls(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        for width, height in ((78, 24), (78, 38)):
+            with self.subTest(size=(width, height)):
+                composed = tui_compositor.compose_narrow_editor(
+                    app.state, width=width, height=height, power_state="on"
+                )
+                visible = "\n".join(composed.lines)
+                for label in ("COLOR · SPECTRUM", "FROM", "TO", "SAT"):
+                    self.assertIn(label, visible)
+                self.assertGreaterEqual(len({
+                    role for row in composed.roles for role in row
+                    if role.startswith("spectrum_")
+                }), 6)
+
+    def test_cycle_footer_explains_spectrum_input_instead_of_rgb_input(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        for width, height in ((78, 24), (110, 30), (159, 54), (160, 55)):
+            with self.subTest(size=(width, height)):
+                screen = StrictScreen(width, height)
+                self.assertTrue(app._draw(screen))
+                footer = "\n".join(screen.lines()[-6:])
+                self.assertIn("FROM/TO/SAT", footer)
+                self.assertNotIn("↑↓ RGB", footer)
+
+    def test_tall_narrow_cycle_effect_strip_is_multicolor(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        composed = tui_compositor.compose_narrow_editor(
+            app.state, width=78, height=55, power_state="on"
+        )
+        hues = {
+            role for row in composed.roles for role in row
+            if role.startswith("spectrum_")
+        }
+        self.assertGreaterEqual(len(hues), 6)
+        self.assertNotIn("effect_preview_cycle", {
+            role for row in composed.roles for role in row
+        })
+
+    def test_larger_than_reference_terminals_use_the_full_viewport(self):
+        app = CursesTui(ReadOnlyBackend())
+        for width, height in ((160, 56), (161, 55), (268, 59)):
+            with self.subTest(size=(width, height)):
+                screen = StrictScreen(width, height)
+                self.assertTrue(app._draw(screen))
+                lines = screen.lines()
+                self.assertEqual(lines[0][0], "╭")
+                self.assertEqual(lines[0][-1], "╮")
+                self.assertEqual(lines[-1][0], "╰")
+                self.assertEqual(lines[-1][-1], "╯")
+
     def test_help_intercepts_reactive_input_before_effect_event(self):
         app = CursesTui(ReadOnlyBackend())
         app.state.effect_running = True
@@ -72,6 +245,68 @@ class ResponsiveEditorTests(unittest.TestCase):
             app._main(InputScreen())
         trigger.assert_not_called()
         self.assertFalse(app.state.help_visible)
+
+    def test_running_reactive_effect_allows_view_switch_without_an_event(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.REACTIVE)
+        app.state.effect_running = True
+
+        class InputScreen(StrictScreen):
+            def __init__(self):
+                super().__init__(110, 30)
+                self.keys = iter((ord("v"), ord("q")))
+
+            def keypad(self, _enabled):
+                pass
+
+            def timeout(self, _milliseconds):
+                pass
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), mock.patch.object(
+            app, "_tick_effect", return_value=True
+        ), mock.patch.object(
+            app, "_trigger_effect_input", side_effect=AssertionError("V triggered effect")
+        ) as trigger:
+            app._main(InputScreen())
+        trigger.assert_not_called()
+        self.assertEqual(app.state.compact_panel, "effects")
+
+    def test_failed_render_cannot_turn_v_into_hidden_reactive_input(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.REACTIVE)
+        app.state.effect_running = True
+
+        class InputScreen(StrictScreen):
+            def __init__(self):
+                super().__init__(110, 30)
+                self.keys = iter((ord("v"), ord("q")))
+
+            def keypad(self, _enabled):
+                pass
+
+            def timeout(self, _milliseconds):
+                pass
+
+            def getch(self):
+                return next(self.keys)
+
+        def failed_draw(_screen):
+            app._rendered_geometry = (30, 110)
+            return False
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), mock.patch.object(
+            app, "_draw", side_effect=failed_draw
+        ), mock.patch.object(
+            app, "_tick_effect", return_value=False
+        ), mock.patch.object(
+            app, "_trigger_effect_input", side_effect=AssertionError("hidden event")
+        ) as trigger:
+            app._main(InputScreen())
+        trigger.assert_not_called()
+        self.assertEqual(app.state.compact_panel, "color")
 
     def test_verified_restore_pending_uses_restore_not_stop_instruction(self):
         app = CursesTui(ReadOnlyBackend())
@@ -170,7 +405,8 @@ class ResponsiveEditorTests(unittest.TestCase):
                 screen = StrictScreen(width, height)
                 self.assertTrue(app._draw(screen))
                 visible = "\n".join(screen.lines())
-                self.assertIn("RESTORE PENDING", screen.lines()[1])
+                self.assertIn("EFFECT UNKNOWN", screen.lines()[1])
+                self.assertNotIn("RESTORE PENDING", screen.lines()[1])
                 self.assertIn("UNKNOWN", visible)
                 self.assertIn("S Verify", visible)
                 self.assertNotIn("#AA0000", visible)
@@ -311,6 +547,30 @@ class ResponsiveEditorTests(unittest.TestCase):
         self.assertIn("Esc", rendered)
         self.assertEqual(app.state.current.to_wire(), app.state.draft.to_wire())
 
+    def test_exact_hex_modal_keeps_full_viewport_above_reference_size(self):
+        app = CursesTui(ReadOnlyBackend())
+
+        class ModalScreen(StrictScreen):
+            def timeout(self, _delay):
+                pass
+
+            def getch(self):
+                return 27
+
+            def move(self, *_args):
+                pass
+
+        for width, height in ((160, 56), (161, 55), (268, 59)):
+            with self.subTest(size=(width, height)):
+                screen = ModalScreen(width, height)
+                app._edit_color(screen)
+                lines = screen.lines()
+                self.assertEqual(lines[0][0], "╭")
+                self.assertEqual(lines[0][-1], "╮")
+                self.assertEqual(lines[-1][0], "╰")
+                self.assertEqual(lines[-1][-1], "╯")
+                self.assertIn("EXACT HEX · RIGHT", "\n".join(lines))
+
     def test_guided_exact_hex_modal_at_normal_font_keeps_preview_and_actions(self):
         app = CursesTui(ReadOnlyBackend())
         for width, height in ((78, 24), (110, 30), (159, 54)):
@@ -331,11 +591,15 @@ class ResponsiveEditorTests(unittest.TestCase):
         self.assertTrue(app._draw(screen))
         lines = screen.lines()
         visible = "\n".join(lines)
-        for label in ("KEYBOARD", "ZONES", "LIVE ▸ DRAFT", "EFFECT", "COLOR · RIGHT", "MOTION"):
+        for label in ("KEYBOARD", "ZONES", "LIVE ▸ DRAFT", "EFFECT", "COLOR · RIGHT",
+                      "RED", "GREEN", "BLUE", "V EFFECTS"):
             with self.subTest(label=label):
                 self.assertIn(label, visible)
         self.assertIn("STATIC", visible)
-        self.assertIn("SCANNER", visible)
+        self.assertNotIn("SCANNER", visible)
+        handle_key(app.state, ord("v"))
+        self.assertTrue(app._draw(screen))
+        self.assertIn("SCANNER", "\n".join(screen.lines()))
         self.assertIn("Esc", visible)
         self.assertIn("#710FFA", visible)
         self.assertIn("A apply", visible)
@@ -360,13 +624,13 @@ class ResponsiveEditorTests(unittest.TestCase):
         lines = screen.lines()
         visible = "\n".join(lines)
         for label in ("KEYBOARD", "ZONES", "LIVE", "DRAFT", "EFFECT", "STATIC",
-                      "SPEED", "LIGHT", "#710FFA", "#0FFA36",
+                      "COLOR · RIGHT", "RED", "#710FFA", "#0FFA36",
                       "A apply", "M profiles", "Q quit"):
             with self.subTest(label=label):
                 self.assertIn(label, visible)
         self.assertEqual(lines[0][0], "╭")
         self.assertEqual(lines[23][77], "╯")
-        self.assertEqual(lines[12][2], "└")
+        self.assertEqual(lines[11][2], "└")
 
     def test_tall_narrow_terminal_uses_extra_rows_for_effects_color_and_motion(self):
         app = CursesTui(ReadOnlyBackend())
@@ -382,6 +646,7 @@ class ResponsiveEditorTests(unittest.TestCase):
 
     def test_narrow_38_row_boundary_keeps_the_full_effect_catalog(self):
         app = CursesTui(ReadOnlyBackend())
+        app.state.compact_panel = "effects"
         screen = StrictScreen(78, 38)
         self.assertTrue(app._draw(screen))
         visible = "\n".join(screen.lines())
@@ -398,10 +663,9 @@ class ResponsiveEditorTests(unittest.TestCase):
                 screen = StrictScreen(width, height)
                 self.assertTrue(app._draw(screen))
                 lines = screen.lines()
-                frame_width = 160 if width >= 160 and height >= 55 else width
-                frame_height = 55 if width >= 160 and height >= 55 else height
-                x = (width - frame_width) // 2
-                y = (height - frame_height) // 2
+                frame_width = width
+                frame_height = height
+                x = y = 0
                 self.assertEqual(lines[y][x], "╭")
                 self.assertEqual(lines[y][x + frame_width - 1], "╮")
                 self.assertEqual(lines[y + frame_height - 1][x], "╰")

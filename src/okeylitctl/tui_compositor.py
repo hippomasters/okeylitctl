@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from colorsys import hsv_to_rgb
 from dataclasses import dataclass
 
 from . import __version__
-from .effects import EffectKind
+from .effects import EffectKind, PHYSICAL_ZONE_ORDER
 from .keyboard_layout import render_block_keyboard
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
-from .tui_state import TuiState
+from .tui_state import CYCLE_PRESETS, TuiState
 from .tui_visual_contract import (
     EDITOR_LAYOUT,
     EFFECT_NAMES,
@@ -68,6 +69,59 @@ class _Canvas:
         )
 
 
+SPECTRUM_BANDS = 24
+
+
+def _cycle_preset_label(state: TuiState) -> str:
+    index = state.cycle_preset_index
+    if not 0 <= index < len(CYCLE_PRESETS):
+        return "Custom"
+    name, start, end, saturation = CYCLE_PRESETS[index]
+    if (state.cycle_from_deg, state.cycle_to_deg,
+            state.cycle_saturation_percent) != (start, end, saturation):
+        return "Custom"
+    return name
+
+
+def _spectrum_colors(state: TuiState) -> tuple[str, ...]:
+    return tuple(
+        "".join(
+            f"{round(channel * 255):02X}"
+            for channel in hsv_to_rgb(
+                (state.cycle_from_deg +
+                 (state.cycle_to_deg - state.cycle_from_deg) * index /
+                 (SPECTRUM_BANDS - 1)) / 360.0,
+                state.cycle_saturation_percent / 100.0,
+                1.0,
+            )
+        )
+        for index in range(SPECTRUM_BANDS)
+    )
+
+
+def _draw_spectrum(
+    canvas: _Canvas, state: TuiState, y: int, x: int, width: int,
+) -> None:
+    colors = _spectrum_colors(state)
+    for column in range(width):
+        band = column * len(colors) // width
+        canvas.put(y, x + column, "█", f"spectrum_{band}_{colors[band]}")
+
+
+def _draw_effect_palette(
+    canvas: _Canvas, state: TuiState, power_state: str,
+    y: int, x: int, width: int,
+) -> None:
+    colors = _keyboard_colors(state, power_state)
+    if colors is None:
+        canvas.put(y, x, " " * width, "muted")
+        return
+    for column in range(width):
+        zone = PHYSICAL_ZONE_ORDER[column * len(PHYSICAL_ZONE_ORDER) // width]
+        color = getattr(colors, zone.value)
+        canvas.put(y, x + column, "█", f"effect_color_{zone.value}_{color}")
+
+
 def _draw_outer_frame(canvas: _Canvas) -> None:
     canvas.put(0, 0, "╭" + "─" * (canvas.width - 2) + "╮", "border")
     for row in range(1, canvas.height - 1):
@@ -76,20 +130,27 @@ def _draw_outer_frame(canvas: _Canvas) -> None:
     canvas.put(canvas.height - 1, 0, "╰" + "─" * (canvas.width - 2) + "╯", "border")
 
 
-def _draw_help_overlay(canvas: _Canvas) -> None:
+def _draw_help_overlay(canvas: _Canvas, state: TuiState) -> None:
     """Keep the input-locking Help screen visible at every supported size."""
+    cycle = state.effect_kind is EffectKind.CYCLE
     lines = (
         "1–4 / ← →  select a keyboard zone",
+        "↑ ↓        select Cycle FROM/TO/SAT control" if cycle else
         "↑ ↓        select red, green, or blue channel",
-        "+ -        adjust the selected channel",
+        "+ -        adjust the selected Cycle control" if cycle else
+        "+ -        adjust the selected RGB channel",
         "Tab        select the next effect",
+        "V          switch the Color / Effects panel",
         "[ ]        adjust effect speed",
         "{ }        adjust effect light",
         "D          reverse effect direction",
         "S          stop a running effect and restore its base",
-        "E          enter an exact six-digit hex color",
-        "P          cycle local presets",
+        "E          edit base RGB (not the Cycle spectrum)" if cycle else
+        "E          enter an exact six-digit base RGB color",
+        "P          cycle Cycle palettes" if cycle else
+        "P          cycle local color presets",
         "M          open local profiles",
+        "A          start an effect" if state.effect_kind is not EffectKind.STATIC else
         "A          apply and verify the complete layout",
         "O          confirm restoration of the original layout",
         "X          discard unapplied edits",
@@ -119,7 +180,17 @@ def _responsive_status_role(state: TuiState, power_state: str) -> str:
 def _responsive_editor_shortcuts(state: TuiState) -> str:
     if state.effect_running:
         return "EDITOR LOCKED · resolve the effect before editing"
+    if state.effect_kind is EffectKind.CYCLE:
+        return "↔ zone  ↑↓ FROM/TO/SAT  +/- adjust  Tab effect  [ ] speed  P preset"
     return "↔ zone  ↑↓ RGB  + - adjust  Tab effect  [ ] speed  E hex  P preset"
+
+
+def _focused_editor_shortcuts(state: TuiState) -> str:
+    if state.effect_running:
+        return _responsive_editor_shortcuts(state)
+    if state.effect_kind is EffectKind.CYCLE:
+        return "V panel  ↔ zone  ↑↓ FROM/TO/SAT  +/- adjust  Tab effect  P preset"
+    return "V panel  ↔ zone  ↑↓ RGB  +/- color  Tab effect  E hex  P preset"
 
 
 def _responsive_effect_shortcut(state: TuiState, power_state: str) -> str:
@@ -137,14 +208,14 @@ def _responsive_effect_shortcut(state: TuiState, power_state: str) -> str:
 def _draw_header(canvas: _Canvas, state: TuiState, power_state: str, version: str) -> None:
     canvas.put(1, 3, "◆ okeylitctl", "brand")
     canvas.put(1, 16, f"v{version}", "muted")
-    if state.effect_running and state.effect_restore_pending:
-        status = "RESTORE PENDING"
-        status_role = "error"
-    elif state.effect_running and power_state == "off":
+    if state.effect_running and power_state == "off":
         status = "RESTORE PENDING"
         status_role = "error"
     elif state.effect_running and state.effect_frame_uncertain:
         status = "EFFECT UNKNOWN"
+        status_role = "error"
+    elif state.effect_running and state.effect_restore_pending:
+        status = "RESTORE PENDING"
         status_role = "error"
     elif state.effect_running:
         status = "EFFECT ACTIVE"
@@ -158,23 +229,47 @@ def _draw_header(canvas: _Canvas, state: TuiState, power_state: str, version: st
     canvas.put(1, 137, device.ljust(19), "device_badge")
 
 
-def _draw_keyboard(canvas: _Canvas, state: TuiState) -> None:
+def _keyboard_colors(state: TuiState, power_state: str) -> ColorLayout | None:
+    if not state.effect_running:
+        return state.preview_frame or state.draft
+    if power_state == "off" or state.effect_frame_uncertain:
+        return None
+    return state.effect_frame
+
+
+def _keyboard_role(
+    zone: Zone, glyph: str, selected: bool, colors: ColorLayout | None,
+    *, running: bool,
+) -> str:
+    if colors is None:
+        return "key_unavailable"
+    role = f"key_{zone.value}"
+    if running:
+        role += f"_{getattr(colors, zone.value)}"
+    if glyph == "▀":
+        role += "_top"
+    if selected:
+        role += "_selected"
+    return role
+
+
+def _draw_keyboard(canvas: _Canvas, state: TuiState, power_state: str) -> None:
     rect = EDITOR_LAYOUT.panel("keyboard")
-    canvas.box(rect, "KEYBOARD")
+    canvas.box(rect, "KEYBOARD · PREVIEW" if state.preview_frame is not None and not state.effect_running else "KEYBOARD")
     keyboard = render_block_keyboard(103, 19, state.selected_zone)
     origin_x = rect.x + 2
     origin_y = rect.y + 1
+    colors = _keyboard_colors(state, power_state)
     for row in range(keyboard.height):
         for column in range(keyboard.width):
             key_id = keyboard.key_ids[row][column]
             if key_id is None:
                 continue
             zone = keyboard.zones[row][column]
-            role = f"key_{zone.value}"
-            if keyboard.lines[row][column] == "▀":
-                role += "_top"
-            if keyboard.selected[row][column]:
-                role += "_selected"
+            role = _keyboard_role(
+                zone, keyboard.lines[row][column], keyboard.selected[row][column],
+                colors, running=state.effect_running or state.preview_frame is not None,
+            )
             canvas.put(
                 origin_y + row,
                 origin_x + column,
@@ -248,7 +343,7 @@ def _draw_live_draft(canvas: _Canvas, state: TuiState, power_state: str) -> None
         canvas.put(rect.y + 7, rect.x + 3, f"Δ  R{red:+d}   G{green:+d}   B{blue:+d}", "dirty")
 
 
-def _draw_effects(canvas: _Canvas, state: TuiState) -> None:
+def _draw_effects(canvas: _Canvas, state: TuiState, power_state: str) -> None:
     rect = EDITOR_LAYOUT.panel("effect")
     canvas.box(rect, "EFFECT", f"{state.effect_index + 1}/16")
     starts = (12, 31, 50, 69, 88, 107, 126, 143)
@@ -262,10 +357,12 @@ def _draw_effects(canvas: _Canvas, state: TuiState) -> None:
             text,
             "effect_selected" if index == state.effect_index else "muted",
         )
-    preview = "█" * (rect.width - 4)
-    preview_role = f"effect_preview_{state.effect_kind.value.lower()}"
-    canvas.put(rect.y + 7, rect.x + 2, preview, preview_role)
-    canvas.put(rect.y + 8, rect.x + 2, preview, preview_role)
+    if state.effect_kind is EffectKind.CYCLE:
+        for row in (rect.y + 7, rect.y + 8):
+            _draw_spectrum(canvas, state, row, rect.x + 2, rect.width - 4)
+    else:
+        for row in (rect.y + 7, rect.y + 8):
+            _draw_effect_palette(canvas, state, power_state, row, rect.x + 2, rect.width - 4)
 
 
 def _channel_values(color: str) -> tuple[int, int, int]:
@@ -276,20 +373,28 @@ def _draw_color(canvas: _Canvas, state: TuiState) -> None:
     rect = EDITOR_LAYOUT.panel("color")
     if state.effect_kind is EffectKind.CYCLE:
         canvas.box(rect, "COLOR · SPECTRUM")
-        canvas.put(rect.y + 3, rect.x + 3, "▸ FROM", "focus")
-        canvas.put(rect.y + 4, rect.x + 5, "TO", "muted")
-        canvas.put(rect.y + 5, rect.x + 5, "SAT", "muted")
-        spectrum = "█" * 57
-        canvas.put(rect.y + 3, rect.x + 15, spectrum, "effect_preview_cycle")
-        canvas.put(rect.y + 4, rect.x + 15, spectrum, "effect_preview_cycle")
-        canvas.put(rect.y + 5, rect.x + 15, "━" * 51 + "─" * 6, "focus")
-        canvas.put(rect.y + 3, rect.x + 76, "  0°", "text")
-        canvas.put(rect.y + 4, rect.x + 76, "360°", "muted")
-        canvas.put(rect.y + 5, rect.x + 76, " 90%", "muted")
-        canvas.put(rect.y + 2, rect.x + 86, " H 190° ", "swatch_center")
-        canvas.put(rect.y + 8, rect.x + 3, "PRESET  ‹ Rainbow ›", "muted")
-        for index, role in enumerate(("right", "center", "left", "wasd", "center")):
-            canvas.put(rect.y + 8, rect.x + 38 + index * 7, "     ", f"swatch_{role}")
+        for index, label in enumerate(("FROM", "TO", "SAT")):
+            row = rect.y + 3 + index
+            selected = index == state.selected_channel
+            canvas.put(row, rect.x + 3, "▸" if selected else " ", "focus")
+            canvas.put(row, rect.x + 5, label, "focus" if selected else "muted")
+        _draw_spectrum(canvas, state, rect.y + 3, rect.x + 15, 57)
+        _draw_spectrum(canvas, state, rect.y + 4, rect.x + 15, 57)
+        filled = round(state.cycle_saturation_percent / 100.0 * 57)
+        canvas.put(rect.y + 5, rect.x + 15, "━" * filled + "─" * (57 - filled), "focus")
+        canvas.put(rect.y + 3, rect.x + 76, f"{state.cycle_from_deg:3d}°", "text")
+        canvas.put(rect.y + 4, rect.x + 76, f"{state.cycle_to_deg:3d}°", "text")
+        canvas.put(rect.y + 5, rect.x + 76, f"{state.cycle_saturation_percent:3d}%", "text")
+        canvas.put(rect.y + 2, rect.x + 86,
+                   f"H {state.cycle_from_deg:3d}°", "muted")
+        canvas.put(rect.y + 2, rect.x + 96, "███",
+                   f"spectrum_0_{_spectrum_colors(state)[0]}")
+        canvas.put(rect.y + 8, rect.x + 3, f"PRESET  ‹ {_cycle_preset_label(state)} ›", "muted")
+        colors = _spectrum_colors(state)
+        for index in range(5):
+            band = round(index * (SPECTRUM_BANDS - 1) / 4)
+            canvas.put(rect.y + 8, rect.x + 38 + index * 7,
+                       "█████", f"spectrum_{band}_{colors[band]}")
         return
 
     zone = state.selected_zone
@@ -330,16 +435,22 @@ def _draw_motion(canvas: _Canvas, state: TuiState) -> None:
 
 def _draw_footer(canvas: _Canvas, state: TuiState, power_state: str) -> None:
     if state.effect_running:
-        if power_state == "off" or state.effect_restore_pending:
+        if power_state == "off":
             status = "RESTORE PENDING"
         elif state.effect_frame_uncertain:
             status = "EFFECT UNKNOWN"
+        elif state.effect_restore_pending:
+            status = "RESTORE PENDING"
         else:
             status = "EFFECT ACTIVE"
         first = f"{status} · editor locked until the base layout is restored"
         second = _responsive_effect_shortcut(state, power_state)
     else:
-        first = "↔  zone    ↑↓  channel    + -  adjust    Tab  effect    [ ]  speed    E  hex    P  preset"
+        first = (
+            "↔  zone    ↑↓  FROM/TO/SAT    + -  adjust    Tab  effect    [ ]  speed    P  preset"
+            if state.effect_kind is EffectKind.CYCLE else
+            "↔  zone    ↑↓  channel    + -  adjust    Tab  effect    [ ]  speed    E  hex    P  preset"
+        )
         second = "A  apply    X  discard    O  original    M  profiles    R  refresh    ?  help    Q  quit"
     canvas.put(49, 5, first, "footer")
     canvas.put(51, 5, second, "footer")
@@ -355,17 +466,17 @@ def compose_editor(
     canvas = _Canvas(EDITOR_LAYOUT.width, EDITOR_LAYOUT.height)
     _draw_outer_frame(canvas)
     _draw_header(canvas, state, power_state, version)
-    _draw_keyboard(canvas, state)
+    _draw_keyboard(canvas, state, power_state)
     _draw_zones(canvas, state)
     _draw_live_draft(canvas, state, power_state)
-    _draw_effects(canvas, state)
+    _draw_effects(canvas, state, power_state)
     _draw_color(canvas, state)
     _draw_motion(canvas, state)
     _draw_footer(canvas, state, power_state)
     if state.message and state.message != "Ready":
         canvas.put(2, 3, state.message[: canvas.width - 6], "muted")
     if state.help_visible:
-        _draw_help_overlay(canvas)
+        _draw_help_overlay(canvas, state)
     return canvas.finish()
 
 
@@ -383,12 +494,12 @@ def compose_adaptive_editor(
     canvas = _Canvas(width, height)
     _draw_outer_frame(canvas)
     canvas.put(1, 3, f"◆ okeylitctl v{version}", "brand")
-    if state.effect_running and state.effect_restore_pending:
-        status = "RESTORE PENDING"
-    elif state.effect_running and power_state == "off":
+    if state.effect_running and power_state == "off":
         status = "RESTORE PENDING"
     elif state.effect_running and state.effect_frame_uncertain:
         status = "EFFECT UNKNOWN"
+    elif state.effect_running and state.effect_restore_pending:
+        status = "RESTORE PENDING"
     elif state.effect_running:
         status = "EFFECT ACTIVE"
     else:
@@ -408,18 +519,18 @@ def compose_adaptive_editor(
     info_y = keyboard.bottom
     effect = Rect("effect", 2, info_y + 6, width - 4, effect_height)
     controls_y = effect.bottom
-    canvas.box(keyboard, "KEYBOARD")
+    canvas.box(keyboard, "KEYBOARD · PREVIEW" if state.preview_frame is not None and not state.effect_running else "KEYBOARD")
     rendered = render_block_keyboard(keyboard.width - 4, keyboard.height - 2, state.selected_zone)
+    keyboard_colors = _keyboard_colors(state, power_state)
     for row in range(rendered.height):
         for column in range(rendered.width):
             if rendered.key_ids[row][column] is None:
                 continue
             zone = rendered.zones[row][column]
-            role = f"key_{zone.value}"
-            if rendered.lines[row][column] == "▀":
-                role += "_top"
-            if rendered.selected[row][column]:
-                role += "_selected"
+            role = _keyboard_role(
+                zone, rendered.lines[row][column], rendered.selected[row][column],
+                keyboard_colors, running=state.effect_running or state.preview_frame is not None,
+            )
             canvas.put(keyboard.y + 1 + row, keyboard.x + 2 + column,
                        rendered.lines[row][column], role)
 
@@ -463,14 +574,30 @@ def compose_adaptive_editor(
     )
     canvas.put(live_draft.y + 4, live_draft.x + 2, message, "muted")
 
+    if controls_height < 6:
+        focused = Rect("focused", 2, effect.y, width - 4, height - 3 - effect.y)
+        _draw_focused_short_panel(canvas, state, focused, power_state)
+        canvas.put(height - 3, 3,
+                   _focused_editor_shortcuts(state), "footer")
+        canvas.put(height - 2, 3,
+                   _responsive_effect_shortcut(state, power_state), "footer")
+        if state.help_visible:
+            _draw_help_overlay(canvas, state)
+        return canvas.finish()
+
     canvas.box(effect, "EFFECT", f"{state.effect_index + 1}/16")
     slot = (effect.width - 4) // 8
     for index, name in enumerate(EFFECT_NAMES):
         canvas.put(effect.y + 1 + index // 8, effect.x + 2 + index % 8 * slot,
                    name.upper(), "effect_selected" if index == state.effect_index else "muted")
     if effect.height >= 5:
-        canvas.put(effect.y + 3, effect.x + 2, "█" * (effect.width - 4),
-                   f"effect_preview_{state.effect_kind.value.lower()}")
+        if state.effect_kind is EffectKind.CYCLE:
+            _draw_spectrum(canvas, state, effect.y + 3, effect.x + 2, effect.width - 4)
+        else:
+            _draw_effect_palette(
+                canvas, state, power_state,
+                effect.y + 3, effect.x + 2, effect.width - 4,
+            )
 
     color_width = (width - 5) * 2 // 3
     color_panel = Rect("color", 2, controls_y, color_width, controls_height)
@@ -479,28 +606,116 @@ def compose_adaptive_editor(
     canvas.box(color_panel, f"COLOR · {zone.value.upper()}" if state.effect_kind is not EffectKind.CYCLE else "COLOR · SPECTRUM")
     canvas.box(motion, "MOTION")
     rgb = _channel_values(draft)
-    if controls_height < 6:
-        canvas.put(controls_y + 1, color_panel.x + 2,
-                   f"R {rgb[0]:3d}  G {rgb[1]:3d}  B {rgb[2]:3d}   #{draft}", "draft")
-        canvas.put(controls_y + 1, motion.x + 2,
-                   f"S {round(state.effect_speed * 100)}% L {round(state.effect_light * 100)}% D {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
+    if state.effect_kind is EffectKind.CYCLE:
+        controls = (
+            ("FROM", f"{state.cycle_from_deg}°"),
+            ("TO", f"{state.cycle_to_deg}°"),
+            ("SAT", f"{state.cycle_saturation_percent}%"),
+        )
+        for index, (label, value) in enumerate(controls):
+            canvas.put(controls_y + 1 + index, color_panel.x + 2,
+                       f"{'▸' if index == state.selected_channel else ' '} "
+                       f"{label:<5} {value}",
+                       "focus" if index == state.selected_channel else "muted")
+        _draw_spectrum(canvas, state, controls_y + 4,
+                       color_panel.x + 2, color_panel.width - 4)
     else:
         for index, (name, value) in enumerate(zip(("RED", "GREEN", "BLUE"), rgb)):
             canvas.put(controls_y + 1 + index, color_panel.x + 2,
-                       f"{'▸' if index == state.selected_channel else ' '} {name:<5} {value:3d} {value:02X}",
+                       f"{'▸' if index == state.selected_channel else ' '} "
+                       f"{name:<5} {value:3d} {value:02X}",
                        "focus" if index == state.selected_channel else "muted")
-        canvas.put(controls_y + 1, motion.x + 2, f"SPEED {round(state.effect_speed * 100)}%", "muted")
-        canvas.put(controls_y + 2, motion.x + 2, f"LIGHT {round(state.effect_light * 100)}%", "muted")
-        canvas.put(controls_y + 3, motion.x + 2,
-                   f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
+    canvas.put(controls_y + 1, motion.x + 2,
+               f"SPEED {round(state.effect_speed * 100)}%", "muted")
+    canvas.put(controls_y + 2, motion.x + 2,
+               f"LIGHT {round(state.effect_light * 100)}%", "muted")
+    canvas.put(controls_y + 3, motion.x + 2,
+               f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
 
     canvas.put(height - 3, 3,
                _responsive_editor_shortcuts(state), "footer")
     canvas.put(height - 2, 3,
                _responsive_effect_shortcut(state, power_state), "footer")
     if state.help_visible:
-        _draw_help_overlay(canvas)
+        _draw_help_overlay(canvas, state)
     return canvas.finish()
+
+
+def _draw_focused_short_panel(
+    canvas: _Canvas, state: TuiState, rect: Rect, power_state: str,
+) -> None:
+    """Show usable Color or Effects controls when both cannot fit."""
+    zone = state.selected_zone
+    if state.compact_panel == "color":
+        if state.effect_kind is EffectKind.CYCLE:
+            canvas.box(rect, "COLOR · SPECTRUM  [V EFFECTS]",
+                       f"CYCLE {state.effect_index + 1}/16")
+            selected = ("FROM", "TO", "SAT")[state.selected_channel]
+            canvas.put(rect.y + 1, rect.x + 2,
+                       f"▸ {selected}  FROM {state.cycle_from_deg}°   "
+                       f"TO {state.cycle_to_deg}°   "
+                       f"SAT {state.cycle_saturation_percent}%", "focus")
+            _draw_spectrum(canvas, state, rect.y + 2, rect.x + 2, rect.width - 4)
+            if rect.height >= 6:
+                _draw_spectrum(canvas, state, rect.y + 3, rect.x + 2, rect.width - 4)
+                canvas.put(rect.y + 4, rect.x + 2, f"PRESET  ‹ {_cycle_preset_label(state)} ›", "muted")
+            return
+        canvas.box(
+            rect, f"COLOR · {zone.value.upper()}  [V EFFECTS]",
+            f"EFFECT {state.effect_kind.value.upper()} {state.effect_index + 1}/16",
+        )
+        color = getattr(state.draft, zone.value)
+        values = _channel_values(color)
+        labels = ("RED", "GREEN", "BLUE")
+        roles = ("channel_red", "channel_green", "channel_blue")
+        if rect.height < 5:
+            for index, (value, role) in enumerate(zip(values, roles)):
+                canvas.put(rect.y + 1, rect.x + 2 + index * 10,
+                           f"{labels[index][0]} {value:3d}", role)
+            canvas.put(rect.y + 1, rect.x + 36, f"HEX #{color}", "draft")
+            selected = state.selected_channel
+            value = values[selected]
+            bar_width = min(38, rect.width - 17)
+            filled = round(value / 255 * bar_width)
+            canvas.put(rect.y + 2, rect.x + 2, f"▸ {labels[selected]:<5}", "focus")
+            canvas.put(rect.y + 2, rect.x + 10,
+                       "━" * filled + "─" * (bar_width - filled), roles[selected])
+        else:
+            bar_width = min(36, rect.width - 21)
+            for index, (value, role) in enumerate(zip(values, roles)):
+                row = rect.y + 1 + index
+                canvas.put(row, rect.x + 2,
+                           f"{'▸' if index == state.selected_channel else ' '} {labels[index]:<5}",
+                           "focus" if index == state.selected_channel else "muted")
+                filled = round(value / 255 * bar_width)
+                canvas.put(row, rect.x + 11,
+                           "━" * filled + "─" * (bar_width - filled), role)
+                canvas.put(row, rect.x + 13 + bar_width,
+                           f"{value:3d} {value:02X}", "text")
+        return
+
+    canvas.box(rect, f"EFFECT · {state.effect_kind.value.upper()} {state.effect_index + 1}/16  [V COLOR]")
+    if rect.height < 6:
+        canvas.put(rect.y + 1, rect.x + 2,
+                   f"TAB next  Shift-Tab previous  [ ] speed  D direction", "muted")
+        canvas.put(rect.y + 2, rect.x + 2,
+                   f"SPEED {round(state.effect_speed * 100)}%  LIGHT {round(state.effect_light * 100)}%  "
+                   f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}", "focus")
+    else:
+        slot = (rect.width - 4) // 8
+        for index, name in enumerate(EFFECT_NAMES):
+            canvas.put(rect.y + 1 + index // 8, rect.x + 2 + index % 8 * slot,
+                       name.upper(), "effect_selected" if index == state.effect_index else "muted")
+        canvas.put(rect.y + 3, rect.x + 2,
+                   f"SPEED {round(state.effect_speed * 100)}%  LIGHT {round(state.effect_light * 100)}%  "
+                   f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
+        if state.effect_kind is EffectKind.CYCLE:
+            _draw_spectrum(canvas, state, rect.bottom - 2, rect.x + 2, rect.width - 4)
+        else:
+            _draw_effect_palette(
+                canvas, state, power_state,
+                rect.bottom - 2, rect.x + 2, rect.width - 4,
+            )
 
 
 def compose_narrow_editor(
@@ -517,10 +732,12 @@ def compose_narrow_editor(
     canvas = _Canvas(width, height)
     _draw_outer_frame(canvas)
     canvas.put(1, 3, f"◆ okeylitctl v{version}", "brand")
-    if state.effect_running and (state.effect_restore_pending or power_state == "off"):
+    if state.effect_running and power_state == "off":
         status = "RESTORE PENDING"
     elif state.effect_running and state.effect_frame_uncertain:
         status = "EFFECT UNKNOWN"
+    elif state.effect_running and state.effect_restore_pending:
+        status = "RESTORE PENDING"
     elif state.effect_running:
         status = "EFFECT ACTIVE"
     else:
@@ -532,19 +749,22 @@ def compose_narrow_editor(
     if state.message and state.message != "Ready":
         canvas.put(2, 3, state.message[: width - 6], "muted")
 
-    keyboard = Rect("keyboard", 2, 3, width - 4, min(21, height - 14))
-    canvas.box(keyboard, "KEYBOARD")
+    keyboard_height = min(21, height - 14)
+    if height - 3 - (3 + keyboard_height + 5) < 4:
+        keyboard_height -= 1
+    keyboard = Rect("keyboard", 2, 3, width - 4, keyboard_height)
+    canvas.box(keyboard, "KEYBOARD · PREVIEW" if state.preview_frame is not None and not state.effect_running else "KEYBOARD")
     rendered = render_block_keyboard(keyboard.width - 4, keyboard.height - 2, state.selected_zone)
+    keyboard_colors = _keyboard_colors(state, power_state)
     for row in range(rendered.height):
         for column in range(rendered.width):
             if rendered.key_ids[row][column] is None:
                 continue
             zone = rendered.zones[row][column]
-            role = f"key_{zone.value}"
-            if rendered.lines[row][column] == "▀":
-                role += "_top"
-            if rendered.selected[row][column]:
-                role += "_selected"
+            role = _keyboard_role(
+                zone, rendered.lines[row][column], rendered.selected[row][column],
+                keyboard_colors, running=state.effect_running or state.preview_frame is not None,
+            )
             canvas.put(keyboard.y + 1 + row, keyboard.x + 2 + column,
                        rendered.lines[row][column], role)
 
@@ -572,6 +792,16 @@ def compose_narrow_editor(
                "error" if power_off or unknown else "draft")
 
     remaining = height - 3 - info.bottom
+    if remaining <= 6:
+        focused = Rect("focused", 2, info.bottom, width - 4, remaining)
+        _draw_focused_short_panel(canvas, state, focused, power_state)
+        canvas.put(height - 3, 3,
+                   _focused_editor_shortcuts(state), "footer")
+        canvas.put(height - 2, 3,
+                   _responsive_effect_shortcut(state, power_state), "footer")
+        if state.help_visible:
+            _draw_help_overlay(canvas, state)
+        return canvas.finish()
     effect_height = (
         remaining if remaining <= 6
         else min(8, max(4, remaining // 2))
@@ -592,9 +822,13 @@ def compose_narrow_editor(
             canvas.put(effect.y + 1 + row, effect.x + 2 + index % columns * slot,
                        name.upper(), "effect_selected" if index == state.effect_index else "muted")
         if effect.height >= 7:
-            canvas.put(effect.bottom - 2, effect.x + 2,
-                       "█" * (effect.width - 4),
-                       f"effect_preview_{state.effect_kind.value.lower()}")
+            if state.effect_kind is EffectKind.CYCLE:
+                _draw_spectrum(canvas, state, effect.bottom - 2, effect.x + 2, effect.width - 4)
+            else:
+                _draw_effect_palette(
+                    canvas, state, power_state,
+                    effect.bottom - 2, effect.x + 2, effect.width - 4,
+                )
     controls_height = remaining - effect_height
     if controls_height >= 3:
         color_width = (width - 5) * 3 // 5
@@ -606,11 +840,35 @@ def compose_narrow_editor(
                    else f"COLOR · {zone.value.upper()}")
         canvas.box(motion, "MOTION")
         rgb = _channel_values(draft)
-        if controls_height >= 6:
+        if state.effect_kind is EffectKind.CYCLE:
+            controls = (
+                ("FROM", f"{state.cycle_from_deg}°"),
+                ("TO", f"{state.cycle_to_deg}°"),
+                ("SAT", f"{state.cycle_saturation_percent}%"),
+            )
+            if controls_height >= 6:
+                for index, (label, value) in enumerate(controls):
+                    canvas.put(color_panel.y + 1 + index, color_panel.x + 2,
+                               f"{'▸' if index == state.selected_channel else ' '} "
+                               f"{label:<5} {value}",
+                               "focus" if index == state.selected_channel else "muted")
+                _draw_spectrum(canvas, state, color_panel.y + 4,
+                               color_panel.x + 2, color_panel.width - 4)
+            else:
+                canvas.put(color_panel.y + 1, color_panel.x + 2,
+                           f"FROM {state.cycle_from_deg}° TO {state.cycle_to_deg}° "
+                           f"SAT {state.cycle_saturation_percent}%", "focus")
+                _draw_spectrum(canvas, state, color_panel.y + 1,
+                               color_panel.x + 29, min(10, color_panel.width - 31))
+        elif controls_height >= 6:
             for index, (label, value) in enumerate(zip(("RED", "GREEN", "BLUE"), rgb)):
                 canvas.put(color_panel.y + 1 + index, color_panel.x + 2,
                            f"{'▸' if index == state.selected_channel else ' '} {label:<5} {value:3d} {value:02X}",
                            "focus" if index == state.selected_channel else "muted")
+        else:
+            canvas.put(color_panel.y + 1, color_panel.x + 2,
+                       f"R {rgb[0]:3d} G {rgb[1]:3d} B {rgb[2]:3d}", "draft")
+        if controls_height >= 6:
             canvas.put(motion.y + 1, motion.x + 2,
                        f"SPEED {round(state.effect_speed * 100)}%", "muted")
             canvas.put(motion.y + 2, motion.x + 2,
@@ -618,8 +876,6 @@ def compose_narrow_editor(
             canvas.put(motion.y + 3, motion.x + 2,
                        f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}", "muted")
         else:
-            canvas.put(color_panel.y + 1, color_panel.x + 2,
-                       f"R {rgb[0]:3d} G {rgb[1]:3d} B {rgb[2]:3d}", "draft")
             canvas.put(motion.y + 1, motion.x + 2,
                        f"S {round(state.effect_speed * 100)}% L {round(state.effect_light * 100)}%", "muted")
     canvas.put(height - 3, 3,
@@ -627,7 +883,7 @@ def compose_narrow_editor(
     canvas.put(height - 2, 3,
                _responsive_effect_shortcut(state, power_state), "footer")
     if state.help_visible:
-        _draw_help_overlay(canvas)
+        _draw_help_overlay(canvas, state)
     return canvas.finish()
 
 

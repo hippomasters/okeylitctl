@@ -8,6 +8,13 @@ from .effects import EffectKind, EffectSpec
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
 from .validation import normalize_color
 
+CYCLE_PRESETS = (
+    ("Rainbow", 0, 360, 90),
+    ("Warm", 0, 80, 95),
+    ("Ocean", 170, 260, 90),
+    ("Aurora", 100, 300, 90),
+)
+
 
 @dataclass
 class TuiState:
@@ -22,11 +29,17 @@ class TuiState:
     effect_speed: float = 0.6
     effect_light: float = 0.8
     effect_direction: int = 1
+    cycle_from_deg: int = 0
+    cycle_to_deg: int = 360
+    cycle_saturation_percent: int = 90
+    cycle_preset_index: int = 0
     effect_running: bool = False
     effect_frame: ColorLayout | None = None
+    preview_frame: ColorLayout | None = None
     effect_frame_uncertain: bool = False
     effect_restore_pending: bool = False
     preset_index: int = -1
+    compact_panel: str = "color"
     help_visible: bool = False
     message: str = "Ready"
 
@@ -53,7 +66,36 @@ class TuiState:
             speed=self.effect_speed,
             light=self.effect_light,
             direction=self.effect_direction,
+            cycle_from_deg=self.cycle_from_deg,
+            cycle_to_deg=self.cycle_to_deg,
+            cycle_saturation=self.cycle_saturation_percent / 100.0,
         )
+
+    def adjust_cycle_control(self, delta: int) -> None:
+        """Change one Cycle control locally in five-degree/percent steps."""
+        step = delta * 5
+        if self.selected_channel == 0:
+            self.cycle_from_deg = max(
+                0, min(self.cycle_to_deg - 5, self.cycle_from_deg + step)
+            )
+        elif self.selected_channel == 1:
+            self.cycle_to_deg = max(
+                self.cycle_from_deg + 5, min(360, self.cycle_to_deg + step)
+            )
+        elif self.selected_channel == 2:
+            self.cycle_saturation_percent = max(
+                0, min(100, self.cycle_saturation_percent + step)
+            )
+        else:
+            raise ValueError("selected Cycle control must be FROM, TO, or SAT")
+        self.cycle_preset_index = -1
+
+    def select_next_cycle_preset(self) -> str:
+        self.cycle_preset_index = (self.cycle_preset_index + 1) % len(CYCLE_PRESETS)
+        name, self.cycle_from_deg, self.cycle_to_deg, self.cycle_saturation_percent = (
+            CYCLE_PRESETS[self.cycle_preset_index]
+        )
+        return name
 
     def select_next_effect(self) -> None:
         self.effect_index = (self.effect_index + 1) % len(EffectKind)

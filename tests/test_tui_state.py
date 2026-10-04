@@ -1,6 +1,7 @@
 import unittest
 
 from okeylitctl.models import ColorLayout, Zone
+from okeylitctl.effects import EffectKind
 from okeylitctl.tui_state import TuiState
 
 
@@ -9,6 +10,37 @@ ORIGINAL = ColorLayout.from_wire("580BC3,D00FEF,4D0998,AF0AA1")
 
 
 class TuiStateTests(unittest.TestCase):
+    def test_cycle_controls_change_the_effect_spec_without_changing_draft(self):
+        state = TuiState(current=CURRENT, original=ORIGINAL)
+        state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        state.selected_channel = 0
+        state.adjust_cycle_control(1)
+        self.assertEqual(state.effect_spec.cycle_from_deg, 5)
+        state.selected_channel = 1
+        state.adjust_cycle_control(-1)
+        self.assertEqual(state.effect_spec.cycle_to_deg, 355)
+        state.selected_channel = 2
+        state.adjust_cycle_control(-1)
+        self.assertEqual(state.effect_spec.cycle_saturation, 0.85)
+        self.assertEqual(state.current, CURRENT)
+        self.assertEqual(state.draft, CURRENT)
+
+    def test_cycle_hue_endpoints_and_saturation_remain_valid_at_limits(self):
+        state = TuiState(current=CURRENT, original=ORIGINAL)
+        state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        state.selected_channel = 0
+        state.adjust_cycle_control(100)
+        self.assertEqual(state.cycle_from_deg, 355)
+        state.selected_channel = 1
+        state.adjust_cycle_control(-100)
+        self.assertEqual(state.cycle_to_deg, 360)
+        state.selected_channel = 2
+        state.adjust_cycle_control(-100)
+        self.assertEqual(state.cycle_saturation_percent, 0)
+        state.adjust_cycle_control(100)
+        self.assertEqual(state.cycle_saturation_percent, 100)
+        self.assertLess(state.effect_spec.cycle_from_deg, state.effect_spec.cycle_to_deg)
+
     def test_edits_are_local_until_marked_applied(self):
         state = TuiState(current=CURRENT, original=ORIGINAL)
 

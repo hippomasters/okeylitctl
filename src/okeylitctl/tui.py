@@ -9,13 +9,13 @@ from typing import Any
 
 from . import __version__
 from .effect_runtime import EffectRuntime
-from .effects import EffectKind
+from .effects import EffectEvent, EffectKind, PHYSICAL_ZONE_ORDER, frame_at
 from .keyboard_layout import key_zone_by_id
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
 from .profiles import ProfileError, ProfileStore
 from .sysfs import SysfsBackend, SysfsError
 from .tui_compositor import (
-    compose_adaptive_editor, compose_editor, compose_exact_hex_modal,
+    SPECTRUM_BANDS, compose_adaptive_editor, compose_editor, compose_exact_hex_modal,
     compose_narrow_editor, compose_profiles, compose_responsive_hex_modal,
     compose_responsive_profiles,
 )
@@ -179,9 +179,15 @@ def handle_key(
     elif key == curses.KEY_UP:
         state.selected_channel = (state.selected_channel - 1) % 3
     elif key in (ord("+"), ord("=")):
-        state.adjust_selected_channel(1)
+        if state.effect_kind is EffectKind.CYCLE:
+            state.adjust_cycle_control(1)
+        else:
+            state.adjust_selected_channel(1)
     elif key == ord("-"):
-        state.adjust_selected_channel(-1)
+        if state.effect_kind is EffectKind.CYCLE:
+            state.adjust_cycle_control(-1)
+        else:
+            state.adjust_selected_channel(-1)
     elif key == ord("]"):
         state.adjust_effect_speed(0.05)
     elif key == ord("["):
@@ -192,16 +198,22 @@ def handle_key(
         state.adjust_effect_light(-0.05)
     elif key == ord("d"):
         state.toggle_effect_direction()
+    elif key == ord("v"):
+        state.compact_panel = "effects" if state.compact_panel == "color" else "color"
     elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
         state.selected_zone = FIRMWARE_ZONE_ORDER[key - ord("1")]
     elif key == ord("p"):
-        state.preset_index = (state.preset_index + 1) % len(PRESETS)
-        name, layout = PRESETS[state.preset_index]
-        state.draft = layout
-        if state.dirty:
-            state.message = f"Preset loaded locally: {name} — press A to apply"
+        if state.effect_kind is EffectKind.CYCLE:
+            name = state.select_next_cycle_preset()
+            state.message = f"Cycle palette: {name} — preview only until A starts"
         else:
-            state.message = f"Preset already active: {name}"
+            state.preset_index = (state.preset_index + 1) % len(PRESETS)
+            name, layout = PRESETS[state.preset_index]
+            state.draft = layout
+            if state.dirty:
+                state.message = f"Preset loaded locally: {name} — press A to apply"
+            else:
+                state.message = f"Preset already active: {name}"
     elif key == ord("x"):
         state.discard_draft()
     elif key == ord("?"):
@@ -249,6 +261,18 @@ class CursesTui:
     def run(self) -> None:
         curses.wrapper(self._main)
 
+    def _update_preview(self, *, now: float) -> None:
+        """Animate only the local drawing; never access the device."""
+        if self.state.effect_running or self.state.effect_kind is EffectKind.STATIC:
+            self.state.preview_frame = None
+        else:
+            event = None
+            if self.state.effect_kind in (EffectKind.REACTIVE, EffectKind.RIPPLE):
+                period_start = now - now % 2.0
+                zone = PHYSICAL_ZONE_ORDER[int(now // 2.0) % len(PHYSICAL_ZONE_ORDER)]
+                event = EffectEvent(zone=zone, elapsed=period_start)
+            self.state.preview_frame = frame_at(self.state.effect_spec, now, event=event)
+
     def _cleanup_after_terminal_failure(self) -> bool:
         delay = 0.05
         while self.effect_runtime is not None:
@@ -293,6 +317,7 @@ class CursesTui:
 
         try:
             while True:
+                self._update_preview(now=monotonic())
                 workspace_visible = self._draw(screen)
                 rendered_geometry = self._rendered_geometry
                 if rendered_geometry is None:
@@ -301,9 +326,6 @@ class CursesTui:
                     return
                 try:
                     if screen.getmaxyx() != rendered_geometry:
-                        self.state.message = (
-                            "Terminal resized — workspace redrawn before accepting input"
-                        )
                         continue
                 except curses.error:
                     if self.effect_runtime is not None:
@@ -351,10 +373,14 @@ class CursesTui:
                         self._cleanup_after_terminal_failure()
                     return
                 if (height, width) != rendered_geometry:
-                    self.state.message = "Terminal resized — action cancelled; press again"
+                    continue
+                if not actions_enabled and key != ord("q"):
                     continue
                 if self.state.help_visible:
                     handle_key(self.state, key, actions_enabled=actions_enabled)
+                    continue
+                if self.state.effect_running and actions_enabled and key == ord("v"):
+                    handle_key(self.state, key, actions_enabled=True)
                     continue
                 if self.state.effect_running and key not in (
                     ord("s"),
@@ -445,7 +471,7 @@ class CursesTui:
                 self._render_failed = True
             return not self._render_failed
 
-        if height >= 55 and width >= 160:
+        if (height, width) == (55, 160):
             return self._draw_reference_editor(screen, height, width)
 
         if height >= 30 and width >= 100:
@@ -476,15 +502,58 @@ class CursesTui:
             zone = Zone(zone_name)
             pair_number = 26 + FIRMWARE_ZONE_ORDER.index(zone)
             return self._color_attr(color, pair_number=pair_number)
+        if role.startswith("effect_color_"):
+            try:
+                zone_name, color = role.removeprefix("effect_color_").rsplit("_", 1)
+                pair_number = 100 + FIRMWARE_ZONE_ORDER.index(Zone(zone_name))
+                foreground = rgb_to_xterm_index(color)
+            except ValueError:
+                return curses.A_DIM
+            if (
+                not self.colors_enabled or getattr(curses, "COLORS", 0) < 256
+                or getattr(curses, "COLOR_PAIRS", 0) <= pair_number
+            ):
+                return curses.A_BOLD
+            try:
+                curses.init_pair(pair_number, foreground, curses.COLOR_BLACK)
+                return curses.color_pair(pair_number)
+            except curses.error:
+                return curses.A_BOLD
+        if role.startswith("spectrum_"):
+            try:
+                band_text, color = role.removeprefix("spectrum_").split("_", 1)
+                band = int(band_text)
+                if not 0 <= band < SPECTRUM_BANDS or len(color) != 6:
+                    raise ValueError("invalid spectrum role")
+                foreground = rgb_to_xterm_index(color)
+            except ValueError:
+                return curses.A_DIM
+            pair_number = 50 + band
+            if (
+                not self.colors_enabled or getattr(curses, "COLORS", 0) < 256
+                or getattr(curses, "COLOR_PAIRS", 0) < 50 + SPECTRUM_BANDS
+                or getattr(curses, "COLOR_PAIRS", 0) <= pair_number
+            ):
+                return curses.A_BOLD
+            try:
+                curses.init_pair(pair_number, foreground, curses.COLOR_BLACK)
+                return curses.color_pair(pair_number)
+            except curses.error:
+                return curses.A_BOLD
+        if role == "key_unavailable":
+            return curses.A_DIM
         if role.startswith("key_"):
             selected = role.endswith("_selected")
             key_role = role.removeprefix("key_").removesuffix("_selected")
             top = key_role.endswith("_top")
-            zone_name = key_role.removesuffix("_top")
+            zone_name, separator, color = key_role.removesuffix("_top").partition("_")
             try:
-                return self._key_attr(Zone(zone_name), top=top, selected=selected)
+                return self._key_attr(
+                    Zone(zone_name), top=top, selected=selected,
+                    color_override=color if separator else None,
+                )
             except ValueError:
-                return curses.A_REVERSE
+                return curses.A_DIM
         if role.startswith("swatch_live_"):
             return self._color_attr(role.rsplit("_", 1)[1], pair_number=14)
         if role.startswith("swatch_draft_"):
@@ -1333,7 +1402,7 @@ class CursesTui:
                 self._render_failed = False
                 compose = (
                     compose_exact_hex_modal
-                    if height >= 55 and width >= 160
+                    if (height, width) == (55, 160)
                     else compose_responsive_hex_modal
                 )
                 options = {} if compose is compose_exact_hex_modal else {

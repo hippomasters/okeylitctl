@@ -62,6 +62,35 @@ class TuiInteractionTests(unittest.TestCase):
         self.assertEqual(self.state.effect_direction, -1)
         self.assertEqual(self.state.current, ColorLayout.from_wire("111111,222222,333333,444444"))
 
+    def test_cycle_plus_minus_edit_spectrum_controls_not_rgb_draft(self):
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        draft = self.state.draft
+        self.assertEqual(handle_key(self.state, ord("+")), TuiCommand.NONE)
+        self.assertEqual(self.state.cycle_from_deg, 5)
+        self.assertEqual(handle_key(self.state, curses.KEY_DOWN), TuiCommand.NONE)
+        self.assertEqual(handle_key(self.state, ord("-")), TuiCommand.NONE)
+        self.assertEqual(self.state.cycle_to_deg, 355)
+        self.assertEqual(handle_key(self.state, curses.KEY_DOWN), TuiCommand.NONE)
+        self.assertEqual(handle_key(self.state, ord("-")), TuiCommand.NONE)
+        self.assertEqual(self.state.cycle_saturation_percent, 85)
+        self.assertEqual(self.state.draft, draft)
+        self.assertEqual(self.state.current, draft)
+
+    def test_cycle_preset_key_changes_spectrum_not_base_colors(self):
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        draft = self.state.draft
+        self.assertEqual(handle_key(self.state, ord("p")), TuiCommand.NONE)
+        self.assertEqual((self.state.cycle_from_deg,
+                          self.state.cycle_to_deg,
+                          self.state.cycle_saturation_percent), (0, 80, 95))
+        self.assertIn("Warm", self.state.message)
+        self.assertEqual(self.state.draft, draft)
+        self.assertEqual(handle_key(self.state, ord("p")), TuiCommand.NONE)
+        self.assertEqual((self.state.cycle_from_deg,
+                          self.state.cycle_to_deg,
+                          self.state.cycle_saturation_percent), (170, 260, 90))
+        self.assertEqual(self.state.draft, draft)
+
     def test_input_keys_map_to_physical_effect_zones_without_raw_device_access(self):
         self.assertEqual(effect_zone_for_key(ord("w"), Zone.CENTER), Zone.WASD)
         self.assertEqual(effect_zone_for_key(ord("q"), Zone.CENTER), Zone.LEFT)
@@ -282,6 +311,82 @@ class TuiInteractionTests(unittest.TestCase):
             rgb_to_xterm_index(top_foreground),
             rgb_to_xterm_index(background),
         )
+
+    def test_rainbow_spectrum_role_uses_its_hue_as_foreground(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 32767, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair, mock.patch(
+            "okeylitctl.tui.curses.color_pair", return_value=0
+        ):
+            app._reference_role_attr("spectrum_0_FF1919")
+        init_pair.assert_called_once_with(
+            50, rgb_to_xterm_index("FF1919"), curses.COLOR_BLACK
+        )
+
+    def test_spectrum_falls_back_uniformly_when_pairs_cannot_hold_all_hues(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 64, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair:
+            self.assertEqual(app._reference_role_attr("spectrum_0_FF1919"), curses.A_BOLD)
+            self.assertEqual(app._reference_role_attr("spectrum_23_FF1919"), curses.A_BOLD)
+        init_pair.assert_not_called()
+
+    def test_effect_strip_role_paints_verified_zone_color_not_teal(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 32767, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair, mock.patch(
+            "okeylitctl.tui.curses.color_pair", return_value=0
+        ):
+            app._reference_role_attr("effect_color_right_710FFA")
+        init_pair.assert_called_once_with(
+            100, rgb_to_xterm_index("710FFA"), curses.COLOR_BLACK
+        )
+
+    def test_verified_effect_key_roles_use_frame_color_not_draft(self):
+        backend = mock.Mock()
+        backend.status.return_value = {
+            "state": "on",
+            "colors": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+            "original": ["710FFA", "710FFA", "710FFA", "0FFA36"],
+        }
+        app = CursesTui(backend)
+        app.colors_enabled = True
+        _, top_foreground, background = tui_module._key_surface_colors("AA0000")
+        with mock.patch.object(curses, "COLORS", 256, create=True), mock.patch.object(
+            curses, "COLOR_PAIRS", 32767, create=True
+        ), mock.patch("okeylitctl.tui.curses.init_pair") as init_pair, mock.patch(
+            "okeylitctl.tui.curses.color_pair", return_value=0
+        ):
+            app._reference_role_attr("key_right_AA0000_top_selected")
+            init_pair.assert_called_once_with(
+                34, rgb_to_xterm_index(top_foreground),
+                rgb_to_xterm_index(background),
+            )
+        self.assertEqual(app._reference_role_attr("key_unavailable"), curses.A_DIM)
 
     def test_monochrome_keycaps_show_top_and_legend_without_reversing_every_body(self):
         backend = mock.Mock()
@@ -1515,6 +1620,42 @@ class TuiDeviceActionTests(unittest.TestCase):
 
         self.assertEqual(backend.writes, [])
 
+    def test_resize_redraw_does_not_show_internal_safety_prose(self):
+        app = CursesTui(FakeBackend(), profile_store=FakeProfileStore())
+
+        class ResizeScreen:
+            def __init__(self):
+                self.width = 110
+                self.refreshes = 0
+                self.text = []
+
+            def keypad(self, _enabled):
+                pass
+
+            def getmaxyx(self):
+                return (30, self.width)
+
+            def erase(self):
+                self.text = []
+
+            def addnstr(self, _y, _x, text, _limit, _attr):
+                self.text.append(text)
+
+            def refresh(self):
+                self.refreshes += 1
+                if self.refreshes == 1:
+                    self.width = 100
+
+            def getch(self):
+                return ord("q")
+
+        screen = ResizeScreen()
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(screen)
+        self.assertGreaterEqual(screen.refreshes, 2)
+        self.assertEqual(app.state.message, "Ready")
+        self.assertNotIn("Terminal resized", " ".join(screen.text))
+
     def test_resize_during_refresh_forces_redraw_before_apply(self):
         class RefreshAwareBackend(FakeBackend):
             def __init__(self):
@@ -2070,6 +2211,7 @@ class TuiDeviceActionTests(unittest.TestCase):
         app = CursesTui(FakeBackend())
         app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
         app.state.effect_running = True
+        app.state.compact_panel = "effects"
 
         class RecordingScreen:
             def __init__(self):
@@ -2095,8 +2237,8 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertIn("CYCLE", rendered)
         self.assertIn("6/16", rendered)
         self.assertIn("S Stop", rendered)
-        self.assertIn("MOTION", rendered)
-        self.assertIn("S 60% L 80%", rendered)
+        self.assertIn("SPEED 60%", rendered)
+        self.assertIn("LIGHT 80%", rendered)
         self.assertIn("EDITOR LOCKED", rendered)
         self.assertNotIn("[ ] speed", rendered)
 
@@ -2217,8 +2359,9 @@ class TuiDeviceActionTests(unittest.TestCase):
                         self.assertIn(function_key, rendered)
                 if width <= 79:
                     self.assertIn("ZONES · LIVE ▸ DRAFT", rendered)
-                    self.assertIn("EFFECT · STATIC", rendered)
-                    self.assertEqual(screen.row(12)[2], "└")
+                    self.assertIn("COLOR · RIGHT", rendered)
+                    self.assertIn("EFFECT STATIC 1/16", rendered)
+                    self.assertEqual(screen.row(11)[2], "└")
 
     def test_apply_refuses_to_write_when_draft_is_unchanged(self):
         backend = FakeBackend()

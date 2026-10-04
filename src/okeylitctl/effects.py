@@ -49,6 +49,9 @@ class EffectSpec:
     light: float = 1.0
     direction: int = 1
     seed: int = 0
+    cycle_from_deg: int = 0
+    cycle_to_deg: int = 360
+    cycle_saturation: float = 0.9
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, EffectKind):
@@ -63,6 +66,18 @@ class EffectSpec:
             raise ValueError("direction must be -1 or 1")
         if type(self.seed) is not int:
             raise TypeError("seed must be an integer")
+        if (
+            type(self.cycle_from_deg) is not int
+            or type(self.cycle_to_deg) is not int
+            or not 0 <= self.cycle_from_deg < self.cycle_to_deg <= 360
+        ):
+            raise ValueError("Cycle hues must satisfy 0 <= from < to <= 360")
+        if (
+            type(self.cycle_saturation) not in (float, int)
+            or not isfinite(self.cycle_saturation)
+            or not 0.0 <= self.cycle_saturation <= 1.0
+        ):
+            raise ValueError("Cycle saturation must be finite and within [0, 1]")
 
 
 def _scale_color(color: str, factor: float) -> str:
@@ -171,8 +186,15 @@ def frame_at(
         return _scale_layout(spec.base, factor)
     if spec.kind is EffectKind.CYCLE:
         phase = _period_phase(elapsed, 4.0 / spec.speed)
+        if spec.direction == -1:
+            phase = (-phase) % 1.0
         colors = {
-            zone: _hsv(phase + index / 12.0, 0.9, spec.light)
+            zone: _hsv(
+                (spec.cycle_from_deg + (spec.cycle_to_deg - spec.cycle_from_deg)
+                 * ((phase + index / 12.0) % 1.0)) / 360.0,
+                spec.cycle_saturation,
+                spec.light,
+            )
             for index, zone in enumerate(PHYSICAL_ZONE_ORDER)
         }
         return _layout_from_named(colors)

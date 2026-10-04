@@ -1,4 +1,5 @@
 import unittest
+from colorsys import rgb_to_hsv
 
 from okeylitctl.effects import EffectKind
 from okeylitctl.keyboard_layout import project_block_keyboard
@@ -59,7 +60,7 @@ class EditorCompositorTests(unittest.TestCase):
         composed = compose_editor(self.state, power_state="on", version="0.2.0")
         projection = project_block_keyboard(103, 19)
         tall = next(item for item in projection.keys if item.key.id == "Q")
-        single = next(item for item in projection.keys if item.key.id == "F1")
+        single = next(item for item in projection.keys if item.key.id == "LEFT")
 
         # The reference keyboard's projected origin is (4, 5).
         self.assertEqual(composed.lines[5 + tall.y][4 + tall.x], "▀")
@@ -144,6 +145,33 @@ class EditorCompositorTests(unittest.TestCase):
         self.assertIn("Effect frame active", visible)
         self.assertEqual(composed.roles[17][128], "swatch_live_right_AA0000")
 
+    def test_keyboard_uses_only_last_verified_effect_frame_while_running(self):
+        self.state.effect_running = True
+        self.state.effect_frame = ColorLayout.from_wire(
+            "AA0000,00BB00,0000CC,DDDD00"
+        )
+        from okeylitctl.tui_compositor import (
+            compose_adaptive_editor, compose_narrow_editor,
+        )
+        for composed in (
+            compose_editor(self.state, power_state="on", version="0.2.0"),
+            compose_adaptive_editor(self.state, width=110, height=30, power_state="on"),
+            compose_narrow_editor(self.state, width=78, height=24, power_state="on"),
+        ):
+            with self.subTest(size=(composed.width, composed.height)):
+                roles = {role for row in composed.roles for role in row if role.startswith("key_")}
+                self.assertTrue(any("AA0000" in role for role in roles))
+                self.assertFalse(any("7B2CFF" in role for role in roles))
+
+        self.state.effect_frame_uncertain = True
+        for composed in (
+            compose_editor(self.state, power_state="on"),
+            compose_adaptive_editor(self.state, width=110, height=30, power_state="on"),
+            compose_narrow_editor(self.state, width=78, height=24, power_state="on"),
+        ):
+            roles = {role for row in composed.roles for role in row if role.startswith("key_")}
+            self.assertFalse(any("AA0000" in role or "7B2CFF" in role for role in roles))
+
     def test_uncertain_effect_state_never_labels_stale_frame_as_live(self):
         self.state.effect_running = True
         self.state.effect_frame = ColorLayout.from_wire(
@@ -173,7 +201,7 @@ class EditorCompositorTests(unittest.TestCase):
         composed = compose_editor(self.state, power_state="on", version="0.2.0")
         visible = "\n".join(composed.lines)
 
-        self.assertIn("RESTORE PENDING", composed.lines[1])
+        self.assertIn("EFFECT UNKNOWN", composed.lines[1])
         self.assertNotIn("EFFECT ACTIVE", composed.lines[1])
         self.assertIn("UNKNOWN", visible)
         self.assertNotIn("#AA0000", visible)
@@ -240,6 +268,152 @@ class EditorCompositorTests(unittest.TestCase):
         self.assertIn("SAT", visible)
         self.assertIn("45%", visible)
         self.assertIn("100%", visible)
+
+    def test_cycle_spectrum_and_effect_strip_contain_multiple_hues(self):
+        from okeylitctl.tui_compositor import compose_adaptive_editor
+
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        for composed in (
+            compose_editor(self.state, power_state="on"),
+            compose_adaptive_editor(self.state, width=110, height=30, power_state="on"),
+        ):
+            with self.subTest(size=(composed.width, composed.height)):
+                hues = {
+                    role for row in composed.roles for role in row
+                    if role.startswith("spectrum_")
+                }
+                self.assertGreaterEqual(len(hues), 6)
+                self.assertNotIn("effect_preview_cycle", {
+                    role for row in composed.roles for role in row
+                })
+
+    def test_default_cycle_spectrum_matches_its_saturation_setting(self):
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        composed = compose_editor(self.state, power_state="on")
+        first = next(
+            role for row in composed.roles for role in row
+            if role.startswith("spectrum_0_")
+        )
+        color = first.rsplit("_", 1)[1]
+        rgb = tuple(int(color[offset:offset + 2], 16) / 255 for offset in (0, 2, 4))
+        self.assertAlmostEqual(rgb_to_hsv(*rgb)[1], 0.9, delta=0.01)
+
+    def test_cycle_spectrum_uses_a_fine_gradient_not_seven_large_blocks(self):
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        composed = compose_editor(self.state, power_state="on")
+        shades = {
+            role for row in composed.roles for role in row
+            if role.startswith("spectrum_")
+        }
+        self.assertGreaterEqual(len(shades), 20)
+
+    def test_cycle_hue_chip_uses_the_selected_hue_not_draft_zone_color(self):
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.state.cycle_from_deg = 60
+        self.state.cycle_to_deg = 180
+        composed = compose_editor(self.state, power_state="on")
+        self.assertIn("H  60°", "\n".join(composed.lines))
+        self.assertTrue(composed.roles[38][104].startswith("spectrum_0_"))
+        self.assertNotEqual(composed.roles[38][104], "swatch_center")
+
+    def test_cycle_preset_chips_show_generated_palette_not_base_colors(self):
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.state.cycle_from_deg = 60
+        self.state.cycle_to_deg = 180
+        self.state.cycle_saturation_percent = 40
+        composed = compose_editor(self.state, power_state="on")
+        before = [composed.roles[44][44 + index * 7] for index in range(5)]
+        self.assertTrue(all(role.startswith("spectrum_") for role in before))
+        self.assertFalse(any("7B2CFF" in role or "00CFFF" in role for role in before))
+        self.state.cycle_saturation_percent = 90
+        changed = compose_editor(self.state, power_state="on")
+        after = [changed.roles[44][44 + index * 7] for index in range(5)]
+        self.assertNotEqual(before, after)
+
+    def test_cycle_controls_update_values_and_spectrum_at_each_layout(self):
+        from okeylitctl.tui_compositor import compose_adaptive_editor, compose_narrow_editor
+
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        layouts = (
+            lambda: compose_editor(self.state, power_state="on"),
+            lambda: compose_adaptive_editor(
+                self.state, width=110, height=30, power_state="on"
+            ),
+            lambda: compose_adaptive_editor(
+                self.state, width=159, height=54, power_state="on"
+            ),
+            lambda: compose_narrow_editor(
+                self.state, width=78, height=24, power_state="on"
+            ),
+            lambda: compose_narrow_editor(
+                self.state, width=78, height=55, power_state="on"
+            ),
+        )
+        baseline = [
+            {role for row in render().roles for role in row if role.startswith("spectrum_")}
+            for render in layouts
+        ]
+        self.state.selected_channel = 0
+        self.state.adjust_cycle_control(1)
+        self.state.selected_channel = 1
+        self.state.adjust_cycle_control(-1)
+        self.state.selected_channel = 2
+        self.state.adjust_cycle_control(-1)
+        for render, before in zip(layouts, baseline):
+            composed = render()
+            with self.subTest(size=(composed.width, composed.height)):
+                visible = "\n".join(composed.lines)
+                for label in ("FROM", "TO", "SAT", "5°", "355°", "85%"):
+                    self.assertIn(label, visible)
+                after = {
+                    role for row in composed.roles for role in row
+                    if role.startswith("spectrum_")
+                }
+                self.assertNotEqual(after, before)
+
+    def test_custom_cycle_range_does_not_claim_rainbow_preset(self):
+        from okeylitctl.tui_compositor import compose_narrow_editor
+
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.state.adjust_cycle_control(1)
+        for composed in (
+            compose_editor(self.state, power_state="on"),
+            compose_narrow_editor(self.state, width=78, height=38, power_state="on"),
+        ):
+            with self.subTest(size=(composed.width, composed.height)):
+                visible = "\n".join(composed.lines)
+                self.assertIn("PRESET  ‹ Custom ›", visible)
+                self.assertNotIn("PRESET  ‹ Rainbow ›", visible)
+
+    def test_selected_cycle_preset_name_matches_its_range(self):
+        from okeylitctl.tui_compositor import compose_narrow_editor
+
+        self.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertEqual(self.state.select_next_cycle_preset(), "Warm")
+        for composed in (
+            compose_editor(self.state, power_state="on"),
+            compose_narrow_editor(self.state, width=78, height=38, power_state="on"),
+        ):
+            self.assertIn("PRESET  ‹ Warm ›", "\n".join(composed.lines))
+
+    def test_static_effect_strip_shows_four_zone_colors_not_flat_teal(self):
+        from okeylitctl.tui_compositor import compose_adaptive_editor
+
+        reference = compose_editor(self.state, power_state="on")
+        self.state.compact_panel = "effects"
+        for composed in (
+            reference,
+            compose_adaptive_editor(self.state, width=110, height=30, power_state="on"),
+        ):
+            with self.subTest(size=(composed.width, composed.height)):
+                colors = {
+                    role for row in composed.roles for role in row
+                    if role.startswith("effect_color_")
+                }
+                self.assertEqual(len(colors), 4)
+                self.assertNotIn("effect_preview_static", {
+                    role for row in composed.roles for role in row
+                })
 
     def test_exact_hex_modal_dims_editor_and_explains_incomplete_input(self):
         self.state.selected_zone = Zone.WASD

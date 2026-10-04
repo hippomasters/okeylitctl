@@ -1,4 +1,5 @@
 import unittest
+from colorsys import rgb_to_hsv
 
 from okeylitctl.effects import EffectEvent, EffectKind, EffectSpec, frame_at
 from okeylitctl.models import ColorLayout, Zone
@@ -54,6 +55,67 @@ class EffectFrameTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     EffectSpec(kind=EffectKind.BREATHE, base=BASE, **kwargs)
+
+    def test_cycle_hue_range_and_saturation_control_actual_frames(self):
+        default = EffectSpec(kind=EffectKind.CYCLE, base=BASE, speed=0.6, light=0.8)
+        expected_default = "14CC4D,37CC14,CCA914,93CC14"
+        self.assertEqual(frame_at(default, 0.9).to_wire(), expected_default)
+
+        for controls in (
+            {"cycle_from_deg": 60},
+            {"cycle_to_deg": 180},
+            {"cycle_saturation": 0.4},
+        ):
+            with self.subTest(controls=controls):
+                changed = EffectSpec(
+                    kind=EffectKind.CYCLE, base=BASE,
+                    speed=0.6, light=0.8, **controls,
+                )
+                self.assertNotEqual(frame_at(changed, 0.9), frame_at(default, 0.9))
+
+    def test_cycle_controls_reject_invalid_ranges_and_nonfinite_saturation(self):
+        for controls in (
+            {"cycle_from_deg": -5},
+            {"cycle_from_deg": 360},
+            {"cycle_to_deg": 0},
+            {"cycle_to_deg": 365},
+            {"cycle_from_deg": 180, "cycle_to_deg": 180},
+            {"cycle_from_deg": True},
+            {"cycle_saturation": -0.01},
+            {"cycle_saturation": 1.01},
+            {"cycle_saturation": float("nan")},
+            {"cycle_saturation": float("inf")},
+            {"cycle_saturation": True},
+        ):
+            with self.subTest(controls=controls):
+                with self.assertRaises(ValueError):
+                    EffectSpec(kind=EffectKind.CYCLE, base=BASE, **controls)
+
+    def test_cycle_zone_hues_stay_within_selected_from_to_range(self):
+        spec = EffectSpec(
+            kind=EffectKind.CYCLE, base=BASE, speed=1.0, light=1.0,
+            cycle_from_deg=60, cycle_to_deg=180, cycle_saturation=1.0,
+        )
+        for elapsed in (0.0, 1.2, 3.6):
+            with self.subTest(elapsed=elapsed):
+                frame = frame_at(spec, elapsed)
+                for color in frame.to_wire().split(","):
+                    rgb = tuple(int(color[offset:offset + 2], 16) / 255 for offset in (0, 2, 4))
+                    hue = rgb_to_hsv(*rgb)[0] * 360
+                    self.assertGreaterEqual(hue, 59.0)
+                    self.assertLessEqual(hue, 181.0)
+
+    def test_cycle_direction_reverses_hue_progression(self):
+        forward = EffectSpec(
+            kind=EffectKind.CYCLE, base=BASE, speed=0.6,
+            cycle_from_deg=60, cycle_to_deg=180, direction=1,
+        )
+        reverse = EffectSpec(
+            kind=EffectKind.CYCLE, base=BASE, speed=0.6,
+            cycle_from_deg=60, cycle_to_deg=180, direction=-1,
+        )
+        self.assertNotEqual(frame_at(forward, 0.9), frame_at(reverse, 0.9))
+        self.assertEqual(frame_at(forward, 0.0), frame_at(reverse, 0.0))
 
     def test_every_time_driven_effect_is_complete_deterministic_and_animated(self):
         animated = tuple(

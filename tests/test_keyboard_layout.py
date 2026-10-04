@@ -74,6 +74,22 @@ class KeyboardGeometryTests(unittest.TestCase):
         self.assertGreater(by_id["KP_ADD"].height, by_id["KP7"].height)
         self.assertGreater(by_id["KP_ENTER"].height, by_id["KP3"].height)
 
+    def test_wide_keyboard_projection_uses_available_panel_width(self):
+        for width in (68, 103, 151):
+            with self.subTest(width=width):
+                projection = project_block_keyboard(width, 19)
+                self.assertLessEqual(min(key.x for key in projection.keys), 3)
+                self.assertGreaterEqual(max(key.right for key in projection.keys), width - 4)
+                self.assertTrue(all(key.right <= width for key in projection.keys))
+
+    def test_keyboard_rows_do_not_have_double_blank_gaps(self):
+        projection = project_block_keyboard(103, 19)
+        occupied = {
+            row for key in projection.keys for row in range(key.y, key.bottom)
+        }
+        for row in range(max(occupied)):
+            self.assertTrue(row in occupied or row + 1 in occupied)
+
     def test_block_projection_rectangles_are_in_bounds_and_do_not_overlap(self):
         projection = project_block_keyboard(103, 19)
         for item in projection.keys:
