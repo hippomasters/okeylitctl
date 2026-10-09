@@ -93,11 +93,18 @@ elif name == "cc":
         with self.isolated() as (root, repo, prefix, run):
             dest = prefix / "usr/src/omen-rgb-0.1.0"
             (dest / "module").mkdir(parents=True)
+            # Model root-installed DKMS directories, regardless of runner umask.
+            dest.chmod(0o755)
+            (dest / "module").chmod(0o755)
             for name in ("Makefile", "dkms.conf", "module/omen_rgb.c", "module/omen_rgb_protocol.h"):
-                (dest / name).write_bytes(subprocess.check_output(
+                snapshot = dest / name
+                snapshot.write_bytes(subprocess.check_output(
                     ["git", "show", f"24296dc:{name}"], cwd=ROOT))
+                snapshot.chmod(0o644)
             self.assertNotEqual((dest / "Makefile").read_bytes(), (repo / "Makefile").read_bytes())
-            (prefix / "etc/modules-load.d/omen-rgb.conf").write_text("omen_rgb\n")
+            load_entry = prefix / "etc/modules-load.d/omen-rgb.conf"
+            load_entry.write_text("omen_rgb\n")
+            load_entry.chmod(0o644)
             legacy_src = root / "legacy-src"
             names = subprocess.check_output(
                 ["git", "ls-tree", "-r", "--name-only", "24296dc", "src"], cwd=ROOT,
@@ -220,6 +227,7 @@ elif name == "cc":
             existing_data.write_text("keep existing profiles")
             broker_dir = prefix / "usr/local/libexec"
             broker_dir.mkdir(parents=True)
+            broker_dir.chmod(0o755)
             existing_file = broker_dir / "other-service"
             existing_file.write_text("keep existing service")
 

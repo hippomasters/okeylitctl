@@ -54,6 +54,7 @@ def _decode_profiles(payload): raise ProfileError("invalid payload")
 def export_legacy_profiles(): return b'{"schema":1,"profiles":{}}\\n'
 def import_profiles(payload): pass
 ''')
+            archive.chmod(0o755)
             hostile = root / "hostile/okeylitctl"
             hostile.mkdir(parents=True)
             marker = root / "executed"
