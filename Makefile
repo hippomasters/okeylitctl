@@ -4,10 +4,16 @@ omen_rgb-y := module/omen_rgb.o
 KDIR ?= /lib/modules/$(if $(KERNELRELEASE),$(KERNELRELEASE),$(shell uname -r))/build
 PWD := $(shell pwd)
 
-.PHONY: all clean test
+.PHONY: all clean test broker
 
 all:
 	$(MAKE) -C "$(KDIR)" M="$(PWD)" modules
+
+broker: build/okeylitctl-broker
+
+build/okeylitctl-broker: broker/main.c
+	mkdir -p build
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror $< -o $@
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi

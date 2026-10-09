@@ -1,0 +1,24 @@
+[Unit]
+Description=OKeyLitCtl privileged lighting broker
+Requires=okeylitctl-broker.socket
+After=okeylitctl-broker.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/libexec/okeylitctl-broker
+Sockets=okeylitctl-broker.socket
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Broker writes /sys/bus/platform/devices/omen-rgb; keep sysfs writable.
