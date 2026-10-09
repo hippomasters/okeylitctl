@@ -147,6 +147,7 @@ def import_profiles(payload): pass
                 store.list_names()
             self.assertFalse((real / "private" / "profiles.json").exists())
 
+    @unittest.skipUnless(os.geteuid() == 0, "root-only importer rejection")
     def test_migration_runner_does_not_fall_back_to_checkout_source(self):
         repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -208,6 +209,7 @@ def import_profiles(payload): pass
         self.assertIn(b"-I", result.stderr)
         self.assertNotIn(b"unsupported schema", result.stderr)
 
+    @unittest.skipUnless(os.geteuid() == 0, "root-only importer rejection")
     def test_migration_cli_rejects_root_import_without_loading_checkout(self):
         repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
