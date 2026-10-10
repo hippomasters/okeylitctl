@@ -8,6 +8,11 @@ from okeylitctl.keyboard_layout import key_zone_by_id
 from okeylitctl.profiles import ProfileError
 from okeylitctl.sysfs import BackendIOError
 from okeylitctl.effects import EffectKind
+from okeylitctl.ipc import ConflictError
+from okeylitctl.tui_compositor import (
+    compose_editor, compose_adaptive_editor, compose_narrow_editor,
+    compose_profiles, compose_responsive_profiles, compose_exact_hex_modal,
+)
 from okeylitctl.tui import (
     _CHARACTER_KEY_IDS,
     _SPECIAL_KEY_IDS,
@@ -494,7 +499,753 @@ class FakeProfileStore:
         del self.layouts[name]
 
 
+class CasEffectBackend(FakeBackend):
+    """A broker-like fake: even an ABA write advances the CAS token."""
+
+    def __init__(self):
+        super().__init__()
+        self.revision = 0
+        self.cas_writes = []
+
+    def snapshot(self):
+        return {**self.status_value, "token": str(self.revision)}
+
+    def compare_and_write(self, token, power, expected, replacement):
+        if (token != str(self.revision) or power != self.status_value["state"]
+                or expected != ",".join(self.status_value["colors"])):
+            raise ConflictError("definitive CAS conflict")
+        self.revision += 1
+        self.status_value["colors"] = replacement.split(",")
+        self.cas_writes.append(replacement)
+        return str(self.revision)
+
+
 class TuiDeviceActionTests(unittest.TestCase):
+    def test_interrupt_after_static_mutation_marks_live_unknown_before_reraising(self):
+        class Interrupted(FakeBackend):
+            def write_colors(self, value):
+                self.writes.append(value)
+                raise KeyboardInterrupt
+
+            def restore(self):
+                self.restores += 1
+                raise KeyboardInterrupt
+
+        for action in ("apply", "restore"):
+            with self.subTest(action=action):
+                backend = Interrupted()
+                app = CursesTui(backend)
+                app.state.set_selected_color("ABCDEF")
+                with self.assertRaises(KeyboardInterrupt):
+                    getattr(app, f"_{action}")()
+                self.assertTrue(app.state.live_unknown)
+                self.assertEqual(app.state.draft.right, "ABCDEF")
+                self.assertEqual(app.state.original.right, "AAAAAA")
+                app._apply()
+                app._restore()
+                self.assertLessEqual(len(backend.writes), 1)
+                self.assertLessEqual(backend.restores, 1)
+
+    def test_interrupt_during_static_restore_readback_retains_unknown_lock(self):
+        class ReadbackInterrupt(FakeBackend):
+            def status(self):
+                if self.restores:
+                    raise KeyboardInterrupt
+                return self.status_value
+
+        backend = ReadbackInterrupt()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        with self.assertRaises(KeyboardInterrupt):
+            app._restore()
+        self.assertTrue(app.state.live_unknown)
+        app._restore()
+        self.assertEqual(backend.restores, 1)
+
+    def test_definite_apply_conflict_does_not_enter_unknown_write_lock(self):
+        class Refused(FakeBackend):
+            def write_colors(self, value):
+                raise ConflictError("no write attempted")
+
+        backend = Refused()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        app._apply()
+        self.assertFalse(app.state.live_unknown)
+        self.assertTrue(app.state.live_last_observed)
+        self.assertIn("definite conflict", app.state.message)
+        self.assertEqual(backend.writes, [])
+        self.assertEqual(app.state.draft.right, "ABCDEF")
+
+    def test_restore_power_off_after_write_keeps_draft_and_unknown_lock(self):
+        class PowerOffOnReadback(FakeBackend):
+            def restore(self):
+                super().restore()
+                self.status_value["state"] = "off"
+
+            def status(self):
+                return {key: list(value) if isinstance(value, list) else value
+                        for key, value in self.status_value.items()}
+
+        backend = PowerOffOnReadback()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        draft, original, current = app.state.draft, app.state.original, app.state.current
+
+        app._restore()
+
+        self.assertEqual(backend.restores, 1)
+        self.assertEqual(app.power_state, "off")
+        self.assertTrue(app.state.live_unknown)
+        self.assertEqual((app.state.draft, app.state.original, app.state.current),
+                         (draft, original, current))
+        self.assertTrue(app.state.dirty)
+        for composed in (
+            compose_editor(app.state, power_state=app.power_state),
+            compose_adaptive_editor(app.state, width=110, height=30,
+                                    power_state=app.power_state),
+            compose_narrow_editor(app.state, width=78, height=24,
+                                  power_state=app.power_state),
+        ):
+            visible = "\n".join(composed.lines)
+            self.assertIn("DEVICE OFF", visible)
+            self.assertNotIn("IN SYNC", visible)
+            self.assertNotIn("DEVICE ON", visible)
+            self.assertNotIn("LIVE  #111111", visible)
+        app._restore()
+        app._apply()
+        self.assertEqual(backend.restores, 1)
+        self.assertEqual(backend.writes, [])
+
+    def test_static_restore_does_not_bypass_running_effect_lock(self):
+        backend = FakeBackend(same_as_original=True)
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        draft = app.state.draft
+        app.state.effect_running = True
+
+        app._restore()
+
+        self.assertEqual(backend.restores, 0)
+        self.assertEqual(backend.writes, [])
+        self.assertEqual(app.state.draft, draft)
+        self.assertTrue(app.state.effect_running)
+        self.assertIn("Stop", app.state.message)
+
+    def test_restore_invalid_prewrite_status_fails_closed_without_write(self):
+        for invalid in ("sleep", None):
+            with self.subTest(invalid=invalid):
+                backend = FakeBackend(same_as_original=True)
+                app = CursesTui(backend)
+                app.state.set_selected_color("ABCDEF")
+                draft, original = app.state.draft, app.state.original
+                if invalid is None:
+                    backend.status_value.pop("state")
+                else:
+                    backend.status_value["state"] = invalid
+
+                app._restore()
+
+                self.assertEqual(backend.restores, 0)
+                self.assertEqual(backend.writes, [])
+                self.assertEqual((app.state.draft, app.state.original), (draft, original))
+                self.assertTrue(app.state.live_unknown)
+                self.assertEqual(app.power_state, "unknown")
+                visible = "\n".join(compose_editor(app.state, power_state=app.power_state).lines)
+                self.assertIn("LIVE UNKNOWN", visible)
+                self.assertNotIn("DEVICE ON", visible)
+                self.assertNotIn("IN SYNC", visible)
+
+    def test_restore_invalid_readback_status_keeps_unknown_and_never_retries(self):
+        for invalid in ("sleep", None):
+            with self.subTest(invalid=invalid):
+                class InvalidReadback(FakeBackend):
+                    def restore(self):
+                        super().restore()
+                        if invalid is None:
+                            self.status_value.pop("state")
+                        else:
+                            self.status_value["state"] = invalid
+
+                backend = InvalidReadback()
+                app = CursesTui(backend)
+                app.state.set_selected_color("ABCDEF")
+                draft, original = app.state.draft, app.state.original
+
+                app._restore()
+
+                self.assertEqual(backend.restores, 1)
+                self.assertEqual((app.state.draft, app.state.original), (draft, original))
+                self.assertTrue(app.state.live_unknown)
+                self.assertEqual(app.power_state, "unknown")
+                app._restore()
+                self.assertEqual(backend.restores, 1)
+                visible = "\n".join(compose_editor(app.state, power_state=app.power_state).lines)
+                self.assertIn("LIVE UNKNOWN", visible)
+                self.assertNotIn("DEVICE ON", visible)
+                self.assertNotIn("IN SYNC", visible)
+
+    def test_restore_readback_failure_after_write_locks_as_ambiguous(self):
+        class ReadbackFails(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail = False
+
+            def restore(self):
+                super().restore()
+                self.fail = True
+
+            def status(self):
+                if self.fail:
+                    raise BackendIOError("readback timed out")
+                return self.status_value
+
+        backend = ReadbackFails()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        original, draft = app.state.original, app.state.draft
+        app._restore()
+        self.assertTrue(app.state.live_unknown)
+        self.assertEqual((app.state.original, app.state.draft), (original, draft))
+        app._restore()
+        self.assertEqual(backend.restores, 1)
+
+    def test_unknown_verification_detects_mutating_status_snapshot(self):
+        class MutatingRead(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.reads = 0
+
+            def status(self):
+                self.reads += 1
+                if self.reads == 3:
+                    self.status_value["colors"][0] = "999999"
+                return self.status_value
+
+            def write_colors(self, value):
+                raise BackendIOError("unacknowledged")
+
+        backend = MutatingRead()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        app._apply()
+        app._refresh()
+        self.assertTrue(app.state.live_unknown)
+        self.assertIn("observation changed", app.state.message)
+
+    def test_unknown_and_power_off_are_honest_in_profiles_and_hex_modal(self):
+        app = CursesTui(FakeBackend(same_as_original=True))
+        for unknown, power in ((True, "on"), (False, "off")):
+            with self.subTest(unknown=unknown, power=power):
+                app.state.live_unknown = unknown
+                screens = (
+                    compose_profiles(app.state, names=(), selected=0, preview_layout=None,
+                                     power_state=power),
+                    compose_responsive_profiles(app.state, width=110, height=30,
+                                                names=(), selected=0, preview_layout=None,
+                                                power_state=power),
+                    compose_exact_hex_modal(app.state, power_state=power,
+                                            input_text="ABCDEF", error=""),
+                    compose_exact_hex_modal(app.state, width=110, height=30,
+                                            power_state=power, input_text="ABCDEF", error=""),
+                )
+                for screen in screens:
+                    visible = "\n".join(screen.lines)
+                    self.assertIn("LIVE UNKNOWN" if unknown else "POWER OFF", visible)
+                    self.assertNotIn("IN SYNC", visible)
+                    self.assertFalse(any("modal_swatch_live_" in role for row in screen.roles
+                                         for role in row))
+                self.assertNotIn("#111111", "\n".join(screens[-1].lines))
+
+    def test_synchronized_power_off_is_not_in_sync_in_any_editor(self):
+        backend = FakeBackend(same_as_original=True)
+        backend.status_value["state"] = "off"
+        app = CursesTui(backend)
+        for screen in (
+            compose_editor(app.state, power_state="off"),
+            compose_adaptive_editor(app.state, width=110, height=30, power_state="off"),
+            compose_narrow_editor(app.state, width=78, height=24, power_state="off"),
+        ):
+            visible = "\n".join(screen.lines)
+            self.assertIn("POWER OFF", visible)
+            self.assertNotIn("IN SYNC", visible)
+            self.assertNotIn("LIVE  #111111", visible)
+            self.assertFalse(any("swatch_live_" in role or role.startswith("key_right_")
+                                 for row in screen.roles for role in row))
+
+    def test_ambiguous_apply_locks_all_writes_until_explicit_read_only_refresh(self):
+        class AcceptedWithoutAck(FakeBackend):
+            def write_colors(self, value):
+                super().write_colors(value)
+                self.status_value["colors"] = value.split(",")
+                raise BackendIOError("ack lost")
+
+        backend = AcceptedWithoutAck()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.set_selected_color("ABCDEF")
+        draft, original, stale = app.state.draft, app.state.original, app.state.current
+        app._apply()
+        self.assertEqual(backend.writes, [draft.to_wire()])
+        self.assertEqual((app.state.draft, app.state.original, app.state.current),
+                         (draft, original, stale))
+        self.assertTrue(app.state.live_unknown)
+        for composed in (
+            compose_editor(app.state, power_state="on"),
+            compose_adaptive_editor(app.state, width=110, height=30, power_state="on"),
+            compose_narrow_editor(app.state, width=78, height=24, power_state="on"),
+        ):
+            visible = "\n".join(composed.lines)
+            self.assertIn("LIVE UNKNOWN", visible)
+            self.assertIn("R Verify", visible)
+            self.assertNotIn("IN SYNC", visible)
+            self.assertNotIn("#111111", visible)
+            self.assertFalse(any("swatch_live_" in role for row in composed.roles for role in row))
+        app._apply()
+        app._restore()
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertFalse(app._start_effect(now=0.0))
+        self.assertEqual(backend.writes, [draft.to_wire()])
+        self.assertEqual(backend.restores, 0)
+        self.assertEqual(app.state.draft, draft)
+        app._refresh()
+        self.assertFalse(app.state.live_unknown)
+        self.assertEqual(app.state.current, draft)
+        self.assertEqual(app.state.draft, draft)
+        self.assertEqual(app.state.original, original)
+        self.assertEqual(len(backend.writes), 1)
+
+    def test_ambiguous_restore_retains_draft_and_original_through_failed_verification(self):
+        class AcceptedRestore(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail_reads = False
+
+            def restore(self):
+                super().restore()
+                raise BackendIOError("ack lost")
+
+            def status(self):
+                if self.fail_reads:
+                    raise BackendIOError("read unavailable")
+                return {key: list(value) if isinstance(value, list) else value
+                        for key, value in self.status_value.items()}
+
+        backend = AcceptedRestore()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        draft, original, stale = app.state.draft, app.state.original, app.state.current
+        app._restore()
+        self.assertTrue(app.state.live_unknown)
+        self.assertEqual((app.state.draft, app.state.original, app.state.current),
+                         (draft, original, stale))
+        backend.fail_reads = True
+        app._refresh()
+        self.assertTrue(app.state.live_unknown)
+        app._restore()
+        app._apply()
+        self.assertEqual(backend.restores, 1)
+        self.assertEqual(backend.writes, [])
+        backend.fail_reads = False
+        backend.status_value["state"] = "off"
+        app._refresh()
+        self.assertTrue(app.state.live_unknown)
+        self.assertEqual(app.power_state, "off")
+        self.assertEqual(app.state.draft, draft)
+        backend.status_value["state"] = "on"
+        app._refresh()
+        self.assertFalse(app.state.live_unknown)
+        self.assertEqual(app.state.current, original)
+        self.assertEqual(app.state.draft, draft)
+        self.assertEqual(backend.restores, 1)
+
+    def test_confirmed_power_off_never_looks_illuminated_without_effect(self):
+        backend = FakeBackend(same_as_original=True)
+        backend.status_value["state"] = "off"
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        screens = (
+            compose_editor(app.state, power_state="off"),
+            compose_adaptive_editor(app.state, width=110, height=30, power_state="off"),
+            compose_narrow_editor(app.state, width=78, height=24, power_state="off"),
+        )
+        for screen in screens:
+            visible = "\n".join(screen.lines)
+            self.assertIn("POWER OFF", visible)
+            self.assertNotIn("IN SYNC", visible)
+            self.assertNotIn("LIVE  #111111", visible)
+            self.assertNotIn("#111111", visible)
+            self.assertFalse(any("swatch_live_" in role or role.startswith("key_right_")
+                                 for row in screen.roles for role in row))
+            self.assertIn("#ABCDEF", visible)  # Clearly local DRAFT only.
+
+    def test_cas_effect_power_off_never_offers_restore_of_lost_token(self):
+        for action in ("tick", "stop"):
+            with self.subTest(action=action):
+                backend = CasEffectBackend()
+                app = CursesTui(backend, profile_store=FakeProfileStore())
+                app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+                app._start_effect(now=0.0)
+                self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+                writes = list(backend.cas_writes)
+                backend.status_value["state"] = "off"
+                if action == "tick":
+                    self.assertFalse(app._tick_effect(
+                        now=app.effect_runtime.next_due, authorized=True
+                    ))
+                else:
+                    self.assertFalse(app._stop_effect())
+                self.assertEqual(backend.cas_writes, writes)
+                self.assertEqual(app.power_state, "off")
+                self.assertTrue(app.state.effect_running)
+                self.assertFalse(app.state.effect_restore_pending)
+                for composed in (
+                    compose_editor(app.state, power_state="off"),
+                    compose_adaptive_editor(app.state, width=110, height=30, power_state="off"),
+                    compose_narrow_editor(app.state, width=78, height=24, power_state="off"),
+                ):
+                    visible = "\n".join(composed.lines)
+                    self.assertNotIn("RESTORE PENDING", visible)
+                    self.assertNotIn("S Restore", visible)
+                    self.assertIn("POWER OFF", visible)
+                backend.status_value["state"] = "on"
+                backend.compare_and_write(str(backend.revision), "on", writes[-1],
+                                          "AA0000,00BB00,0000CC,DDDD00")
+                observed = list(backend.cas_writes)
+                self.assertTrue(app._stop_effect())
+                self.assertEqual(backend.cas_writes, observed)
+                self.assertIsNone(app.effect_runtime)
+                self.assertEqual(app.state.current.to_wire(), observed[-1])
+
+    def test_external_cas_write_reconciles_observed_live_and_unlocks_without_restore(self):
+        for action in ("tick", "stop"):
+            for aba in (False, True):
+                with self.subTest(action=action, aba=aba):
+                    backend = CasEffectBackend()
+                    app = CursesTui(backend, profile_store=FakeProfileStore())
+                    app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+                    app._start_effect(now=0.0)
+                    self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+                    frame = backend.cas_writes[-1]
+                    base = app.state.draft.to_wire()
+                    self.assertNotEqual(frame, base)
+                    external = frame if aba else "AA0000,00BB00,0000CC,DDDD00"
+                    backend.compare_and_write(str(backend.revision), "on", frame, external)
+                    writes = list(backend.cas_writes)
+
+                    if action == "tick":
+                        self.assertFalse(app._tick_effect(
+                            now=app.effect_runtime.next_due, authorized=True
+                        ))
+                    else:
+                        self.assertTrue(app._stop_effect())
+
+                    self.assertEqual(backend.cas_writes, writes)
+                    self.assertIsNone(app.effect_runtime)
+                    self.assertFalse(app.state.effect_running)
+                    self.assertFalse(app.state.effect_restore_pending)
+                    self.assertFalse(app.state.effect_frame_uncertain)
+                    self.assertIsNone(app.state.effect_frame)
+                    self.assertEqual(app.state.current.to_wire(), external)
+                    self.assertEqual(app.state.draft.to_wire(), base)
+                    self.assertTrue(app.state.dirty)
+                    self.assertIn("ownership", app.state.message.lower())
+                    for composed in (
+                        compose_editor(app.state, power_state=app.power_state),
+                        compose_adaptive_editor(app.state, width=110, height=30,
+                                                power_state=app.power_state),
+                        compose_narrow_editor(app.state, width=78, height=24,
+                                              power_state=app.power_state),
+                    ):
+                        visible = "\n".join(composed.lines)
+                        self.assertNotIn("IN SYNC", visible)
+                        self.assertNotIn("RESTORE PENDING", visible)
+                        self.assertNotIn("S Restore", visible)
+                        self.assertNotIn("EFFECT ACTIVE", visible)
+                        self.assertIn("UNSAVED DRAFT", visible)
+                        self.assertIn(f"#{external.split(',')[0]}", visible)
+                    app._stop_effect()
+                    self.assertEqual(backend.cas_writes, writes)
+
+    def test_lost_ownership_snapshot_race_stays_unknown_until_explicit_verification(self):
+        class RacingBackend(CasEffectBackend):
+            def __init__(self):
+                super().__init__()
+                self.race_on_reconcile = False
+                self.reads_since_armed = 0
+
+            def snapshot(self):
+                snapshot = super().snapshot()
+                if self.race_on_reconcile:
+                    self.reads_since_armed += 1
+                    if self.reads_since_armed == 2:
+                        self.race_on_reconcile = False
+                        self.compare_and_write(str(self.revision), "on",
+                                               ",".join(self.status_value["colors"]),
+                                               "BB0000,00CC00,0000DD,EEEE00")
+                return snapshot
+
+        backend = RacingBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        frame = backend.cas_writes[-1]
+        backend.compare_and_write(str(backend.revision), "on", frame,
+                                  "AA0000,00BB00,0000CC,DDDD00")
+        backend.race_on_reconcile = True
+        writes = list(backend.cas_writes)
+        self.assertFalse(app._tick_effect(now=app.effect_runtime.next_due, authorized=True))
+        self.assertEqual(backend.cas_writes, writes + ["BB0000,00CC00,0000DD,EEEE00"])
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertTrue(app.state.effect_frame_uncertain)
+        self.assertFalse(app.state.effect_restore_pending)
+        for composed in (
+            compose_editor(app.state, power_state="on"),
+            compose_adaptive_editor(app.state, width=110, height=30, power_state="on"),
+            compose_narrow_editor(app.state, width=78, height=24, power_state="on"),
+        ):
+            visible = "\n".join(composed.lines)
+            self.assertIn("EFFECT UNKNOWN", visible)
+            self.assertIn("S Verify", visible)
+            self.assertNotIn("S Restore", visible)
+            self.assertNotIn("#AA0000", visible)
+        self.assertTrue(app._stop_effect())
+        self.assertEqual(backend.cas_writes[-1], "BB0000,00CC00,0000DD,EEEE00")
+        self.assertIsNone(app.effect_runtime)
+        self.assertEqual(app.state.current.to_wire(), backend.cas_writes[-1])
+
+    def test_lost_ownership_snapshot_error_retains_lock_until_explicit_verify(self):
+        class TransientBackend(CasEffectBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail_next_snapshot = False
+                self.reads_since_armed = 0
+
+            def snapshot(self):
+                if self.fail_next_snapshot:
+                    self.reads_since_armed += 1
+                    if self.reads_since_armed == 2:
+                        self.fail_next_snapshot = False
+                        raise BackendIOError("transient snapshot failure")
+                return super().snapshot()
+
+        backend = TransientBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        frame = backend.cas_writes[-1]
+        backend.compare_and_write(str(backend.revision), "on", frame,
+                                  "AA0000,00BB00,0000CC,DDDD00")
+        backend.fail_next_snapshot = True
+        self.assertFalse(app._stop_effect())
+        self.assertTrue(app.state.effect_running)
+        self.assertTrue(app.state.effect_frame_uncertain)
+        self.assertFalse(app.state.effect_restore_pending)
+        self.assertIn("S Verify", "\n".join(compose_editor(app.state, power_state="on").lines))
+        self.assertTrue(app._stop_effect())
+        self.assertIsNone(app.effect_runtime)
+        self.assertEqual(len(backend.cas_writes), 2)
+
+    def test_loss_reconciliation_labels_even_matching_draft_as_last_observed(self):
+        class PostSnapshotWrite(CasEffectBackend):
+            def __init__(self):
+                super().__init__()
+                self.after_second_snapshot = False
+                self.reconcile_reads = 0
+
+            def snapshot(self):
+                observed = super().snapshot()
+                if self.after_second_snapshot:
+                    self.reconcile_reads += 1
+                    if self.reconcile_reads == 3:
+                        self.compare_and_write(str(self.revision), "on",
+                                               ",".join(self.status_value["colors"]),
+                                               "BB0000,00CC00,0000DD,EEEE00")
+                return observed
+
+        backend = PostSnapshotWrite()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        backend.compare_and_write(str(backend.revision), "on", backend.cas_writes[-1], base)
+        backend.after_second_snapshot = True
+        self.assertTrue(app._stop_effect())
+        self.assertFalse(app.state.dirty)
+        self.assertEqual(app.state.current.to_wire(), base)
+        self.assertEqual(backend.cas_writes[-1], "BB0000,00CC00,0000DD,EEEE00")
+        for composed in (
+            compose_editor(app.state, power_state="on"),
+            compose_adaptive_editor(app.state, width=110, height=30, power_state="on"),
+            compose_narrow_editor(app.state, width=78, height=24, power_state="on"),
+        ):
+            visible = "\n".join(composed.lines)
+            self.assertIn("LAST OBSERVED", visible)
+            self.assertNotIn("IN SYNC", visible)
+            self.assertNotIn("S Restore", visible)
+            self.assertIn("SEEN" if composed.width != 78 else "LAST OBSERVED #", visible)
+            self.assertNotIn("LIVE  #111111", visible)
+
+    def test_lost_ownership_cleanup_backs_off_without_retrying_base(self):
+        class FailingReconciliationBackend(CasEffectBackend):
+            def __init__(self):
+                super().__init__()
+                self.fail_reconciliation = False
+                self.snapshot_attempts = 0
+
+            def snapshot(self):
+                if self.fail_reconciliation:
+                    self.snapshot_attempts += 1
+                    raise BackendIOError("reconciliation temporarily unavailable")
+                return super().snapshot()
+
+        backend = FailingReconciliationBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        frame = backend.cas_writes[-1]
+        backend.compare_and_write(str(backend.revision), "on", frame,
+                                  "AA0000,00BB00,0000CC,DDDD00")
+        # Detect the definite conflict, but fail only the subsequent observation.
+        original_snapshot = backend.snapshot
+        def detect_then_fail():
+            observed = original_snapshot()
+            backend.snapshot = original_snapshot
+            backend.fail_reconciliation = True
+            return observed
+        backend.snapshot = detect_then_fail
+        self.assertFalse(app._tick_effect(now=app.effect_runtime.next_due, authorized=True))
+        self.assertTrue(app.effect_runtime.ownership_lost)
+        backend.snapshot_attempts = 0
+        writes = list(backend.cas_writes)
+        with mock.patch("okeylitctl.tui.sleep", side_effect=(None, None, KeyboardInterrupt)) as sleeper:
+            self.assertFalse(app._cleanup_after_terminal_failure())
+        self.assertEqual([call.args[0] for call in sleeper.call_args_list], [0.05, 0.1, 0.2])
+        self.assertEqual(backend.snapshot_attempts, 3)
+        self.assertEqual(backend.cas_writes, writes)
+        self.assertTrue(app.state.effect_running)
+        self.assertFalse(app.state.effect_restore_pending)
+        self.assertTrue(app._terminal_cleanup_forced)
+
+    def test_deliberate_apply_after_loss_clears_last_observed_label(self):
+        backend = CasEffectBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        backend.compare_and_write(str(backend.revision), "on", backend.cas_writes[-1],
+                                  "AA0000,00BB00,0000CC,DDDD00")
+        self.assertTrue(app._stop_effect())
+        self.assertTrue(app.state.live_last_observed)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.STATIC)
+        app._apply()
+        self.assertFalse(app.state.live_last_observed)
+        self.assertIn("IN SYNC", compose_editor(app.state, power_state="on").lines[1])
+
+    def test_refresh_after_lost_ownership_keeps_provenance_and_local_draft(self):
+        backend = CasEffectBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app.state.set_selected_color("ABCDEF")
+        draft = app.state.draft
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        backend.compare_and_write(str(backend.revision), "on", backend.cas_writes[-1],
+                                  draft.to_wire())
+        self.assertTrue(app._stop_effect())
+        self.assertFalse(app.state.dirty)
+        self.assertTrue(app.state.live_last_observed)
+
+        app._refresh()
+        self.assertIs(app.state.draft, draft)
+        self.assertTrue(app.state.live_last_observed)
+        self.assertFalse(app.state.live_unknown)
+        visible = "\n".join(compose_editor(app.state, power_state="on").lines)
+        self.assertIn("LAST OBSERVED", visible)
+        self.assertNotIn("IN SYNC", visible)
+        self.assertEqual(backend.cas_writes.count(draft.to_wire()), 1)
+
+    def test_refresh_after_lost_ownership_rejects_racing_token_and_power_off(self):
+        class Racing(CasEffectBackend):
+            race = False
+            def snapshot(self):
+                observed = super().snapshot()
+                if self.race:
+                    self.race = False
+                    self.compare_and_write(str(self.revision), "on",
+                                           ",".join(self.status_value["colors"]),
+                                           "BB0000,00CC00,0000DD,EEEE00")
+                return observed
+
+        backend = Racing()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        backend.compare_and_write(str(backend.revision), "on", backend.cas_writes[-1],
+                                  "AA0000,00BB00,0000CC,DDDD00")
+        self.assertTrue(app._stop_effect())
+        app.state.set_selected_color("ABCDEF")
+        draft = app.state.draft
+        current = app.state.current
+        backend.race = True
+        app._refresh()
+        self.assertTrue(app.state.live_unknown)
+        self.assertTrue(app.state.live_last_observed)
+        self.assertEqual((app.state.draft, app.state.current), (draft, current))
+        self.assertNotIn("IN SYNC", "\n".join(compose_editor(app.state, power_state="on").lines))
+        backend.status_value["state"] = "off"
+        app._refresh()
+        self.assertEqual(app.power_state, "off")
+        self.assertTrue(app.state.live_unknown)
+        self.assertEqual(app.state.draft, draft)
+
+    def test_lost_ownership_reconciliation_requires_token_bearing_observations(self):
+        backend = CasEffectBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        app.state.set_selected_color("ABCDEF")
+        draft = app.state.draft
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        backend.compare_and_write(str(backend.revision), "on", backend.cas_writes[-1],
+                                  draft.to_wire())
+        actual_snapshot = backend.snapshot
+        backend.snapshot = lambda: {k: v for k, v in actual_snapshot().items()
+                                    if k != "token"}
+        self.assertFalse(app._stop_effect())
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertTrue(app.state.effect_frame_uncertain)
+        self.assertFalse(app.state.live_last_observed)
+        self.assertEqual(app.state.draft, draft)
+        backend.snapshot = actual_snapshot
+        self.assertTrue(app._stop_effect())
+        self.assertTrue(app.state.live_last_observed)
+        self.assertEqual(backend.cas_writes[-1], draft.to_wire())
+
+    def test_repeated_legacy_refresh_after_ambiguous_apply_remains_last_observed(self):
+        class AcceptedWithoutAck(FakeBackend):
+            def write_colors(self, value):
+                self.writes.append(value)
+                self.status_value["colors"] = value.split(",")
+                raise BackendIOError("ack lost")
+
+        backend = AcceptedWithoutAck()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        draft = app.state.draft
+        app._apply()
+        app._refresh()
+        self.assertTrue(app.state.live_last_observed)
+        app._refresh()
+        self.assertFalse(app.state.live_unknown)
+        self.assertTrue(app.state.live_last_observed)
+        self.assertEqual(app.state.draft, draft)
+        self.assertNotIn("IN SYNC", "\n".join(compose_editor(app.state, power_state="on").lines))
+
     def test_nonstatic_effect_start_tick_and_stop_restore_the_chosen_base(self):
         backend = FakeBackend()
         app = CursesTui(backend, profile_store=FakeProfileStore())
@@ -1037,15 +1788,134 @@ class TuiDeviceActionTests(unittest.TestCase):
             def getch(self):
                 return next(self.keys)
 
-        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), self.assertRaises(
-            KeyboardInterrupt
-        ):
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
             app._main(StopScreen())
 
         self.assertEqual(backend.writes.count(base), 1)
         self.assertEqual(backend.status_value["colors"], base.split(","))
         self.assertIsNone(app.effect_runtime)
         self.assertFalse(app.state.effect_running)
+
+    def test_main_interrupted_cas_stop_uses_cleanup_gate_without_duplicate_write(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                class InterruptedStop(CasEffectBackend):
+                    interrupt_once = True
+                    def compare_and_write(self, token, power, expected, replacement):
+                        if replacement == base and self.interrupt_once:
+                            self.interrupt_once = False
+                            if accepted:
+                                super().compare_and_write(token, power, expected, replacement)
+                            raise KeyboardInterrupt
+                        return super().compare_and_write(token, power, expected, replacement)
+
+                backend = InterruptedStop()
+                app = CursesTui(backend, profile_store=FakeProfileStore())
+                app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+                base = app.state.draft.to_wire()
+                app._start_effect(now=0.0)
+                app._tick_effect(now=0.0, authorized=True)
+                frame = backend.cas_writes[-1]
+
+                class StopScreen:
+                    reads = 0
+                    def keypad(self, _enabled): pass
+                    def timeout(self, _milliseconds): pass
+                    def getmaxyx(self): return (30, 110)
+                    def erase(self): pass
+                    def addnstr(self, *_args): pass
+                    def refresh(self): pass
+                    def getch(self):
+                        self.reads += 1
+                        if self.reads > 1:
+                            raise AssertionError("cleanup must not resume input")
+                        return ord("s")
+
+                with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), \
+                     mock.patch("okeylitctl.tui.monotonic", return_value=0.1), \
+                     mock.patch("okeylitctl.tui.sleep") as sleeper:
+                    app._main(StopScreen())
+                self.assertEqual(backend.cas_writes, [frame, base])
+                if accepted:
+                    self.assertTrue(app.state.live_last_observed)
+                    self.assertIn("ownership lost", app.state.message.lower())
+                    self.assertNotIn("restored", app.state.message.lower())
+                else:
+                    self.assertEqual(app.state.message, "Effect stopped; base layout restored")
+                    self.assertEqual(sleeper.call_count, 1)
+                self.assertIsNone(app.effect_runtime)
+                self.assertFalse(app._terminal_cleanup_forced)
+
+    def test_interrupted_cas_stop_power_off_bounds_cleanup_without_claiming_restore(self):
+        class PowerOffStop(CasEffectBackend):
+            interrupt_once = True
+            def compare_and_write(self, token, power, expected, replacement):
+                if replacement == base and self.interrupt_once:
+                    self.interrupt_once = False
+                    self.status_value["state"] = "off"
+                    raise KeyboardInterrupt
+                return super().compare_and_write(token, power, expected, replacement)
+
+        backend = PowerOffStop()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+        frame = backend.cas_writes[-1]
+
+        class StopScreen:
+            def keypad(self, _enabled): pass
+            def timeout(self, _milliseconds): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self): return ord("s")
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), \
+             mock.patch("okeylitctl.tui.monotonic", return_value=0.1), \
+             mock.patch("okeylitctl.tui.sleep") as sleeper:
+            app._main(StopScreen())
+        self.assertLessEqual(sleeper.call_count, 6)
+        self.assertEqual(backend.cas_writes, [frame])
+        self.assertEqual(app.power_state, "off")
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertTrue(app.state.effect_frame_uncertain)
+        self.assertTrue(app._terminal_cleanup_forced)
+        self.assertIn("unresolved", app.state.message.lower())
+
+    def test_terminal_failure_with_interrupted_cas_stop_resolves_without_double_write(self):
+        class InterruptedStop(CasEffectBackend):
+            interrupt_once = True
+            def compare_and_write(self, token, power, expected, replacement):
+                if replacement == base and self.interrupt_once:
+                    self.interrupt_once = False
+                    raise KeyboardInterrupt
+                return super().compare_and_write(token, power, expected, replacement)
+
+        backend = InterruptedStop()
+        app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        base = app.state.draft.to_wire()
+        app._start_effect(now=0.0)
+        app._tick_effect(now=0.0, authorized=True)
+
+        class BrokenScreen:
+            def keypad(self, _enabled): pass
+            def timeout(self, _milliseconds): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self): raise curses.error("terminal failed")
+
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), \
+             mock.patch("okeylitctl.tui.monotonic", return_value=0.1), \
+             mock.patch("okeylitctl.tui.sleep"):
+            app._main(BrokenScreen())
+        self.assertEqual(backend.cas_writes.count(base), 1)
+        self.assertIsNone(app.effect_runtime)
 
     def test_terminal_input_failure_waits_for_pending_power_off_restore(self):
         backend = FakeBackend()
@@ -2380,6 +3250,48 @@ class TuiDeviceActionTests(unittest.TestCase):
 
         self.assertEqual(backend.restores, 0)
         self.assertIn("already active", app.state.message)
+
+    def test_restore_power_off_noop_preserves_dirty_draft_without_write(self):
+        for initially_off in (True, False):
+            for same_as_original in (True, False):
+                with self.subTest(initially_off=initially_off,
+                                  same_as_original=same_as_original):
+                    self._assert_restore_power_off_preserves_draft(
+                        initially_off=initially_off,
+                        same_as_original=same_as_original,
+                    )
+
+    def _assert_restore_power_off_preserves_draft(self, *, initially_off, same_as_original):
+        backend = FakeBackend(same_as_original=same_as_original)
+        if initially_off:
+            backend.status_value["state"] = "off"
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        draft, original, current = app.state.draft, app.state.original, app.state.current
+        backend.status_value["state"] = "off"
+
+        app._restore()
+
+        self.assertEqual(backend.restores, 0)
+        self.assertEqual(backend.writes, [])
+        self.assertEqual((app.state.draft, app.state.original, app.state.current),
+                         (draft, original, current))
+        self.assertTrue(app.state.dirty)
+        self.assertEqual(app.power_state, "off")
+        self.assertIn("power off", app.state.message.lower())
+        for composed in (
+            compose_editor(app.state, power_state=app.power_state),
+            compose_adaptive_editor(app.state, width=110, height=30,
+                                    power_state=app.power_state),
+            compose_narrow_editor(app.state, width=78, height=24,
+                                  power_state=app.power_state),
+        ):
+            visible = "\n".join(composed.lines)
+            self.assertIn("DEVICE OFF", visible)
+            self.assertNotIn("IN SYNC", visible)
+            self.assertNotIn("LIVE  #111111", visible)
+            self.assertFalse(any("swatch_live_" in role or role.startswith("key_right_")
+                                 for row in composed.roles for role in row))
 
     def test_restore_discards_only_local_draft_when_original_is_active(self):
         backend = FakeBackend(same_as_original=True)

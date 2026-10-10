@@ -170,6 +170,8 @@ def _draw_help_overlay(canvas: _Canvas, state: TuiState) -> None:
 
 
 def _responsive_status_role(state: TuiState, power_state: str) -> str:
+    if state.live_unknown or power_state == "off":
+        return "error"
     if state.effect_running:
         if state.effect_restore_pending or power_state == "off" or state.effect_frame_uncertain:
             return "error"
@@ -178,6 +180,8 @@ def _responsive_status_role(state: TuiState, power_state: str) -> str:
 
 
 def _responsive_editor_shortcuts(state: TuiState) -> str:
+    if state.live_unknown:
+        return "EDITOR LOCKED · verify Live before editing"
     if state.effect_running:
         return "EDITOR LOCKED · resolve the effect before editing"
     if state.effect_kind is EffectKind.CYCLE:
@@ -186,7 +190,7 @@ def _responsive_editor_shortcuts(state: TuiState) -> str:
 
 
 def _focused_editor_shortcuts(state: TuiState) -> str:
-    if state.effect_running:
+    if state.live_unknown or state.effect_running:
         return _responsive_editor_shortcuts(state)
     if state.effect_kind is EffectKind.CYCLE:
         return "V panel  ↔ zone  ↑↓ FROM/TO/SAT  +/- adjust  Tab effect  P preset"
@@ -194,10 +198,15 @@ def _focused_editor_shortcuts(state: TuiState) -> str:
 
 
 def _responsive_effect_shortcut(state: TuiState, power_state: str) -> str:
+    if state.live_unknown:
+        return "R Verify  ? help  Q quit"
     if not state.effect_running:
         return "A apply  X discard  O original  M profiles  R refresh  ? help  Q quit"
     if power_state == "off":
-        return "POWER ON, THEN S TO RESTORE  ? help"
+        return (
+            "POWER ON, THEN S TO VERIFY  ? help"
+            if state.effect_ownership_lost else "POWER ON, THEN S TO RESTORE  ? help"
+        )
     if state.effect_frame_uncertain:
         return "S Verify  ? help"
     if state.effect_restore_pending and state.effect_frame is not None:
@@ -205,24 +214,29 @@ def _responsive_effect_shortcut(state: TuiState, power_state: str) -> str:
     return "S Stop  ? help  Q quit"
 
 
+def _effect_status(state: TuiState, power_state: str) -> str:
+    if state.live_unknown:
+        return "LIVE UNKNOWN"
+    if state.effect_running:
+        if power_state == "off" and not state.effect_ownership_lost:
+            return "RESTORE PENDING"
+        if state.effect_frame_uncertain:
+            return "EFFECT UNKNOWN"
+        if state.effect_restore_pending:
+            return "RESTORE PENDING"
+        return "EFFECT ACTIVE"
+    if power_state == "off":
+        return "POWER OFF"
+    if state.dirty:
+        return "UNSAVED DRAFT"
+    return "LAST OBSERVED" if state.live_last_observed else "IN SYNC"
+
+
 def _draw_header(canvas: _Canvas, state: TuiState, power_state: str, version: str) -> None:
     canvas.put(1, 3, "◆ okeylitctl", "brand")
     canvas.put(1, 16, f"v{version}", "muted")
-    if state.effect_running and power_state == "off":
-        status = "RESTORE PENDING"
-        status_role = "error"
-    elif state.effect_running and state.effect_frame_uncertain:
-        status = "EFFECT UNKNOWN"
-        status_role = "error"
-    elif state.effect_running and state.effect_restore_pending:
-        status = "RESTORE PENDING"
-        status_role = "error"
-    elif state.effect_running:
-        status = "EFFECT ACTIVE"
-        status_role = "effect_badge"
-    else:
-        status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
-        status_role = "dirty_badge" if state.dirty else "synced_badge"
+    status = _effect_status(state, power_state)
+    status_role = _responsive_status_role(state, power_state)
     status_text = f" ◆ {status} "
     canvas.put(1, 111, status_text.ljust(23), status_role)
     device = f" ● DEVICE {power_state.upper()} "
@@ -230,6 +244,8 @@ def _draw_header(canvas: _Canvas, state: TuiState, power_state: str, version: st
 
 
 def _keyboard_colors(state: TuiState, power_state: str) -> ColorLayout | None:
+    if power_state == "off" or state.live_unknown:
+        return None
     if not state.effect_running:
         return state.preview_frame or state.draft
     if power_state == "off" or state.effect_frame_uncertain:
@@ -289,7 +305,7 @@ def _draw_zones(canvas: _Canvas, state: TuiState) -> None:
         canvas.put(row, rect.x + 19, "  ", f"swatch_{zone.value}")
         value = getattr(state.draft, zone.value)
         canvas.put(row, rect.x + 23, f"#{value}", "draft" if state.dirty else "muted")
-        if selected and getattr(state.current, zone.value) != value:
+        if selected and not state.live_unknown and getattr(state.current, zone.value) != value:
             canvas.put(row, rect.right - 4, "●", "dirty")
 
 
@@ -303,8 +319,8 @@ def _draw_live_draft(canvas: _Canvas, state: TuiState, power_state: str) -> None
     rect = EDITOR_LAYOUT.panel("live_draft")
     canvas.box(rect, "LIVE ▸ DRAFT")
     zone = state.selected_zone
-    power_off = state.effect_running and power_state == "off"
-    uncertain = state.effect_running and state.effect_frame_uncertain and not power_off
+    power_off = power_state == "off"
+    uncertain = (state.live_unknown or state.effect_running and state.effect_frame_uncertain) and not power_off
     live_layout = (
         state.effect_frame
         if state.effect_running
@@ -315,7 +331,8 @@ def _draw_live_draft(canvas: _Canvas, state: TuiState, power_state: str) -> None
     )
     live = getattr(live_layout, zone.value)
     draft = getattr(state.draft, zone.value)
-    canvas.put(rect.y + 3, rect.x + 3, "LIVE", "muted")
+    canvas.put(rect.y + 3, rect.x + 3,
+               "SEEN" if state.live_last_observed and not state.effect_running and not state.live_unknown else "LIVE", "muted")
     canvas.put(rect.y + 4, rect.x + 3, "DRAFT", "muted")
     if power_off:
         canvas.put(rect.y + 3, rect.x + 12, "       ", "error")
@@ -329,13 +346,20 @@ def _draw_live_draft(canvas: _Canvas, state: TuiState, power_state: str) -> None
     canvas.put(rect.y + 4, rect.x + 12, "       ", f"swatch_draft_{zone.value}_{draft}")
     canvas.put(rect.y + 4, rect.x + 21, f"#{draft}", "draft" if live != draft else "muted")
     if power_off:
-        canvas.put(rect.y + 7, rect.x + 3, "Base restore pending · power on", "error")
+        canvas.put(rect.y + 7, rect.x + 3,
+                   "Ownership lost · S Verify when on" if state.effect_ownership_lost
+                   else "Live unknown · R Verify when on" if state.live_unknown
+                   else "Base restore pending · power on" if state.effect_running
+                   else "Power off · DRAFT is local preview", "error")
     elif uncertain:
-        canvas.put(rect.y + 7, rect.x + 3, "Device state unknown · S Verify", "error")
+        canvas.put(rect.y + 7, rect.x + 3,
+                   "Live unknown · R Verify" if state.live_unknown else "Device state unknown · S Verify", "error")
     elif state.effect_restore_pending and state.effect_frame is not None:
         canvas.put(rect.y + 7, rect.x + 3, "Verified frame · S Restore", "focus")
     elif state.effect_running and state.effect_frame is not None:
         canvas.put(rect.y + 7, rect.x + 3, "Effect frame active · S Stop", "focus")
+    elif state.live_last_observed:
+        canvas.put(rect.y + 7, rect.x + 3, "LAST OBSERVED · not guaranteed live", "muted")
     elif live == draft:
         canvas.put(rect.y + 7, rect.x + 3, "No changes", "muted")
     else:
@@ -434,16 +458,14 @@ def _draw_motion(canvas: _Canvas, state: TuiState) -> None:
 
 
 def _draw_footer(canvas: _Canvas, state: TuiState, power_state: str) -> None:
-    if state.effect_running:
-        if power_state == "off":
-            status = "RESTORE PENDING"
-        elif state.effect_frame_uncertain:
-            status = "EFFECT UNKNOWN"
-        elif state.effect_restore_pending:
-            status = "RESTORE PENDING"
-        else:
-            status = "EFFECT ACTIVE"
-        first = f"{status} · editor locked until the base layout is restored"
+    if state.live_unknown:
+        first = "LIVE UNKNOWN · editor locked until read-only verification"
+        second = _responsive_effect_shortcut(state, power_state)
+    elif state.effect_running:
+        status = _effect_status(state, power_state)
+        first = (f"{status} · editor locked until state is verified"
+                 if state.effect_ownership_lost
+                 else f"{status} · editor locked until the base layout is restored")
         second = _responsive_effect_shortcut(state, power_state)
     else:
         first = (
@@ -494,16 +516,7 @@ def compose_adaptive_editor(
     canvas = _Canvas(width, height)
     _draw_outer_frame(canvas)
     canvas.put(1, 3, f"◆ okeylitctl v{version}", "brand")
-    if state.effect_running and power_state == "off":
-        status = "RESTORE PENDING"
-    elif state.effect_running and state.effect_frame_uncertain:
-        status = "EFFECT UNKNOWN"
-    elif state.effect_running and state.effect_restore_pending:
-        status = "RESTORE PENDING"
-    elif state.effect_running:
-        status = "EFFECT ACTIVE"
-    else:
-        status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
+    status = _effect_status(state, power_state)
     device = f"DEVICE {power_state.upper()}"
     canvas.put(1, width - len(status) - len(device) - 7, status,
                _responsive_status_role(state, power_state))
@@ -550,8 +563,8 @@ def compose_adaptive_editor(
         canvas.put(y, zones.x + 18, f"#{color}", "draft" if chosen else "muted")
 
     zone = state.selected_zone
-    power_off = state.effect_running and power_state == "off"
-    unknown = state.effect_running and state.effect_frame_uncertain and not power_off
+    power_off = power_state == "off"
+    unknown = (state.live_unknown or state.effect_running and state.effect_frame_uncertain) and not power_off
     live_layout = (
         state.effect_frame if state.effect_running and state.effect_frame is not None
         and not power_off and not unknown else state.current
@@ -559,17 +572,23 @@ def compose_adaptive_editor(
     live = getattr(live_layout, zone.value)
     draft = getattr(state.draft, zone.value)
     canvas.put(live_draft.y + 1, live_draft.x + 2,
-               "LIVE  POWER OFF" if power_off else "LIVE  UNKNOWN" if unknown else f"LIVE  #{live}",
+               "LIVE  POWER OFF" if power_off else "LIVE  UNKNOWN" if unknown
+               else f"SEEN  #{live}" if state.live_last_observed else f"LIVE  #{live}",
                "error" if power_off or unknown else "muted")
     canvas.put(live_draft.y + 2, live_draft.x + 2, f"DRAFT #{draft}", "draft")
     if not power_off and not unknown:
         canvas.put(live_draft.y + 1, live_draft.x + 20, "  ", f"swatch_live_{zone.value}_{live}")
     canvas.put(live_draft.y + 2, live_draft.x + 20, "  ", f"swatch_draft_{zone.value}_{draft}")
     message = (
-        "Base restore pending · POWER ON TO RESTORE" if power_off else "Device state unknown" if unknown
+        ("Ownership lost · POWER ON TO VERIFY" if state.effect_ownership_lost
+         else "Live unknown · R Verify when on" if state.live_unknown
+         else "Base restore pending · POWER ON TO RESTORE" if state.effect_running
+         else "Power off · DRAFT local preview") if power_off else
+        "Live unknown · R Verify" if state.live_unknown else "Device state unknown" if unknown
         else "Verified frame · S Restore"
         if state.effect_restore_pending and state.effect_frame is not None
         else "Effect frame active · S Stop" if state.effect_running
+        else "LAST OBSERVED · not guaranteed live" if state.live_last_observed
         else "No changes" if live == draft else "Local draft · A apply"
     )
     canvas.put(live_draft.y + 4, live_draft.x + 2, message, "muted")
@@ -732,16 +751,7 @@ def compose_narrow_editor(
     canvas = _Canvas(width, height)
     _draw_outer_frame(canvas)
     canvas.put(1, 3, f"◆ okeylitctl v{version}", "brand")
-    if state.effect_running and power_state == "off":
-        status = "RESTORE PENDING"
-    elif state.effect_running and state.effect_frame_uncertain:
-        status = "EFFECT UNKNOWN"
-    elif state.effect_running and state.effect_restore_pending:
-        status = "RESTORE PENDING"
-    elif state.effect_running:
-        status = "EFFECT ACTIVE"
-    else:
-        status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
+    status = _effect_status(state, power_state)
     device = f"DEVICE {power_state.upper()}"
     canvas.put(1, width - len(status) - len(device) - 7, status,
                _responsive_status_role(state, power_state))
@@ -779,8 +789,8 @@ def compose_narrow_editor(
         canvas.put(y, x + 11, "  ", f"swatch_{zone.value}")
         canvas.put(y, x + 14, f"#{getattr(state.draft, zone.value)}", "draft")
     zone = state.selected_zone
-    power_off = state.effect_running and power_state == "off"
-    unknown = state.effect_running and state.effect_frame_uncertain and not power_off
+    power_off = power_state == "off"
+    unknown = (state.live_unknown or state.effect_running and state.effect_frame_uncertain) and not power_off
     live_layout = (
         state.effect_frame if state.effect_running and state.effect_frame is not None
         and not power_off and not unknown else state.current
@@ -788,7 +798,9 @@ def compose_narrow_editor(
     live = "POWER OFF" if power_off else "UNKNOWN" if unknown else f"#{getattr(live_layout, zone.value)}"
     draft = getattr(state.draft, zone.value)
     canvas.put(info.y + 3, info.x + 2,
-               f"LIVE {live}  DRAFT #{draft}   RGB {'/'.join(f'{v:03d}' for v in _channel_values(draft))}",
+               (f"LAST OBSERVED #{getattr(live_layout, zone.value)}  DRAFT #{draft}"
+                if state.live_last_observed and not state.effect_running and not power_off and not unknown else
+                f"LIVE {live}  DRAFT #{draft}   RGB {'/'.join(f'{v:03d}' for v in _channel_values(draft))}"),
                "error" if power_off or unknown else "draft")
 
     remaining = height - 3 - info.bottom
@@ -894,8 +906,8 @@ def _draw_profiles_header(
     version: str,
 ) -> None:
     canvas.put(1, 3, f"◆ okeylitctl v{version}  ›  Profiles", "brand")
-    status = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
-    status_role = "dirty_badge" if state.dirty else "synced_badge"
+    status = _effect_status(state, power_state)
+    status_role = _responsive_status_role(state, power_state)
     canvas.put(1, 111, f" ◆ {status} ".ljust(23), status_role)
     canvas.put(
         1,
@@ -1031,10 +1043,10 @@ def compose_responsive_profiles(
     canvas = _Canvas(width, height)
     _draw_outer_frame(canvas)
     canvas.put(1, 3, f"◆ okeylitctl v{version}  ›  Profiles", "brand")
-    state_text = "UNSAVED DRAFT" if state.dirty else "IN SYNC"
+    state_text = _effect_status(state, power_state)
     device = f"DEVICE {power_state.upper()}"
     canvas.put(1, width - len(state_text) - len(device) - 7, state_text,
-               "dirty_badge" if state.dirty else "synced_badge")
+               _responsive_status_role(state, power_state))
     canvas.put(1, width - len(device) - 3, device, "device_badge")
 
     list_width = max(38, (width - 5) // 3)
@@ -1157,10 +1169,16 @@ def compose_exact_hex_modal(
         "modal_error" if error else ("modal_ready" if valid else "modal_muted"),
     )
 
+    unavailable = state.live_unknown or power_state == "off"
     canvas.put(rect.y + 10, rect.x + 6, "LIVE", "modal_muted")
     canvas.put(rect.y + 11, rect.x + 6, "NEW", "modal_muted")
-    canvas.put(rect.y + 10, rect.x + 13, "        ", f"modal_swatch_live_{live}")
-    canvas.put(rect.y + 10, rect.x + 23, f"#{live}", "modal_text")
+    if unavailable:
+        canvas.put(rect.y + 10, rect.x + 13, "        ", "modal_muted")
+        canvas.put(rect.y + 10, rect.x + 23,
+                   "POWER OFF" if power_state == "off" else "UNKNOWN", "modal_error")
+    else:
+        canvas.put(rect.y + 10, rect.x + 13, "        ", f"modal_swatch_live_{live}")
+        canvas.put(rect.y + 10, rect.x + 23, f"#{live}", "modal_text")
     if valid:
         canvas.put(rect.y + 11, rect.x + 13, "        ", f"modal_swatch_new_{normalized}")
         canvas.put(rect.y + 11, rect.x + 23, f"#{normalized}", "modal_text")

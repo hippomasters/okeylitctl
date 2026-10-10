@@ -631,6 +631,91 @@ class EffectRuntimeSchedulingTests(unittest.TestCase):
         self.assertEqual(len(backend.cas_calls), 2)
         self.assertNotEqual(runtime.last_written, BASE)
 
+    def test_unaccepted_interrupted_restore_can_retry_only_after_matching_token_and_frame(self):
+        class InterruptedBeforeAcceptance(CASBackend):
+            interrupt = True
+            def compare_and_write(self, token, state, expected_wire, desired_wire):
+                if self.interrupt and desired_wire == BASE.to_wire():
+                    self.interrupt = False
+                    self.cas_calls.append((token, state, expected_wire, desired_wire))
+                    raise KeyboardInterrupt
+                return super().compare_and_write(token, state, expected_wire, desired_wire)
+
+        backend = InterruptedBeforeAcceptance()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        frame, owned_token = runtime.last_written, runtime.owned_token
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.stop()
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertEqual((runtime.last_written, runtime.owned_token), (frame, owned_token))
+        self.assertEqual(backend.colors, frame.to_wire())
+        self.assertFalse(runtime.stop())  # Read-only: proves this CAS was not accepted.
+        self.assertFalse(runtime.write_state_uncertain)
+        self.assertEqual(len(backend.cas_calls), 2)
+        self.assertTrue(runtime.stop())  # Only this acknowledged CAS restores base.
+        self.assertEqual(backend.writes.count(BASE.to_wire()), 1)
+        self.assertEqual(runtime.last_written, BASE)
+
+    def test_interrupted_restore_with_changed_token_never_retries_even_for_matching_colors(self):
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted):
+                class Interrupted(CASBackend):
+                    interrupt = True
+                    def compare_and_write(self, token, state, expected_wire, desired_wire):
+                        if self.interrupt and desired_wire == BASE.to_wire():
+                            self.interrupt = False
+                            if accepted:
+                                super().compare_and_write(token, state, expected_wire, desired_wire)
+                            else:
+                                self.external_write(expected_wire)  # ABA by another client.
+                            raise KeyboardInterrupt
+                        return super().compare_and_write(token, state, expected_wire, desired_wire)
+
+                backend = Interrupted()
+                runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+                runtime.start(now=0.0)
+                runtime.tick(now=0.0)
+                with self.assertRaises(KeyboardInterrupt):
+                    runtime.stop()
+                self.assertFalse(runtime.stop())
+                self.assertTrue(runtime.ownership_lost)
+                self.assertNotEqual(runtime.last_written, BASE)
+                self.assertFalse(runtime.stop())
+                self.assertEqual(len(backend.writes), 2 if accepted else 1)
+
+    def test_interrupted_restore_power_off_or_snapshot_failure_keeps_unknown_without_write(self):
+        class Interrupted(CASBackend):
+            interrupt = True
+            fail_snapshot = False
+            def compare_and_write(self, token, state, expected_wire, desired_wire):
+                if self.interrupt and desired_wire == BASE.to_wire():
+                    self.interrupt = False
+                    raise KeyboardInterrupt
+                return super().compare_and_write(token, state, expected_wire, desired_wire)
+            def snapshot(self):
+                if self.fail_snapshot:
+                    raise BackendIOError("status unavailable")
+                return super().snapshot()
+
+        backend = Interrupted()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        runtime.tick(now=0.0)
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.stop()
+        backend.fail_snapshot = True
+        with self.assertRaises(BackendIOError):
+            runtime.stop()
+        self.assertTrue(runtime.write_state_uncertain)
+        backend.fail_snapshot = False
+        backend.state = "off"
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.observed_power_off)
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertEqual(len(backend.writes), 1)
+
     def test_rate_must_be_finite_and_within_safe_hardware_limit(self):
         for rate in (0.0, -1.0, 5.01, inf, nan):
             with self.subTest(rate=rate):

@@ -392,6 +392,71 @@ class ResponsiveEditorTests(unittest.TestCase):
                                         "speed", "E hex", "P preset"):
                         self.assertNotIn(unavailable, footer)
 
+    def test_unknown_live_compact_footers_match_reference_locked_actions(self):
+        app = CursesTui(ReadOnlyBackend())
+        app.state.live_unknown = True
+        forbidden = ("zone", "RGB", "adjust", "Tab effect", "speed",
+                     "E hex", "P preset", "FROM/TO/SAT", "+/-")
+        for kind in (EffectKind.STATIC, EffectKind.CYCLE):
+            app.state.effect_index = tuple(EffectKind).index(kind)
+            reference = tui_compositor.compose_editor(app.state, power_state="on")
+            reference_footer = reference.lines[51][5:-1].strip()
+            self.assertEqual(reference_footer, "R Verify  ? help  Q quit")
+            for width, height in ((78, 24), (99, 30), (100, 30),
+                                  (110, 30), (159, 54)):
+                with self.subTest(kind=kind, size=(width, height)):
+                    screen = StrictScreen(width, height)
+                    self.assertTrue(app._draw(screen))
+                    first, second = screen.lines()[-3:-1]
+                    self.assertIn("EDITOR LOCKED", first)
+                    self.assertEqual(second[3:-1].strip(), reference_footer)
+                    for unavailable in forbidden:
+                        self.assertNotIn(unavailable, first)
+                    self.assertIn("LIVE UNKNOWN", screen.lines()[1])
+
+    def test_unknown_live_footer_keys_are_routed_and_editing_keys_are_blocked(self):
+        for width, height in ((78, 24), (100, 30), (110, 30), (160, 55)):
+            with self.subTest(size=(width, height)):
+                app = CursesTui(ReadOnlyBackend())
+                app.state.live_unknown = True
+                initial_draft = app.state.draft
+                initial_effect = app.state.effect_index
+
+                class InputScreen(StrictScreen):
+                    def __init__(self):
+                        super().__init__(width, height)
+                        self.keys = iter((ord("+"), 9, ord("e"), ord("p"),
+                                          ord("a"), ord("v"), ord("?"), 27,
+                                          ord("r"), ord("q")))
+                        self.help_seen = False
+
+                    def keypad(self, _enabled):
+                        pass
+
+                    def timeout(self, _milliseconds):
+                        pass
+
+                    def refresh(self):
+                        self.help_seen |= "Press ? or Esc to close" in "\n".join(self.lines())
+
+                    def getch(self):
+                        return next(self.keys)
+
+                screen = InputScreen()
+                with mock.patch("okeylitctl.tui.initialize_colors", return_value=False), \
+                     mock.patch.object(app, "_refresh") as verify, \
+                     mock.patch.object(app, "_apply", side_effect=AssertionError("locked Apply")), \
+                     mock.patch.object(app, "_edit_color", side_effect=AssertionError("locked Edit")), \
+                     mock.patch.object(app, "_profile_manager", side_effect=AssertionError("locked Profiles")):
+                    app._main(screen)
+                verify.assert_called_once_with()
+                self.assertTrue(screen.help_seen)
+                self.assertFalse(app.state.help_visible)
+                self.assertTrue(app.state.live_unknown)
+                self.assertEqual(app.state.draft, initial_draft)
+                self.assertEqual(app.state.effect_index, initial_effect)
+                self.assertEqual(app.state.compact_panel, "color")
+
     def test_uncertain_restore_pending_reports_unknown_until_verified(self):
         app = CursesTui(ReadOnlyBackend())
         app.state.effect_running = True

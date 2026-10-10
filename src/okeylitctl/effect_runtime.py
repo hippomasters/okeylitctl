@@ -71,8 +71,27 @@ class EffectRuntime:
         self.last_written = None
 
     def _cas_stop(self) -> bool:
-        if self.ownership_lost or self.write_state_uncertain:
+        if self.ownership_lost:
             return False
+        if self.write_state_uncertain:
+            # Only a restoration from an acknowledged, owned frame can be
+            # disproved by the unchanged token and expected colors. A changed
+            # token may be our lost ACK or someone else's write (even ABA).
+            if (self.attempted_frame != self.spec.base
+                    or self.owned_token is None or self.last_written is None):
+                return False
+            snapshot = self.backend.snapshot()
+            if snapshot.get("state") != "on":
+                self.observed_power_off = True
+                return False
+            self.observed_power_off = False
+            if (snapshot.get("token") != self.owned_token
+                    or snapshot.get("colors") != self.last_written.to_wire().split(",")):
+                self._lose_ownership()
+                return False
+            self.write_state_uncertain = False
+            self.attempted_frame = None
+            return False  # Reconciliation never writes in the same Stop action.
         if self.owned_token is None or self.last_written is None:
             return False
         snapshot = self.backend.snapshot()
