@@ -7,6 +7,7 @@ import unittest
 
 from okeylitctl.effects import EffectKind, EffectSpec
 from okeylitctl.effect_runtime import EffectRuntime
+from okeylitctl.ipc import ConflictError
 from okeylitctl.models import ColorLayout, Zone
 from okeylitctl.sysfs import BackendIOError
 
@@ -44,6 +45,50 @@ class RecordingBackend:
         if self.write_attempts == self.fail_on_write:
             raise BackendIOError("injected firmware write failure")
         self.writes.append(canonical_colors)
+
+
+class CASBackend:
+    """Broker-like token fencing, including writes by a second client."""
+
+    def __init__(self):
+        self.state = "on"
+        self.colors = BASE.to_wire()
+        self.revision = 0
+        self.writes: list[str] = []
+        self.cas_calls: list[tuple[str, str, str, str]] = []
+        self.race_color: str | None = None
+        self.lose_ack = False
+
+    @property
+    def token(self) -> str:
+        return f"0000000000000001:{self.revision:016X}"
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "token": self.token,
+            "state": self.state,
+            "colors": self.colors.split(","),
+            "original": BASE.to_wire().split(","),
+        }
+
+    def external_write(self, colors: str) -> None:
+        self.revision += 1
+        self.colors = colors
+
+    def compare_and_write(self, token: str, state: str, expected_wire: str, desired_wire: str) -> str:
+        self.cas_calls.append((token, state, expected_wire, desired_wire))
+        if self.race_color is not None:
+            self.external_write(self.race_color)
+            self.race_color = None
+        if token != self.token or state != self.state or expected_wire != self.colors:
+            raise ConflictError("broker snapshot conflict")
+        self.revision += 1
+        self.colors = desired_wire
+        self.writes.append(desired_wire)
+        if self.lose_ack:
+            self.lose_ack = False
+            raise BackendIOError("mutation outcome uncertain")
+        return self.token
 
 
 class EffectRuntimeSchedulingTests(unittest.TestCase):
@@ -453,6 +498,223 @@ class EffectRuntimeSchedulingTests(unittest.TestCase):
         self.assertFalse(runtime.active)
         self.assertEqual(backend.writes, [])
         self.assertEqual(backend.status_calls, 1)
+
+    def test_cas_tick_owns_acknowledged_token_and_stop_conditionally_restores(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        frame = backend.colors
+        self.assertNotEqual(frame, BASE.to_wire())
+        self.assertEqual(runtime.owned_token, backend.token)
+        self.assertEqual(backend.cas_calls[0][2], BASE.to_wire())
+        self.assertTrue(runtime.stop())
+        self.assertEqual(backend.cas_calls[-1][2:], (frame, BASE.to_wire()))
+        self.assertEqual(runtime.owned_token, backend.token)
+        self.assertEqual(runtime.last_written, BASE)
+        self.assertFalse(runtime.stop())
+        self.assertEqual(len(backend.writes), 2)
+
+    def test_cross_client_write_before_stop_blocks_restore_even_with_same_colors(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        frame = backend.colors
+        owned_token = runtime.owned_token
+        backend.external_write(frame)  # ABA: colors match, ownership does not.
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.ownership_lost)
+        self.assertFalse(runtime.active)
+        self.assertNotEqual(runtime.owned_token, backend.token)
+        self.assertNotEqual(runtime.last_written, BASE)
+        self.assertFalse(runtime.stop())
+        self.assertEqual(len(backend.cas_calls), 1)
+        self.assertEqual(backend.writes, [frame])
+        self.assertNotEqual(owned_token, backend.token)
+
+    def test_cross_client_write_during_effect_stops_without_next_frame(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        backend.external_write(BASE.to_wire())
+        with self.assertRaises(ConflictError):
+            runtime.tick(now=runtime.next_due)
+        self.assertTrue(runtime.ownership_lost)
+        self.assertFalse(runtime.active)
+        self.assertFalse(runtime.stop())
+        self.assertNotEqual(runtime.last_written, BASE)
+        self.assertEqual(len(backend.cas_calls), 1)
+
+    def test_cross_client_race_between_snapshot_and_restore_cas(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        backend.race_color = BASE.to_wire()
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.ownership_lost)
+        self.assertFalse(runtime.stop())
+        self.assertEqual(len(backend.cas_calls), 2)
+        self.assertEqual(len(backend.writes), 1)
+        self.assertNotEqual(runtime.last_written, BASE)
+
+    def test_lost_ack_does_not_infer_ownership_from_attempted_frame(self):
+        backend = CASBackend()
+        backend.lose_ack = True
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        with self.assertRaises(BackendIOError):
+            runtime.tick(now=0.0)
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertIsNone(runtime.owned_token)
+        self.assertEqual(backend.colors, runtime.attempted_frame.to_wire())
+        self.assertFalse(runtime.stop())
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertIsNone(runtime.last_written)
+        self.assertEqual(len(backend.cas_calls), 1)
+
+    def test_power_off_does_not_restore_after_cas_frame(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        backend.state = "off"
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.observed_power_off)
+        self.assertFalse(runtime.stop())
+        self.assertEqual(len(backend.cas_calls), 1)
+        self.assertNotEqual(runtime.last_written, BASE)
+
+    def test_base_frame_is_verified_before_claiming_it_is_still_active(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.STATIC, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        self.assertEqual(runtime.last_written, BASE)
+        backend.external_write(BASE.to_wire())
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.ownership_lost)
+        self.assertIsNone(runtime.last_written)
+
+    def test_race_during_frame_cas_does_not_claim_or_restore_frame(self):
+        backend = CASBackend()
+        backend.race_color = BASE.to_wire()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        with self.assertRaises(ConflictError):
+            runtime.tick(now=0.0)
+        self.assertTrue(runtime.ownership_lost)
+        self.assertIsNone(runtime.last_written)
+        self.assertIsNone(runtime.owned_token)
+        self.assertFalse(runtime.stop())
+        self.assertEqual(backend.writes, [])
+        self.assertEqual(len(backend.cas_calls), 1)
+
+    def test_lost_restore_ack_never_claims_base_or_retries(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        frame = runtime.last_written
+        owned_token = runtime.owned_token
+        backend.lose_ack = True
+        with self.assertRaises(BackendIOError):
+            runtime.stop()
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertEqual(runtime.last_written, frame)
+        self.assertEqual(runtime.owned_token, owned_token)
+        self.assertEqual(backend.colors, BASE.to_wire())
+        self.assertFalse(runtime.stop())
+        self.assertEqual(len(backend.cas_calls), 2)
+        self.assertNotEqual(runtime.last_written, BASE)
+
+    def test_unaccepted_interrupted_restore_can_retry_only_after_matching_token_and_frame(self):
+        class InterruptedBeforeAcceptance(CASBackend):
+            interrupt = True
+            def compare_and_write(self, token, state, expected_wire, desired_wire):
+                if self.interrupt and desired_wire == BASE.to_wire():
+                    self.interrupt = False
+                    self.cas_calls.append((token, state, expected_wire, desired_wire))
+                    raise KeyboardInterrupt
+                return super().compare_and_write(token, state, expected_wire, desired_wire)
+
+        backend = InterruptedBeforeAcceptance()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        frame, owned_token = runtime.last_written, runtime.owned_token
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.stop()
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertEqual((runtime.last_written, runtime.owned_token), (frame, owned_token))
+        self.assertEqual(backend.colors, frame.to_wire())
+        self.assertFalse(runtime.stop())  # Read-only: proves this CAS was not accepted.
+        self.assertFalse(runtime.write_state_uncertain)
+        self.assertEqual(len(backend.cas_calls), 2)
+        self.assertTrue(runtime.stop())  # Only this acknowledged CAS restores base.
+        self.assertEqual(backend.writes.count(BASE.to_wire()), 1)
+        self.assertEqual(runtime.last_written, BASE)
+
+    def test_interrupted_restore_with_changed_token_never_retries_even_for_matching_colors(self):
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted):
+                class Interrupted(CASBackend):
+                    interrupt = True
+                    def compare_and_write(self, token, state, expected_wire, desired_wire):
+                        if self.interrupt and desired_wire == BASE.to_wire():
+                            self.interrupt = False
+                            if accepted:
+                                super().compare_and_write(token, state, expected_wire, desired_wire)
+                            else:
+                                self.external_write(expected_wire)  # ABA by another client.
+                            raise KeyboardInterrupt
+                        return super().compare_and_write(token, state, expected_wire, desired_wire)
+
+                backend = Interrupted()
+                runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+                runtime.start(now=0.0)
+                runtime.tick(now=0.0)
+                with self.assertRaises(KeyboardInterrupt):
+                    runtime.stop()
+                self.assertFalse(runtime.stop())
+                self.assertTrue(runtime.ownership_lost)
+                self.assertNotEqual(runtime.last_written, BASE)
+                self.assertFalse(runtime.stop())
+                self.assertEqual(len(backend.writes), 2 if accepted else 1)
+
+    def test_interrupted_restore_power_off_or_snapshot_failure_keeps_unknown_without_write(self):
+        class Interrupted(CASBackend):
+            interrupt = True
+            fail_snapshot = False
+            def compare_and_write(self, token, state, expected_wire, desired_wire):
+                if self.interrupt and desired_wire == BASE.to_wire():
+                    self.interrupt = False
+                    raise KeyboardInterrupt
+                return super().compare_and_write(token, state, expected_wire, desired_wire)
+            def snapshot(self):
+                if self.fail_snapshot:
+                    raise BackendIOError("status unavailable")
+                return super().snapshot()
+
+        backend = Interrupted()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE))
+        runtime.start(now=0.0)
+        runtime.tick(now=0.0)
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.stop()
+        backend.fail_snapshot = True
+        with self.assertRaises(BackendIOError):
+            runtime.stop()
+        self.assertTrue(runtime.write_state_uncertain)
+        backend.fail_snapshot = False
+        backend.state = "off"
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.observed_power_off)
+        self.assertTrue(runtime.write_state_uncertain)
+        self.assertEqual(len(backend.writes), 1)
 
     def test_rate_must_be_finite_and_within_safe_hardware_limit(self):
         for rate in (0.0, -1.0, 5.01, inf, nan):
