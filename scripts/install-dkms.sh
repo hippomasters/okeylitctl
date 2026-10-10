@@ -46,7 +46,7 @@ if [ "$#" -ne 0 ]; then
         exit 2
     fi
     case "$2" in
-        ''|[!a-z_]*|*[!a-zA-Z0-9_-]*)
+        ''|[!a-zA-Z_]*|*[!a-zA-Z0-9_-]*)
             printf '%s\n' 'invalid user name' >&2; exit 2 ;;
     esac
     for command in getent id usermod stat; do

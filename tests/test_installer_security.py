@@ -352,12 +352,14 @@ if name == "modprobe" and args == ["omen_rgb"]:
 if name == "modprobe" and args == ["-r", "omen_rgb"]:
     (state / "target/sys/module/omen_rgb").rmdir()
 if name == "id":
-    print("0" if args == ["-u"] else "users" if args == ["-nG", "alice"] else "")
+    print("0" if args == ["-u"] else "users" if args in (["-nG", "alice"], ["-nG", "Master"]) else "")
 elif name == "getent":
     if args == ["group", "okeylitctl"]:
         if not (state / "group").exists(): sys.exit(2)
         print("okeylitctl:x:123:")
-    elif args == ["passwd", "alice"]: print("alice:x:1000:1000::/home/alice:/bin/sh")
+    elif args in (["passwd", "alice"], ["passwd", "Master"]):
+        user = args[1]
+        print(f"{user}:x:1000:1000::/home/{user}:/bin/sh")
     else: sys.exit(2)
 elif name == "groupadd": (state / "group").touch()
 elif name == "groupdel": (state / "group").unlink()
@@ -431,6 +433,14 @@ else: pass
             self.assertNotEqual(run("install-dkms.sh", "--allow-user", "../alice").returncode, 0)
             self.assertEqual(run("install-dkms.sh", "--allow-user", "alice").returncode, 0)
             self.assertIn("usermod -a -G okeylitctl alice", (root / "log").read_text())
+            result = run("install-dkms.sh", "--allow-user", "Master")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usermod -a -G okeylitctl Master", (root / "log").read_text())
+            before = (root / "log").read_text()
+            result = run("install-dkms.sh", "--allow-user", "Master;touch /tmp/unsafe")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("invalid user name", result.stderr)
+            self.assertEqual((root / "log").read_text(), before + "id -u\n")
             data = profile / "profiles.json"
             data.write_text("owned data")
             sockunit.chmod(0o666)
