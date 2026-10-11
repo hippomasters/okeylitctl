@@ -92,6 +92,23 @@ class IPCTests(unittest.TestCase):
         self.assertEqual(result["state"], "on")
         self.assertEqual(result["token"], "0123456789ABCDEF:FEDCBA9876543210")
 
+    def test_stop_snapshot_falls_back_only_for_unsupported_legacy_verb(self):
+        response = (b"OK 0123456789ABCDEF:FEDCBA9876543210 on "
+                    b"111111,222222,333333,444444 AAAAAA,BBBBBB,CCCCCC,DDDDDD\n")
+        backend = IPCBackend()
+        with patch.object(backend, "_exchange", side_effect=(b"ERR INVALID\n", response)) as exchange:
+            result = backend.stop_snapshot()
+        self.assertEqual(result["colors"], ["111111", "222222", "333333", "444444"])
+        self.assertEqual([call.args[0] for call in exchange.call_args_list],
+                         [b"2 STOPSHOT\n", b"2 SNAPSHOT\n"])
+        self.assertTrue(all(not call.kwargs["mutation"] for call in exchange.call_args_list))
+
+        for error in (b"ERR BUSY\n", b"ERR IO\n", b"ERR DENIED\n", b"OK\n"):
+            with self.subTest(error=error), patch.object(backend, "_exchange", return_value=error) as exchange:
+                with self.assertRaises((BackendIOError, PermissionDenied, UnsupportedABI)):
+                    backend.stop_snapshot()
+                self.assertEqual(exchange.call_count, 1)
+
     def test_cas_sends_expected_and_desired_wire_and_returns_new_token(self):
         token = "0123456789ABCDEF:FEDCBA9876543210"
         new_token = "1111111111111111:2222222222222222"
