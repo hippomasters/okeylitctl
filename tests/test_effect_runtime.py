@@ -92,6 +92,48 @@ class CASBackend:
 
 
 class EffectRuntimeSchedulingTests(unittest.TestCase):
+    def test_stop_uses_bounded_stop_snapshot_without_changing_frame_snapshot(self):
+        class StopBackend(CASBackend):
+            stop_reads = 0
+            frame_reads = 0
+
+            def snapshot(self):
+                self.frame_reads += 1
+                return super().snapshot()
+
+            def stop_snapshot(self):
+                self.stop_reads += 1
+                return super().snapshot()
+
+        backend = StopBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE), rate_hz=5)
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        self.assertEqual((backend.frame_reads, backend.stop_reads), (1, 0))
+        self.assertTrue(runtime.stop())
+        self.assertEqual((backend.frame_reads, backend.stop_reads), (1, 1))
+        self.assertEqual(backend.writes[-1], BASE.to_wire())
+
+    def test_reports_completed_frame_io_and_real_write_spacing_without_changing_cadence(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE), rate_hz=2.0)
+        runtime.start(now=0.0)
+        self.assertIsNone(runtime.last_io_duration)
+        self.assertIsNone(runtime.last_write_spacing)
+        with mock.patch("okeylitctl.effect_runtime.monotonic",
+                        side_effect=(10.0, 10.2, 10.7, 10.9)):
+            self.assertTrue(runtime.tick(now=0.0))
+            self.assertAlmostEqual(runtime.last_io_duration, 0.2)
+            self.assertIsNone(runtime.last_write_spacing)
+            self.assertAlmostEqual(runtime.next_due, 0.7)
+            self.assertTrue(runtime.tick(now=0.7))
+        self.assertAlmostEqual(runtime.last_io_duration, 0.2)
+        self.assertAlmostEqual(runtime.last_write_spacing, 0.7)
+        self.assertAlmostEqual(runtime.next_due, 1.4)
+        runtime.start(now=2.0)
+        self.assertIsNone(runtime.last_io_duration)
+        self.assertIsNone(runtime.last_write_spacing)
+
     def test_next_deadline_is_measured_from_completed_write(self):
         backend = RecordingBackend()
         runtime = EffectRuntime(

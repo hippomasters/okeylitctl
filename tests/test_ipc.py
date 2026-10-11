@@ -71,6 +71,14 @@ class IPCTests(unittest.TestCase):
             "original": ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"],
         })
 
+    def test_stop_snapshot_uses_bounded_wait_packet_and_same_schema(self):
+        response = (b"OK 0123456789ABCDEF:FEDCBA9876543210 on "
+                    b"111111,222222,333333,444444 AAAAAA,BBBBBB,CCCCCC,DDDDDD\n")
+        result, requests = self.exchange(lambda backend: backend.stop_snapshot(), response)
+        self.assertEqual(requests, [b"2 STOPSHOT\n"])
+        self.assertEqual(result["state"], "on")
+        self.assertEqual(result["token"], "0123456789ABCDEF:FEDCBA9876543210")
+
     def test_cas_sends_expected_and_desired_wire_and_returns_new_token(self):
         token = "0123456789ABCDEF:FEDCBA9876543210"
         new_token = "1111111111111111:2222222222222222"
@@ -148,6 +156,12 @@ class IPCTests(unittest.TestCase):
         )
         self.assertIsNone(result)
         self.assertEqual(requests, [b"1 SET ABCDEF,123456,000000,FFFFFF\n"])
+
+    def test_power_off_set_conflict_is_definite_without_unknown_outcome(self):
+        with self.assertRaises(ConflictError) as caught:
+            self.exchange(lambda backend: backend.write_colors(
+                "ABCDEF,123456,000000,FFFFFF"), b"ERR CONFLICT\n")
+        self.assertNotIn("uncertain", str(caught.exception))
 
     def test_restore_sends_one_packet(self):
         result, requests = self.exchange(lambda backend: backend.restore(), b"OK\n")

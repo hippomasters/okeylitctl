@@ -110,6 +110,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(launched), 1)
         self.assertIsInstance(launched[0], IPCBackend)
 
+    def test_staged_rate_selects_only_explicit_diagnostic_setting(self):
+        for rate in (2,):
+            with self.subTest(rate=rate), patch("okeylitctl.tui.CursesTui") as tui:
+                code = main(["tui", "--test-rate-hz", str(rate)], backend=FakeBackend(),
+                            stdout=io.StringIO(), stderr=io.StringIO())
+                self.assertEqual(code, 0)
+                self.assertEqual(tui.call_args.kwargs["test_rate_hz"], rate)
+                tui.return_value.run.assert_called_once_with()
+
+    def test_invalid_staged_rate_is_rejected_without_device_access(self):
+        for rate in ("3", "4", "5", "6", "0", "nan"):
+            with self.subTest(rate=rate):
+                backend = FakeBackend()
+                backend.status = lambda: self.fail("invalid test rate accessed device")
+                err = io.StringIO()
+                self.assertEqual(main(["tui", "--test-rate-hz", rate], backend=backend,
+                                      stdout=io.StringIO(), stderr=err), 2)
+                self.assertIn("invalid", err.getvalue())
+
+    def test_injected_runner_cannot_silently_ignore_diagnostic_rate(self):
+        backend = FakeBackend()
+        launched = []
+        err = io.StringIO()
+        self.assertEqual(main(["tui", "--test-rate-hz", "2"], backend=backend,
+                              stdout=io.StringIO(), stderr=err,
+                              tui_runner=launched.append), 2)
+        self.assertEqual(launched, [])
+        self.assertIn("built-in", err.getvalue())
+
     def test_broker_error_retains_cli_exit_code_without_success_output(self):
         from test_ipc import BrokerFixture
 

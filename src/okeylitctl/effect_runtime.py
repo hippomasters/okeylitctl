@@ -36,6 +36,9 @@ class EffectRuntime:
     # from a matching layout after a lost acknowledgement or another client's write.
     owned_token: str | None = field(default=None, init=False)
     ownership_lost: bool = field(default=False, init=False)
+    last_io_duration: float | None = field(default=None, init=False)
+    last_write_spacing: float | None = field(default=None, init=False)
+    _last_write_completed_at: float | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not isfinite(self.rate_hz) or not 0.0 < self.rate_hz <= 5.0:
@@ -56,6 +59,16 @@ class EffectRuntime:
         self.attempted_frame = None
         self.owned_token = None
         self.ownership_lost = False
+        self.last_io_duration = None
+        self.last_write_spacing = None
+        self._last_write_completed_at = None
+
+    def _record_completed_write(self, started: float, completed: float) -> None:
+        """Expose measured I/O and frame spacing without weakening the rate ceiling."""
+        self.last_io_duration = max(0.0, completed - started)
+        if self._last_write_completed_at is not None:
+            self.last_write_spacing = max(0.0, completed - self._last_write_completed_at)
+        self._last_write_completed_at = completed
 
     @property
     def _uses_cas(self) -> bool:
@@ -70,6 +83,10 @@ class EffectRuntime:
         # particular, never claim that the base has been restored.
         self.last_written = None
 
+    def _stop_snapshot(self) -> dict[str, object]:
+        stop_snapshot = getattr(self.backend, "stop_snapshot", None)
+        return stop_snapshot() if callable(stop_snapshot) else self.backend.snapshot()
+
     def _cas_stop(self) -> bool:
         if self.ownership_lost:
             return False
@@ -80,7 +97,7 @@ class EffectRuntime:
             if (self.attempted_frame != self.spec.base
                     or self.owned_token is None or self.last_written is None):
                 return False
-            snapshot = self.backend.snapshot()
+            snapshot = self._stop_snapshot()
             if snapshot.get("state") != "on":
                 self.observed_power_off = True
                 return False
@@ -94,7 +111,7 @@ class EffectRuntime:
             return False  # Reconciliation never writes in the same Stop action.
         if self.owned_token is None or self.last_written is None:
             return False
-        snapshot = self.backend.snapshot()
+        snapshot = self._stop_snapshot()
         if snapshot.get("state") != "on":
             self.observed_power_off = True
             self._lose_ownership()
@@ -248,6 +265,7 @@ class EffectRuntime:
                 raise
             if wrote:
                 io_completed = monotonic()
+                self._record_completed_write(io_started, io_completed)
                 self.next_due = now + max(0.0, io_completed - io_started) + self.interval
             return wrote
         try:
@@ -282,5 +300,6 @@ class EffectRuntime:
         if event_expired:
             self.event = None
         io_completed = monotonic()
+        self._record_completed_write(io_started, io_completed)
         self.next_due = now + max(0.0, io_completed - io_started) + self.interval
         return True

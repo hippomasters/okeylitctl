@@ -45,10 +45,39 @@ class BrokerIntegration(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #ifndef BROKER_TEST_ROOT
 #error "fake kernel must be built for the fake root"
 #endif
+static void trace_wmi(char kind) {
+    const char *log = getenv("BROKER_WMI_TRACE");
+    if (!log) return;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
+    int fd = open(log, O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (fd < 0) return;
+    char line[64];
+    int n = snprintf(line, sizeof(line), "%lld %c\n",
+                     (long long)now.tv_sec * 1000000000LL + now.tv_nsec, kind);
+    syscall(SYS_write, fd, line, n);
+    close(fd);
+}
+static char attribute_kind(int fd) {
+    char link[64], path[512];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t size = readlink(link, path, sizeof(path) - 1);
+    if (size < 0) return 0;
+    path[size] = 0;
+    if (!strcmp(path, BROKER_TEST_ROOT "/colors")) return 'C';
+    if (!strcmp(path, BROKER_TEST_ROOT "/state")) return 'S';
+    return 0;
+}
+ssize_t read(int fd, void *buf, size_t len) {
+    ssize_t n = syscall(SYS_read, fd, buf, len);
+    if (n > 0 && attribute_kind(fd)) trace_wmi(attribute_kind(fd));
+    return n;
+}
 ssize_t write(int fd, const void *buf, size_t len) {
     ssize_t n = syscall(SYS_write, fd, buf, len);
     const char *mode = getenv("BROKER_FAKE_KERNEL");
@@ -58,6 +87,11 @@ ssize_t write(int fd, const void *buf, size_t len) {
     ssize_t size = readlink(link, path, sizeof(path) - 1);
     if (size < 0) return n;
     path[size] = 0;
+    if ((!strcmp(path, BROKER_TEST_ROOT "/colors") ||
+         !strcmp(path, BROKER_TEST_ROOT "/restore")) && n == (ssize_t)len) {
+        trace_wmi('I'); /* kernel colors_store/restore_store pre-read */
+        trace_wmi('I'); /* kernel post-write verification read */
+    }
     if (!strcmp(mode, "restore") && !strcmp(path, BROKER_TEST_ROOT "/restore")) {
         int source = open(BROKER_TEST_ROOT "/original", O_RDONLY | O_NOFOLLOW);
         int target = open(BROKER_TEST_ROOT "/colors", O_WRONLY | O_NOFOLLOW);
@@ -104,10 +138,12 @@ ssize_t write(int fd, const void *buf, size_t len) {
         self.launch_broker()
         self.addCleanup(self.stop)
 
-    def launch_broker(self, fake_mode=None):
+    def launch_broker(self, fake_mode=None, trace=None):
         fd = self.listener.fileno()
         command = f"exec 3<&{fd}; LISTEN_PID=$$ exec {shlex.quote(str(self.binary))}"
         env = dict(os.environ, LISTEN_FDS="1")
+        if trace is not None:
+            env["BROKER_WMI_TRACE"] = str(trace)
         if fake_mode is not None:
             preload = str(self.fake_kernel)
             if os.environ.get("BROKER_SANITIZE") == "1":
@@ -121,10 +157,20 @@ ssize_t write(int fd, const void *buf, size_t len) {
         # No fixed sleeps: wait until the process has inherited its listener.
         self.assertIsNone(self.proc.poll(), self.proc.stderr.read() if self.proc.poll() is not None else "")
 
-    def restart_with_fake_kernel(self, mode):
+    def restart_with_fake_kernel(self, mode, trace=None):
         self.proc.terminate()
         self.proc.communicate(timeout=2)
-        self.launch_broker(mode)
+        self.launch_broker(mode, trace=trace)
+
+    def wmi_trace(self):
+        trace = pathlib.Path(self.tmp.name) / "wmi-trace"
+        trace.write_text("")
+        self.restart_with_fake_kernel("trace", trace=trace)
+        return trace
+
+    def observed_wmi(self, trace):
+        return [(int(timestamp), kind) for timestamp, kind in
+                (line.split() for line in trace.read_text().splitlines())]
 
     def stop(self):
         if self.proc.poll() is None:
@@ -232,6 +278,20 @@ ssize_t write(int fd, const void *buf, size_t len) {
         self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
         self.assertEqual(self.snapshot()[0], token)
 
+    def test_set_refuses_power_off_without_write_or_token_invalidation(self):
+        token = self.snapshot()[0]
+        self.put("state", b"off\n")
+
+        self.assertEqual(self.request(b"1 SET " + ALT + b"\n"), b"ERR CONFLICT\n")
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        self.assertEqual(self.snapshot()[0], token)
+
+    def test_restore_refuses_power_off_without_touching_restore_attribute(self):
+        self.put("state", b"off\n")
+        self.assertEqual(self.request(b"1 RESTORE\n"), b"ERR CONFLICT\n")
+        self.assertEqual((self.root / "restore").read_bytes(), b"")
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+
     def test_malformed_version_two_requests_never_write(self):
         token = b"A" * 16 + b":" + b"0" * 16
         valid = b"2 CAS " + token + b" on " + BASE + b" " + ALT + b"\n"
@@ -244,11 +304,68 @@ ssize_t write(int fd, const void *buf, size_t len) {
                 self.assertEqual(self.request(packet), b"ERR INVALID\n")
                 self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
 
-    def test_five_hz_snapshots_and_cas_sustain_verified_updates(self):
+    def test_snapshot_cas_reserves_all_seven_firmware_reads(self):
+        trace = self.wmi_trace()
+        token = self.snapshot()[0]
+        self.assertTrue(self.cas(token).startswith(b"OK "))
+        self.assertEqual([kind for _, kind in self.observed_wmi(trace)],
+                         ["C", "S", "S", "C", "I", "I", "C"])
+        for _ in range(2):
+            token = self.snapshot()[0]
+            current = (self.root / "colors").read_bytes().strip()
+            desired = BASE if current == ALT else ALT
+            self.assertTrue(self.cas(token, expected=current, desired=desired).startswith(b"OK "))
+        token = self.snapshot()[0]
+        current = (self.root / "colors").read_bytes().strip()
+        desired = BASE if current == ALT else ALT
+        reply = self.cas(token, expected=current, desired=desired)
+        self.assertRegex(reply, rb"\A(?:OK [0-9A-F]{16}:[0-9A-F]{16}|ERR BUSY)\n\Z")
+        events = self.observed_wmi(trace)
+        if reply.startswith(b"OK "):
+            self.assertEqual(len(events), 28)
+        else:
+            # Deadline may expire after admission and one or both CAS checks.
+            self.assertGreaterEqual(len(events), 23)
+            self.assertLessEqual(len(events), 25)
+        for timestamp, _ in events:
+            self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                     for at, _ in events), 25)
+
+    def test_competing_status_cannot_spend_cas_kernel_and_readback_reserve(self):
+        trace = self.wmi_trace()
+        token = self.snapshot()[0]
+        for _ in range(4):
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        self.assertEqual(self.request(b"1 STATUS\n"), b"ERR BUSY\n")
+        self.assertTrue(self.cas(token).startswith(b"OK "))
+        self.assertEqual(len(self.observed_wmi(trace)), 15)
+
+    def test_stop_waits_for_status_capacity_then_conditionally_restores(self):
+        trace = self.wmi_trace()
+        token = self.snapshot()[0]
+        self.assertTrue(self.cas(token).startswith(b"OK "))
+        self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        time.sleep(0.3)
+        for _ in range(3):
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        began = time.monotonic()
+        response = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(response.startswith(b"OK "), response)
+        self.assertGreaterEqual(time.monotonic() - began, 0.55)
+        stop_token = response.split(b" ")[1]
+        self.assertTrue(self.cas(stop_token, expected=ALT, desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
+        self.assertEqual(len(events), 22)  # first CAS cycle, four STATUS, Stop
+        for timestamp, _ in events:
+            self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                     for at, _ in events), 25)
+
+    def test_two_hz_snapshots_and_cas_sustain_verified_updates(self):
         start = time.monotonic()
         expected, desired = BASE, ALT
         for step in range(6):
-            target = start + step * 0.21
+            target = start + step * 0.51
             if target > time.monotonic():
                 time.sleep(target - time.monotonic())
             token, state, colors, _ = self.snapshot()
@@ -258,12 +375,51 @@ ssize_t write(int fd, const void *buf, size_t len) {
             expected, desired = desired, expected
         self.assertEqual((self.root / "colors").read_bytes(), expected + b"\n")
 
-    def test_five_hz_legacy_status_and_cas_keep_readback_budget(self):
+    def test_two_hz_stop_snapshot_restores_with_cas(self):
+        trace = self.wmi_trace()
+        start = time.monotonic()
+        expected, desired = BASE, ALT
+        for step in range(5):
+            target = start + step * 0.51
+            if target > time.monotonic():
+                time.sleep(target - time.monotonic())
+            token, state, colors, _ = self.snapshot()
+            self.assertEqual((state, colors), (b"on", expected))
+            reply = self.cas(token, expected=expected, desired=desired)
+            self.assertRegex(reply, rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+            expected, desired = desired, expected
+        began = time.monotonic()
+        response = self.request(b"2 STOPSHOT\n")
+        match = re.fullmatch(rb"OK ([0-9A-F]{16}:[0-9A-F]{16}) on (" +
+                             ALT + rb") " + BASE + rb"\n", response)
+        self.assertIsNotNone(match, response)
+        self.assertLess(time.monotonic() - began, 1.0)
+        reply = self.cas(match.group(1), expected=ALT, desired=BASE)
+        self.assertRegex(reply, rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
+        self.assertEqual(len(events), 52)  # five frames, competing STATUS, Stop
+        for timestamp, _ in events:
+            self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                     for at, _ in events), 25)
+
+    def test_stop_snapshot_does_not_restore_after_competing_write(self):
+        token = self.snapshot()[0]
+        self.assertTrue(self.cas(token).startswith(b"OK "))
+        response = self.request(b"2 STOPSHOT\n")
+        stop_token = response.split(b" ")[1]
+        self.assertEqual(self.request(b"1 SET " + BASE + b"\n"), b"OK\n")
+        self.assertEqual(self.cas(stop_token, expected=ALT, desired=BASE),
+                         b"ERR CONFLICT\n")
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+
+    def test_two_hz_legacy_status_and_cas_keep_readback_budget(self):
         expected, desired = BASE, ALT
         token = self.snapshot()[0]
         start = time.monotonic()
         for step in range(6):
-            target = start + (step + 1) * 0.21
+            target = start + (step + 1) * 0.51
             if target > time.monotonic():
                 time.sleep(target - time.monotonic())
             self.assertEqual(self.request(b"1 STATUS\n"),
@@ -291,14 +447,18 @@ ssize_t write(int fd, const void *buf, size_t len) {
             self.assertEqual(client.recv(256), b"ERR CONFLICT\n")
         self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
 
-    def test_off_state_cas_and_uncertain_cas_invalidate_token(self):
+    def test_off_state_cas_refuses_write_without_invalidating_token(self):
         self.put("state", b"off\n")
         token, state, _, _ = self.snapshot()
         self.assertEqual(state, b"off")
-        self.assertTrue(self.cas(token, state=b"off").startswith(b"OK "))
+        self.assertEqual(self.cas(token, state=b"off"), b"ERR CONFLICT\n")
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        self.assertEqual(self.snapshot()[0], token)
+
+    def test_uncertain_cas_invalidates_token(self):
         self.restart_with_fake_kernel("mismatch")
         token = self.snapshot()[0]
-        self.assertEqual(self.cas(token, state=b"off", expected=ALT, desired=ALT),
+        self.assertEqual(self.cas(token),
                          b"ERR IO\n")
         self.assertNotEqual(self.snapshot()[0], token)
 
@@ -449,10 +609,10 @@ ssize_t write(int fd, const void *buf, size_t len) {
         self.assertEqual(self.request(b"1 SET " + ALT + b"\n"), b"OK\n")
         self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
 
-    def test_five_hz_status_and_set_sustain_verified_updates(self):
+    def test_two_hz_status_and_set_sustain_verified_updates(self):
         start = time.monotonic()
         for step in range(6):
-            target = start + step * 0.21
+            target = start + step * 0.51
             if target > time.monotonic():
                 time.sleep(target - time.monotonic())
             self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "), step)

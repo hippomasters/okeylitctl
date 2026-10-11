@@ -465,6 +465,7 @@ class FakeBackend:
 
     def write_colors(self, value):
         self.writes.append(value)
+        self.status_value["colors"] = value.split(",")
 
     def restore(self):
         self.restores += 1
@@ -718,7 +719,7 @@ class TuiDeviceActionTests(unittest.TestCase):
 
             def status(self):
                 self.reads += 1
-                if self.reads == 3:
+                if self.reads == 4:
                     self.status_value["colors"][0] = "999999"
                 return self.status_value
 
@@ -2013,11 +2014,12 @@ class TuiDeviceActionTests(unittest.TestCase):
     def test_running_effect_locks_editor_mutations_until_stop(self):
         backend = FakeBackend()
         app = CursesTui(backend, profile_store=FakeProfileStore())
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
 
         class ScriptedScreen:
             def __init__(self):
                 self.keys = iter(
-                    (9, 9, 9, 9, 9, ord("a"), 9, ord("+"), ord("s"), ord("q"))
+                    (ord("a"), ord("+"), ord("s"), ord("q"))
                 )
 
             def keypad(self, _enabled):
@@ -2156,7 +2158,7 @@ class TuiDeviceActionTests(unittest.TestCase):
         self.assertEqual(backend.writes, ["A1B2C3,222222,333333,444444"])
         self.assertFalse(app.state.dirty)
 
-    def test_cancelled_restore_and_dirty_quit_never_change_firmware(self):
+    def test_cancelled_dirty_quit_never_changes_firmware(self):
         backend = FakeBackend()
         app = CursesTui(backend, profile_store=FakeProfileStore())
         app.state.set_selected_color("A1B2C3")
@@ -2165,8 +2167,6 @@ class TuiDeviceActionTests(unittest.TestCase):
             def __init__(self):
                 self.keys = iter(
                     (
-                        ord("o"),
-                        ord("n"),
                         ord("q"),
                         ord("n"),
                         ord("q"),
@@ -3241,6 +3241,53 @@ class TuiDeviceActionTests(unittest.TestCase):
 
         self.assertEqual(backend.writes, [])
         self.assertIn("No unapplied", app.state.message)
+
+    def test_apply_rechecks_power_and_preserves_draft_when_device_turned_off(self):
+        backend = FakeBackend()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        draft, current, original = app.state.draft, app.state.current, app.state.original
+        backend.status_value["state"] = "off"
+
+        app._apply()
+
+        self.assertEqual(backend.writes, [])
+        self.assertEqual((app.state.draft, app.state.current, app.state.original),
+                         (draft, current, original))
+        self.assertEqual(app.power_state, "off")
+        self.assertFalse(app.state.live_unknown)
+        self.assertIn("power off", app.state.message.lower())
+
+    def test_apply_power_off_after_write_retains_unknown_and_draft(self):
+        class PowerOffOnWrite(FakeBackend):
+            def write_colors(self, value):
+                super().write_colors(value)
+                self.status_value["state"] = "off"
+
+        backend = PowerOffOnWrite()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        draft, current = app.state.draft, app.state.current
+
+        app._apply()
+
+        self.assertEqual(len(backend.writes), 1)
+        self.assertEqual(app.power_state, "off")
+        self.assertTrue(app.state.live_unknown)
+        self.assertEqual((app.state.draft, app.state.current), (draft, current))
+        app._apply()
+        self.assertEqual(len(backend.writes), 1)
+
+    def test_apply_invalid_prewrite_status_enters_read_only_unknown_lock(self):
+        backend = FakeBackend()
+        app = CursesTui(backend)
+        app.state.set_selected_color("ABCDEF")
+        backend.status_value["state"] = "bad"
+        app._apply()
+        self.assertEqual(backend.writes, [])
+        self.assertTrue(app.state.live_unknown)
+        self.assertEqual(app.power_state, "unknown")
+        self.assertTrue(app.state.dirty)
 
     def test_restore_refuses_to_write_when_original_is_already_active(self):
         backend = FakeBackend(same_as_original=True)

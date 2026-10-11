@@ -239,8 +239,12 @@ def handle_key(
 class CursesTui:
     """Interactive adapter; all editing remains local until Apply."""
 
-    def __init__(self, backend: SysfsBackend, profile_store: ProfileStore | None = None):
+    def __init__(self, backend: SysfsBackend, profile_store: ProfileStore | None = None,
+                 *, test_rate_hz: int | None = None):
+        if test_rate_hz not in (None, 2):
+            raise ValueError("test_rate_hz must be 2; higher rates exceed the provisional WMI budget")
         self.backend = backend
+        self.test_rate_hz = test_rate_hz
         self.profile_store = profile_store or ProfileStore()
         self.power_state = "unknown"
         self.colors_enabled = False
@@ -377,6 +381,10 @@ class CursesTui:
                 if key == -1:
                     continue
                 if key == curses.KEY_RESIZE:
+                    try:
+                        screen.clearok(True)
+                    except (AttributeError, curses.error):
+                        pass
                     continue
                 try:
                     height, width = screen.getmaxyx()
@@ -394,6 +402,9 @@ class CursesTui:
                 if self.state.live_unknown and key not in (ord("r"), ord("q"), ord("?"), 27):
                     self.state.message = "Live unknown; press R to verify before another write"
                     continue
+                if key in (9, curses.KEY_BTAB) and self.effect_runtime is not None:
+                    if not self._stop_effect():
+                        continue
                 if self.state.effect_running and actions_enabled and key == ord("v"):
                     handle_key(self.state, key, actions_enabled=True)
                     continue
@@ -412,6 +423,13 @@ class CursesTui:
                     key,
                     actions_enabled=actions_enabled,
                 )
+                if key in (9, curses.KEY_BTAB):
+                    if self.state.effect_kind is EffectKind.STATIC:
+                        if self.state.dirty:
+                            self._apply()
+                    else:
+                        self._start_effect(now=monotonic())
+                    continue
                 if command is TuiCommand.QUIT:
                     if self.state.dirty:
                         if not self._confirm_action(screen, "Quit?"):
@@ -435,10 +453,7 @@ class CursesTui:
                         self._cleanup_after_terminal_failure()
                         return
                 elif command is TuiCommand.RESTORE:
-                    if self._confirm_action(screen, "Restore the original module layout?"):
-                        self._restore()
-                    else:
-                        self.state.message = "Restore cancelled"
+                    self._restore()
                 elif command is TuiCommand.REFRESH:
                     self._refresh()
                 elif command is TuiCommand.EDIT:
@@ -603,8 +618,13 @@ class CursesTui:
         if role in {"modal_border", "modal_title", "modal_input", "modal_shortcut"}:
             base = curses.color_pair(1) if self.colors_enabled else 0
             return base | curses.A_BOLD
-        if role in {"modal_fill", "modal_swatch_live", "modal_swatch_new"}:
+        if role == "modal_fill":
+            return 0
+        if role in {"modal_swatch_live", "modal_swatch_new"}:
             return curses.A_REVERSE
+        if role == "profile_delete_prompt":
+            base = curses.color_pair(1) if self.colors_enabled else 0
+            return base | curses.A_BOLD
         if role == "modal_ready":
             base = curses.color_pair(3) if self.colors_enabled else 0
             return base | curses.A_BOLD
@@ -772,7 +792,7 @@ class CursesTui:
             "1–4 / ← →    Select a named keyboard zone",
             "↑ ↓           Select red, green, or blue channel",
             "+ -           Adjust the selected RGB channel by one",
-            "Tab / Shift-Tab  Select next or previous effect",
+            "Tab / Shift-Tab  Select and activate next or previous effect",
             "[ ]           Adjust effect speed",
             "{ }           Adjust effect light",
             "D             Reverse effect direction",
@@ -781,12 +801,12 @@ class CursesTui:
             "P             Cycle curated local presets",
             "M             Open the local profile manager",
             "A             Apply and verify the complete layout immediately",
-            "O             Confirm restoration of the original layout",
+            "O             Restore the original layout immediately",
             "X             Discard unapplied local edits",
             "R             Refresh from the device (blocked while dirty)",
             "Q             Quit; dirty drafts require confirmation",
             "",
-            "No color-picker movement writes firmware. Apply is always explicit.",
+            "Tab activates effects; color editing remains local until Apply.",
             "Press ? or Esc to close",
         )
         box_width = min(72, width - 6)
@@ -1175,13 +1195,28 @@ class CursesTui:
         if self.state.live_unknown:
             self.state.message = "Live unknown; press R to verify before another write"
             return False
+        if self.state.effect_ownership_lost or self.state.live_last_observed:
+            self.state.message = "Effect ownership not established; refresh before starting"
+            return False
         if self.state.effect_running:
             self.state.message = "Effect is already running"
+            return False
+        try:
+            power = self.backend.status()["state"]
+            if power not in ("on", "off"):
+                raise ValidationError("device state must be on or off")
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            self.power_state = "unknown"
+            self.state.message = f"Effect status unavailable: {exc}"
+            return False
+        self.power_state = power
+        if power == "off":
+            self.state.message = "Effect unavailable: power off"
             return False
         runtime = EffectRuntime(
             backend=self.backend,
             spec=self.state.effect_spec,
-            rate_hz=2.0,
+            rate_hz=float(self.test_rate_hz or 2),
         )
         runtime.start(now=monotonic() if now is None else now)
         self.effect_runtime = runtime
@@ -1190,7 +1225,12 @@ class CursesTui:
         self.state.effect_frame_uncertain = False
         self.state.effect_restore_pending = False
         self.state.effect_ownership_lost = False
-        self.state.message = f"{self.state.effect_kind.value} effect started at 2 Hz"
+        self.state.message = (
+            f"{self.state.effect_kind.value} effect started at "
+            f"{runtime.rate_hz:g} Hz (provisional test)"
+            if self.test_rate_hz is not None else
+            f"{self.state.effect_kind.value} effect started at 2 Hz"
+        )
         return True
 
     def _reconcile_lost_effect_ownership(self) -> bool:
@@ -1273,6 +1313,13 @@ class CursesTui:
             self.state.effect_frame_uncertain = False
             self.state.effect_restore_pending = False
             self.state.live_last_observed = False
+            if self.test_rate_hz is not None and runtime.last_io_duration is not None:
+                spacing = ("spacing pending" if runtime.last_write_spacing is None else
+                           f"spacing {runtime.last_write_spacing * 1000:.0f}ms")
+                self.state.message = (
+                    f"TEST {self.test_rate_hz}Hz I/O "
+                    f"{runtime.last_io_duration * 1000:.0f}ms, {spacing}; S Stop"
+                )
         if runtime.ownership_lost:
             self.power_state = "off" if runtime.observed_power_off else self.power_state
             self.state.effect_running = True
@@ -1321,6 +1368,7 @@ class CursesTui:
                 and runtime.last_written != runtime.spec.base
             )
         )
+        stop_started = monotonic() if self.test_rate_hz is not None else None
         try:
             restored = runtime.stop()
         except SysfsError as exc:
@@ -1330,6 +1378,8 @@ class CursesTui:
             self.state.effect_restore_pending = needs_restore
             self.state.effect_frame_uncertain = needs_restore
             self.state.message = f"Effect base restoration is still pending: {exc}"
+            if stop_started is not None:
+                self.state.message += f"; Stop {(monotonic() - stop_started) * 1000:.0f}ms"
             return False
         except BaseException:
             # A CAS write can be accepted before the interrupt is delivered.
@@ -1368,6 +1418,8 @@ class CursesTui:
                 if restored
                 else "Effect stopped; verified base layout active"
             )
+            if stop_started is not None:
+                self.state.message += f"; Stop {(monotonic() - stop_started) * 1000:.0f}ms"
             self.effect_runtime = None
             self.state.effect_frame = None
             self.state.effect_frame_uncertain = False
@@ -1400,13 +1452,32 @@ class CursesTui:
             self.state.message = "No unapplied changes"
             return
         try:
+            power = self.backend.status()["state"]
+            if power not in ("on", "off"):
+                raise ValidationError("device state must be on or off")
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            self.power_state = "unknown"
+            self.state.live_unknown = True
+            self.state.message = f"Apply status unknown: {exc}; press R to verify"
+            return
+        self.power_state = power
+        if power == "off":
+            self.state.message = "Apply unavailable: power off; local draft preserved"
+            return
+        try:
             self.backend.write_colors(self.state.draft.to_wire())
+            verified = self.backend.status()
+            self.power_state = str(verified["state"])
+            if self.power_state != "on":
+                raise ValidationError("device power off during Apply readback")
+            if ColorLayout.from_wire(",".join(verified["colors"])) != self.state.draft:
+                raise ValidationError("applied colors no longer match the local draft")
             self.state.mark_applied()
             self.state.live_last_observed = False
         except ConflictError as exc:
             self.state.live_last_observed = True
             self.state.message = f"Apply not written (definite conflict): {exc}; press R to refresh"
-        except SysfsError as exc:
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
             self.state.live_unknown = True
             self.state.message = f"Apply outcome unknown: {exc}; press R to verify"
         except BaseException:
@@ -1671,6 +1742,8 @@ class CursesTui:
 def run_tui(
     backend: SysfsBackend | None = None,
     profile_store: ProfileStore | None = None,
+    *, test_rate_hz: int | None = None,
 ) -> None:
     """Load verified device state and start the curses application."""
-    CursesTui(backend or SysfsBackend(), profile_store=profile_store).run()
+    CursesTui(backend or SysfsBackend(), profile_store=profile_store,
+              test_rate_hz=test_rate_hz).run()

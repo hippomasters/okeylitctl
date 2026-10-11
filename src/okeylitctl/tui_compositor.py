@@ -139,7 +139,7 @@ def _draw_help_overlay(canvas: _Canvas, state: TuiState) -> None:
         "↑ ↓        select red, green, or blue channel",
         "+ -        adjust the selected Cycle control" if cycle else
         "+ -        adjust the selected RGB channel",
-        "Tab        select the next effect",
+        "Tab        select and activate the next effect",
         "V          switch the Color / Effects panel",
         "[ ]        adjust effect speed",
         "{ }        adjust effect light",
@@ -152,7 +152,7 @@ def _draw_help_overlay(canvas: _Canvas, state: TuiState) -> None:
         "M          open local profiles",
         "A          start an effect" if state.effect_kind is not EffectKind.STATIC else
         "A          apply and verify the complete layout",
-        "O          confirm restoration of the original layout",
+        "O          restore the original layout immediately",
         "X          discard unapplied edits",
         "R          refresh from the device (unless dirty)",
         "Q          quit; dirty drafts require confirmation",
@@ -823,7 +823,7 @@ def compose_narrow_editor(
     if effect.height < 4:
         canvas.put(effect.y + 1, effect.x + 2,
                    f"SPEED {round(state.effect_speed * 100)}%  LIGHT {round(state.effect_light * 100)}%  "
-                   f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}   Tab select effect", "muted")
+                   f"DIR {'L→R' if state.effect_direction == 1 else 'R→L'}   Tab start effect", "muted")
     else:
         columns = 4 if effect.height >= 6 else 8
         slot = (effect.width - 4) // columns
@@ -1007,12 +1007,12 @@ def compose_profiles(
     if pending_delete is not None:
         profiles_rect = PROFILES_LAYOUT.panel("profiles")
         prompt_width = profiles_rect.width - 6
-        canvas.put(33, profiles_rect.x + 3, "Delete profile?", "profile_error")
+        canvas.put(33, profiles_rect.x + 3, "Delete profile?", "profile_delete_prompt")
         canvas.put(
             34,
             profiles_rect.x + 3,
             pending_delete[:prompt_width],
-            "profile_error",
+            "profile_delete_prompt",
         )
         canvas.put(35, profiles_rect.x + 3, "Y confirm · N cancel", "profile_selected")
     footer = (
@@ -1068,8 +1068,8 @@ def compose_responsive_profiles(
     else:
         canvas.put(listing.y + 3, listing.x + 2, "No saved profiles", "muted")
     if pending_delete is not None:
-        canvas.put(listing.bottom - 4, listing.x + 2, "Delete profile?", "profile_error")
-        canvas.put(listing.bottom - 3, listing.x + 2, pending_delete, "profile_error")
+        canvas.put(listing.bottom - 4, listing.x + 2, "Delete profile?", "profile_delete_prompt")
+        canvas.put(listing.bottom - 3, listing.x + 2, pending_delete, "profile_delete_prompt")
         canvas.put(listing.bottom - 2, listing.x + 2, "Y confirm · N cancel", "profile_selected")
     elif preview_error:
         canvas.put(listing.bottom - 2, listing.x + 2,

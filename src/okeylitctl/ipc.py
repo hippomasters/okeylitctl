@@ -111,6 +111,8 @@ class IPCBackend:
 
     @staticmethod
     def _check_error(raw: bytes, *, mutation: bool = False) -> None:
+        if mutation and raw == b"ERR CONFLICT\n":
+            raise ConflictError("broker rejected write without mutation")
         if raw.startswith(b"ERR ") and raw.endswith(b"\n"):
             code = raw[4:-1]
             if code in _ERRORS:
@@ -133,7 +135,14 @@ class IPCBackend:
         }
 
     def snapshot(self) -> dict[str, object]:
-        raw = self._exchange(b"2 SNAPSHOT\n", mutation=False)
+        return self._snapshot(b"2 SNAPSHOT\n")
+
+    def stop_snapshot(self) -> dict[str, object]:
+        """Wait within the broker deadline for a Stop read slot, without writing."""
+        return self._snapshot(b"2 STOPSHOT\n")
+
+    def _snapshot(self, request: bytes) -> dict[str, object]:
+        raw = self._exchange(request, mutation=False)
         self._check_error(raw)
         match = _SNAPSHOT.fullmatch(raw)
         if match is None:

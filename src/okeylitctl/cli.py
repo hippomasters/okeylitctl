@@ -63,7 +63,9 @@ def _parser() -> argparse.ArgumentParser:
     profile_delete.add_argument("name", metavar="NAME")
 
     commands.add_parser("restore", help="restore colors saved when the module loaded")
-    commands.add_parser("tui", help="open the interactive four-zone workspace")
+    tui = commands.add_parser("tui", help="open the interactive four-zone workspace")
+    tui.add_argument("--test-rate-hz", type=int, choices=(2,),
+                     help="provisional effect-write rate for staged laptop validation (Hz)")
     return parser
 
 
@@ -201,8 +203,15 @@ def main(
             if tui_runner is None:
                 from .tui import run_tui
 
-                run_tui(backend, profile_store=profile_store)
+                if args.test_rate_hz is None:
+                    run_tui(backend, profile_store=profile_store)
+                else:
+                    run_tui(backend, profile_store=profile_store,
+                            test_rate_hz=args.test_rate_hz)
             else:
+                if args.test_rate_hz is not None:
+                    stderr.write(f"{APP_NAME}: --test-rate-hz requires the built-in TUI runner\n")
+                    return 2
                 tui_runner(backend)
         else:  # argparse requires a known subcommand; retain fail-closed behavior.
             parser.error("unknown command")

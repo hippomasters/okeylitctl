@@ -48,14 +48,20 @@
 #define REQUEST_MS 1000
 #define PENDING_MAX 16
 #define WRITE_LIMIT 5
-#define READ_LIMIT 25 /* 5Hz: two snapshots, two CAS checks, one verification */
-#define STATUS_READ_LIMIT 10 /* preserve room for verified writes */
-#define CAS_READ_LIMIT 10
+/* Provisional WMI GET ceiling, not a measured hardware-safe maximum.
+ * SNAPSHOT: colors + state = 2 GETs (original and ABI are cached sysfs).
+ * CAS: state + colors + kernel pre-read + kernel verification + broker
+ * readback = 5 GETs. A complete snapshot/CAS frame costs 7 GETs.
+ * Thus sustained 4/5 Hz cannot fit this 25 GET/s rolling ceiling.
+ */
+#define READ_LIMIT 25
+#define STATUS_READ_LIMIT 10 /* read-only clients cannot starve writes */
+#define CAS_READ_LIMIT 20
 #define WINDOW_MS 1000
 #define WIRE_LEN 27
 
 enum result { OK, INVALID, BUSY, MODULE, DENIED, IO, ABI, CONFLICT };
-enum read_kind { SNAPSHOT_READ, CAS_READ, VERIFY_READ };
+enum read_kind { SNAPSHOT_READ, CAS_READ };
 enum attribute { ABI_VERSION, COLORS, ORIGINAL, STATE, RESTORE };
 static const char *const attributes[] = {
     "abi_version", "colors", "original", "state", "restore"
@@ -139,7 +145,8 @@ static enum result reserve_slot(int64_t *times, size_t *count, size_t capacity)
     return OK;
 }
 
-/* Admit the whole STATUS pair atomically; reserve write verification separately. */
+/* Reserve all firmware-facing GETs before starting each operation, including
+ * the two GETs executed inside the kernel's colors_store/restore_store. */
 static enum result reserve_reads(size_t count, enum read_kind kind)
 {
     int64_t current = now_ms();
@@ -266,6 +273,57 @@ static enum result peer_present(int client)
     return peer.revents & (POLLHUP | POLLRDHUP | POLLERR | POLLNVAL) ? BUSY : OK;
 }
 
+/* Stop reconciliation may wait for capacity, but never bypass a rolling limit. */
+static enum result reserve_stop_reads(int64_t deadline, int client)
+{
+    for (;;) {
+        enum result result = check_deadline(deadline);
+        if (result != OK) return result;
+        result = reserve_reads(2, SNAPSHOT_READ);
+        if (result != BUSY) return result;
+        int64_t current = now_ms();
+        if (current < 0) return IO;
+        int64_t next = deadline;
+        if (read_count + 2 > READ_LIMIT && read_count > 0 &&
+            read_times[0] + WINDOW_MS < next)
+            next = read_times[0] + WINDOW_MS;
+        if (status_count + 2 > STATUS_READ_LIMIT && status_count > 0 &&
+            status_times[0] + WINDOW_MS < next)
+            next = status_times[0] + WINDOW_MS;
+        int wait = (int)(next - current);
+        if (wait < 1) wait = 1;
+        struct pollfd peer = { .fd = client, .events = POLLRDHUP };
+        if (poll(&peer, 1, wait) < 0 && errno != EINTR) return IO;
+        if (peer.revents & (POLLHUP | POLLRDHUP | POLLERR | POLLNVAL)) return BUSY;
+    }
+}
+
+/* Mutation admission waits only until the request deadline. The complete
+ * kernel pre-read, kernel verification and broker readback are prebooked. */
+static enum result reserve_mutation_reads(size_t count, int64_t deadline, int client)
+{
+    for (;;) {
+        enum result result = check_deadline(deadline);
+        if (result != OK) return result;
+        result = reserve_reads(count, CAS_READ);
+        if (result != BUSY) return result;
+        int64_t current = now_ms();
+        if (current < 0) return IO;
+        int64_t next = deadline;
+        if (read_count + count > READ_LIMIT && read_count > 0 &&
+            read_times[0] + WINDOW_MS < next)
+            next = read_times[0] + WINDOW_MS;
+        if (cas_count + count > CAS_READ_LIMIT && cas_count > 0 &&
+            cas_times[0] + WINDOW_MS < next)
+            next = cas_times[0] + WINDOW_MS;
+        int wait = (int)(next - current);
+        if (wait < 1) wait = 1;
+        struct pollfd peer = { .fd = client, .events = POLLRDHUP };
+        if (poll(&peer, 1, wait) < 0 && errno != EINTR) return IO;
+        if (peer.revents & (POLLHUP | POLLRDHUP | POLLERR | POLLNVAL)) return BUSY;
+    }
+}
+
 static enum result reserve_write(int64_t deadline, int client)
 {
     for (;;) {
@@ -300,17 +358,22 @@ static enum result write_attribute(int root, const struct stat *st,
     if (result == OK) result = reserve_write(deadline, client);
     if (result == OK) result = check_deadline(deadline);
     if (result == OK) result = peer_present(client);
+    char state[READ_MAX + 1];
     if (result == OK && cas_token) {
-        char current_token[34], state[READ_MAX + 1], colors[READ_MAX + 1];
+        char current_token[34], colors[READ_MAX + 1];
         token_string(current_token);
         if (memcmp(cas_token, current_token, 33)) result = CONFLICT;
-        if (result == OK) result = reserve_reads(2, CAS_READ);
+        if (result == OK) result = reserve_mutation_reads(5, deadline, client);
         if (result == OK) result = read_state(root, st, state, deadline);
         if (result == OK) result = read_wire(root, st, COLORS, colors, deadline);
         if (result == OK && (strcmp(state, cas_state) ||
                             memcmp(colors, cas_expected, WIRE_LEN))) result = CONFLICT;
+    } else if (result == OK) {
+        result = reserve_mutation_reads(4, deadline, client);
+        if (result == OK) result = read_state(root, st, state, deadline);
     }
-    if (result == OK) result = reserve_reads(1, VERIFY_READ); /* before write */
+    if (result == OK && strcmp(state, "on")) result = CONFLICT;
+
     if (result == OK) result = check_deadline(deadline);
     if (result == OK) result = peer_present(client);
     if (result == OK) {
@@ -335,6 +398,7 @@ static enum result transact(const char *request, size_t length,
     bool set = length == 34 && memcmp(request, "1 SET ", 6) == 0 &&
                wire_valid(request + 6, WIRE_LEN) && request[33] == '\n';
     bool snapshot = length == 11 && memcmp(request, "2 SNAPSHOT\n", 11) == 0;
+    bool stop_snapshot = length == 11 && memcmp(request, "2 STOPSHOT\n", 11) == 0;
     bool cas = false;
     size_t state_length = 0, expected_offset = 0, desired_offset = 0;
     if ((length == 99 || length == 100) && memcmp(request, "2 CAS ", 6) == 0 &&
@@ -350,21 +414,22 @@ static enum result transact(const char *request, size_t length,
               wire_valid(request + desired_offset, WIRE_LEN) &&
               request[desired_offset + WIRE_LEN] == '\n';
     }
-    if (!status && !restore && !set && !snapshot && !cas) return INVALID;
+    if (!status && !restore && !set && !snapshot && !stop_snapshot && !cas) return INVALID;
 
     int root = -1;
     struct stat st;
     enum result result = open_root(&root, &st);
     if (result == OK) result = check_abi(root, &st, deadline);
     char expected[READ_MAX + 1], actual[READ_MAX + 1];
-    if (result == OK && (status || snapshot)) result = reserve_reads(2, SNAPSHOT_READ);
-    if (result == OK && (status || snapshot)) {
+    if (result == OK && stop_snapshot) result = reserve_stop_reads(deadline, client);
+    else if (result == OK && (status || snapshot)) result = reserve_reads(2, SNAPSHOT_READ);
+    if (result == OK && (status || snapshot || stop_snapshot)) {
         result = read_wire(root, &st, COLORS, actual, deadline);
         if (result == OK) result = read_wire(root, &st, ORIGINAL, expected, deadline);
         if (result == OK) {
             char state[READ_MAX + 1];
             result = read_state(root, &st, state, deadline);
-            if (result == OK && snapshot) {
+            if (result == OK && (snapshot || stop_snapshot)) {
                 char token[34];
                 token_string(token);
                 snprintf(response, 2 * READ_MAX + 16, "OK %s %.3s %.27s %.27s\n",

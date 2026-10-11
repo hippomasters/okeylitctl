@@ -59,6 +59,15 @@ class SysfsBackendTests(unittest.TestCase):
             "FF0000,00FF00,0000FF,FFFFFF\n",
         )
 
+    def test_power_off_rejects_color_write_before_opening_output(self):
+        (self.root / "state").write_text("off\n", encoding="ascii")
+        before = (self.root / "colors").read_bytes()
+        with mock.patch("okeylitctl.sysfs.os.write", wraps=os.write) as write:
+            with self.assertRaises(BackendIOError):
+                self.backend.write_colors("FF0000,00FF00,0000FF,FFFFFF")
+        write.assert_not_called()
+        self.assertEqual((self.root / "colors").read_bytes(), before)
+
     def test_rejects_short_write(self):
         with mock.patch("okeylitctl.sysfs.os.write", return_value=1):
             with self.assertRaises(BackendIOError):
