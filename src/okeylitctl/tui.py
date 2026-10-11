@@ -1373,7 +1373,7 @@ class CursesTui:
                     and runtime.last_cas_duration is not None else ""
                 )
                 self.state.message = (
-                    f"TEST {self.test_rate_hz}Hz; S Stop I/O "
+                    f"{self.test_rate_hz}Hz S Stop I/O "
                     f"{runtime.last_io_duration * 1000:.0f}ms {spacing}"
                     f"{start_spacing}{phase}"
                 )
