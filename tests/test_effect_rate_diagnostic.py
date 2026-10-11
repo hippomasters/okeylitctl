@@ -5,6 +5,7 @@ from unittest import mock
 
 from okeylitctl.effects import EffectKind
 from okeylitctl.tui import CursesTui
+from okeylitctl.tui_compositor import compose_narrow_editor
 from okeylitctl.sysfs import BackendIOError
 from test_tui import CasEffectBackend, FakeProfileStore
 
@@ -33,7 +34,7 @@ class RateDiagnosticTests(unittest.TestCase):
                 self.assertEqual(backend.started_rate, rate)
                 for frame in range(10):
                     with mock.patch("okeylitctl.effect_runtime.monotonic",
-                                    side_effect=(10.0 + frame, 10.01 + frame)):
+                                    side_effect=(10.0 + frame, 10.005 + frame, 10.007 + frame, 10.01 + frame)):
                         self.assertTrue(app._tick_effect(now=frame * 0.3, authorized=True))
                 self.assertFalse(app.state.effect_running)
                 self.assertIsNone(app.effect_runtime)
@@ -119,7 +120,7 @@ class RateDiagnosticTests(unittest.TestCase):
         self.assertTrue(app._start_effect(now=0.0))
         for frame in range(10):
             with mock.patch("okeylitctl.effect_runtime.monotonic",
-                            side_effect=(10.0 + frame, 10.01 + frame)):
+                            side_effect=(10.0 + frame, 10.005 + frame, 10.007 + frame, 10.01 + frame)):
                 app._tick_effect(now=frame * 0.3, authorized=True)
         self.assertIsNone(app.effect_runtime)
         self.assertFalse(app.state.effect_running)
@@ -167,7 +168,7 @@ class RateDiagnosticTests(unittest.TestCase):
                 runtime = app.effect_runtime
                 self.assertEqual(runtime.rate_hz, rate)
                 with mock.patch("okeylitctl.effect_runtime.monotonic",
-                                side_effect=(10.0, 10.1, 10.4, 10.5)):
+                                side_effect=(10.0, 10.04, 10.045, 10.1, 10.4, 10.44, 10.445, 10.5)):
                     self.assertTrue(app._tick_effect(now=0.0, authorized=True))
                     self.assertIn("I/O 100ms", app.state.message)
                     self.assertIn("spacing pending", app.state.message)
@@ -177,11 +178,68 @@ class RateDiagnosticTests(unittest.TestCase):
                     self.assertTrue(app._tick_effect(now=runtime.next_due,
                                                      authorized=True))
                 self.assertIn("spacing 400ms", app.state.message)
+                self.assertIn("start 400ms", app.state.message)
+                self.assertIn("snap 40ms", app.state.message)
+                self.assertIn("CAS 55ms", app.state.message)
                 self.assertAlmostEqual(runtime.next_due, 0.2 + 2 / rate)
                 self.assertEqual(len(backend.cas_writes), 2)
                 self.assertTrue(app._stop_effect())
+                self.assertIn("2 verified frames", app.state.message)
+                self.assertIn("2.5 verified/s", app.state.message)
+                screen = compose_narrow_editor(app.state, width=78, height=24,
+                                               power_state=app.power_state)
+                self.assertIn("2.5 verified/s", screen.lines[2])
                 self.assertEqual(len(backend.cas_writes), 3)
                 self.assertEqual(backend.cas_writes[-1], runtime.spec.base.to_wire())
+
+    def test_long_session_stop_summary_fits_78_columns(self):
+        app = CursesTui(CasEffectBackend(), profile_store=FakeProfileStore(),
+                        test_rate_hz=2)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        runtime = app.effect_runtime
+        # Model a long verified session without issuing 999 extra fake writes.
+        runtime.verified_frames = 1000
+        runtime._first_write_completed_at = 0.0
+        runtime._last_write_completed_at = 499.5
+        with mock.patch("okeylitctl.tui.monotonic", side_effect=(10.0, 11.0)):
+            self.assertTrue(app._stop_effect())
+        screen = compose_narrow_editor(app.state, width=78, height=24,
+                                       power_state=app.power_state)
+        self.assertIn("base restored", screen.lines[2].lower())
+        self.assertIn("Stop 1000ms", screen.lines[2])
+        self.assertIn("1000 verified frames", screen.lines[2])
+        self.assertIn("2.0 verified/s", screen.lines[2])
+
+    def test_opt_in_tick_shows_complete_stop_guidance_at_78_columns(self):
+        app = CursesTui(CasEffectBackend(), profile_store=FakeProfileStore(),
+                        test_rate_hz=2)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertTrue(app._start_effect(now=0.0))
+        with mock.patch("okeylitctl.effect_runtime.monotonic",
+                        side_effect=(10.0, 10.04, 10.045, 10.1,
+                                     10.4, 10.44, 10.445, 10.5)):
+            self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+            self.assertTrue(app._tick_effect(now=0.6, authorized=True))
+        screen = compose_narrow_editor(app.state, width=78, height=24,
+                                       power_state=app.power_state)
+        self.assertIn("S Stop", screen.lines[2])
+        self.assertIn("CAS 55ms", screen.lines[2])
+
+    def test_opt_in_slow_tick_keeps_stop_visible_at_78_columns(self):
+        app = CursesTui(CasEffectBackend(), profile_store=FakeProfileStore(),
+                        test_rate_hz=2)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertTrue(app._start_effect(now=0.0))
+        with mock.patch("okeylitctl.effect_runtime.monotonic",
+                        side_effect=(10.0, 10.04, 10.045, 11.1,
+                                     12.4, 12.44, 12.445, 13.5)):
+            self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+            self.assertTrue(app._tick_effect(now=2.0, authorized=True))
+        screen = compose_narrow_editor(app.state, width=78, height=24,
+                                       power_state=app.power_state)
+        self.assertIn("S Stop", screen.lines[2])
 
     def test_opt_in_stop_reports_elapsed_restoration_time(self):
         backend = CasEffectBackend()
