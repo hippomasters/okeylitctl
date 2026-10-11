@@ -239,6 +239,7 @@ class RateDiagnosticTests(unittest.TestCase):
             self.assertTrue(app._tick_effect(now=2.0, authorized=True))
         screen = compose_narrow_editor(app.state, width=78, height=24,
                                        power_state=app.power_state)
+        self.assertIn("CAS 1055ms", screen.lines[2])
         self.assertIn("S Stop", screen.lines[2])
 
     def test_opt_in_stop_reports_elapsed_restoration_time(self):
