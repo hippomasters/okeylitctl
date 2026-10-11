@@ -1,4 +1,4 @@
-ackaging/okeylitctl-broker-rate-campaign-3.service[Unit]
+[Unit]
 Description=OKeyLitCtl privileged lighting broker
 Requires=okeylitctl-broker.socket
 After=okeylitctl-broker.socket
