@@ -121,6 +121,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
     def setUp(self):
         self.root.chmod(0o755)
         (self.root / "rate-experiment-used").unlink(missing_ok=True)
+        (self.root / "rate-experiment-2-used").unlink(missing_ok=True)
         for name in ("abi_version", "colors", "original", "state", "restore"):
             path = self.root / name
             if path.is_symlink():
@@ -380,6 +381,14 @@ ssize_t write(int fd, const void *buf, size_t len) {
         self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR INVALID\n")
         self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR INVALID\n")
 
+    def test_campaign_two_lease_does_not_consume_legacy_stamp(self):
+        legacy = self.root / "rate-experiment-used"
+        legacy.write_bytes(b"prior trial")
+        self.start_diagnostic()
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"OK BURST\n")
+        self.assertEqual(legacy.read_bytes(), b"prior trial")
+        self.assertTrue((self.root / "rate-experiment-2-used").exists())
+
     def test_diagnostic_lease_cannot_be_rearmed_by_service_restart(self):
         self.start_diagnostic()
         self.assertEqual(self.request(b"2 BURST 4\n"), b"OK BURST\n")
@@ -428,12 +437,12 @@ ssize_t write(int fd, const void *buf, size_t len) {
                 self.proc.communicate(timeout=2)
                 self.binary = self.__class__.binary
                 self.launch_broker()
-                (self.root / "rate-experiment-used").unlink()
+                (self.root / "rate-experiment-2-used").unlink()
 
     def start_diagnostic(self):
         diagnostic = pathlib.Path(self.bin_tmp.name) / "diagnostic-broker"
         subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT",
+                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT", "-DBROKER_RATE_CAMPAIGN_2",
                         f'-DBROKER_TEST_ROOT="{self.root}"',
                         f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
                         str(REPO / "broker" / "main.c"), "-o", str(diagnostic)], check=True)
@@ -445,7 +454,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
     def test_explicit_diagnostic_broker_bounds_five_hz_and_preserves_stop(self):
         diagnostic = pathlib.Path(self.bin_tmp.name) / "diagnostic-broker"
         subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT",
+                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT", "-DBROKER_RATE_CAMPAIGN_2",
                         f'-DBROKER_TEST_ROOT="{self.root}"',
                         f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
                         str(REPO / "broker" / "main.c"), "-o", str(diagnostic)], check=True)
