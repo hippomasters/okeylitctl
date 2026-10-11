@@ -154,6 +154,10 @@ class IPCBackend:
 
     def _snapshot(self, request: bytes) -> dict[str, object]:
         raw = self._exchange(request, mutation=False)
+        if request == b"2 STOPSHOT\n" and raw == b"ERR INVALID\n":
+            # An installed pre-STOPSHOT broker can still provide the same
+            # token-bearing read through SNAPSHOT. Never retry a mutation.
+            return self.snapshot()
         self._check_error(raw)
         match = _SNAPSHOT.fullmatch(raw)
         if match is None:
