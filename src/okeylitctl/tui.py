@@ -1362,9 +1362,20 @@ class CursesTui:
             if self.test_rate_hz is not None and runtime.last_io_duration is not None:
                 spacing = ("spacing pending" if runtime.last_write_spacing is None else
                            f"spacing {runtime.last_write_spacing * 1000:.0f}ms")
+                start_spacing = (
+                    f" start {runtime.last_frame_start_spacing * 1000:.0f}ms"
+                    if runtime.last_frame_start_spacing is not None else ""
+                )
+                phase = (
+                    f" snap {runtime.last_snapshot_duration * 1000:.0f}ms"
+                    f" CAS {runtime.last_cas_duration * 1000:.0f}ms"
+                    if runtime.last_snapshot_duration is not None
+                    and runtime.last_cas_duration is not None else ""
+                )
                 self.state.message = (
-                    f"TEST {self.test_rate_hz}Hz I/O "
-                    f"{runtime.last_io_duration * 1000:.0f}ms, {spacing}; S Stop"
+                    f"TEST {self.test_rate_hz}Hz; S Stop I/O "
+                    f"{runtime.last_io_duration * 1000:.0f}ms {spacing}"
+                    f"{start_spacing}{phase}"
                 )
             if self.rate_experiment and self._experiment_frames >= 10:
                 self._experiment_auto_stop_attempted = True
@@ -1469,7 +1480,15 @@ class CursesTui:
                 else "Effect stopped; verified base layout active"
             )
             if stop_started is not None:
+                self.state.message = (
+                    "Base restored" if restored
+                    else "Base verified"
+                )
                 self.state.message += f"; Stop {(monotonic() - stop_started) * 1000:.0f}ms"
+                rate = runtime.effective_write_rate
+                self.state.message += f"; {runtime.verified_frames} verified frames"
+                if rate is not None:
+                    self.state.message += f", {rate:.1f} verified/s"
             self.effect_runtime = None
             self.state.effect_frame = None
             self.state.effect_frame_uncertain = False
