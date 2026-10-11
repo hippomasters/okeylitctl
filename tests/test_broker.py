@@ -122,6 +122,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
         self.root.chmod(0o755)
         (self.root / "rate-experiment-used").unlink(missing_ok=True)
         (self.root / "rate-experiment-2-used").unlink(missing_ok=True)
+        (self.root / "rate-experiment-3-used").unlink(missing_ok=True)
         for name in ("abi_version", "colors", "original", "state", "restore"):
             path = self.root / name
             if path.is_symlink():
@@ -389,6 +390,24 @@ ssize_t write(int fd, const void *buf, size_t len) {
         self.assertEqual(legacy.read_bytes(), b"prior trial")
         self.assertTrue((self.root / "rate-experiment-2-used").exists())
 
+    def test_campaign_three_isolated_from_both_consumed_campaigns(self):
+        prior = {name: self.root / name for name in
+                 ("rate-experiment-used", "rate-experiment-2-used")}
+        for stamp in prior.values():
+            stamp.write_bytes(b"consumed prior campaign")
+        self.start_diagnostic(campaign=3)
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"OK BURST\n")
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR BUSY\n")
+        self.assertTrue((self.root / "rate-experiment-3-used").exists())
+        self.assertTrue(all(p.read_bytes() == b"consumed prior campaign"
+                            for p in prior.values()))
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.launch_broker()
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR BUSY\n")
+        self.assertTrue(all(p.read_bytes() == b"consumed prior campaign"
+                            for p in prior.values()))
+
     def test_diagnostic_lease_cannot_be_rearmed_by_service_restart(self):
         self.start_diagnostic()
         self.assertEqual(self.request(b"2 BURST 4\n"), b"OK BURST\n")
@@ -439,10 +458,12 @@ ssize_t write(int fd, const void *buf, size_t len) {
                 self.launch_broker()
                 (self.root / "rate-experiment-2-used").unlink()
 
-    def start_diagnostic(self):
+    def start_diagnostic(self, campaign=2):
+        if campaign not in (2, 3):
+            raise ValueError("unknown diagnostic campaign")
         diagnostic = pathlib.Path(self.bin_tmp.name) / "diagnostic-broker"
         subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT", "-DBROKER_RATE_CAMPAIGN_2",
+                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT", f"-DBROKER_RATE_CAMPAIGN_{campaign}",
                         f'-DBROKER_TEST_ROOT="{self.root}"',
                         f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
                         str(REPO / "broker" / "main.c"), "-o", str(diagnostic)], check=True)
