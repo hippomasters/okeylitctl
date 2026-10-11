@@ -141,6 +141,17 @@ class IPCBackend:
         """Wait within the broker deadline for a Stop read slot, without writing."""
         return self._snapshot(b"2 STOPSHOT\n")
 
+    def start_rate_experiment(self, rate: int) -> None:
+        """Request the separately built, one-shot diagnostic broker lease."""
+        if type(rate) is not int or rate not in (4, 5):
+            raise ValidationError("rate experiment requires 4 or 5 Hz")
+        raw = self._exchange(f"2 BURST {rate}\n".encode("ascii"), mutation=False)
+        if raw == b"ERR INVALID\n":
+            raise BackendIOError("rate experiment needs an opt-in diagnostic broker")
+        self._check_error(raw)
+        if raw != b"OK BURST\n":
+            raise UnsupportedABI("malformed rate experiment acknowledgement")
+
     def _snapshot(self, request: bytes) -> dict[str, object]:
         raw = self._exchange(request, mutation=False)
         self._check_error(raw)

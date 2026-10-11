@@ -58,6 +58,19 @@ class IPCTests(unittest.TestCase):
                 fixture.close()
             return result, fixture.requests
 
+    def test_rate_experiment_requires_exact_broker_ack(self):
+        result, requests = self.exchange(
+            lambda backend: backend.start_rate_experiment(5), b"OK BURST\n")
+        self.assertIsNone(result)
+        self.assertEqual(requests, [b"2 BURST 5\n"])
+        for response in (b"ERR INVALID\n", b"OK\n", b"OK BURST extra\n"):
+            with self.subTest(response=response), self.assertRaises((BackendIOError, UnsupportedABI)):
+                self.exchange(lambda backend: backend.start_rate_experiment(4), response)
+
+    def test_rate_experiment_rejects_invalid_rate_without_broker_access(self):
+        with self.assertRaises(ValidationError):
+            IPCBackend().start_rate_experiment(3)
+
     def test_snapshot_uses_v2_packet_and_returns_token_plus_status(self):
         result, requests = self.exchange(
             lambda backend: backend.snapshot(),

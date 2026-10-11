@@ -60,6 +60,71 @@
 #define WINDOW_MS 1000
 #define WIRE_LEN 27
 
+/* Not built or installed by the normal broker target. One root-owned persistent
+ * stamp allows only one three-second lease across service restarts/reboots;
+ * deliberate root-only rearm requires a stopped socket and service. All GETs
+ * remain prebooked and verified. Stop falls back to bounded waiting at the
+ * ordinary ceiling after expiry. This is not a thermal safety claim. */
+#ifdef BROKER_RATE_EXPERIMENT
+#define MAX_READ_LIMIT 49
+#define MAX_STATUS_READ_LIMIT 16
+#define MAX_CAS_READ_LIMIT 35
+#define MAX_WRITE_LIMIT 7
+static int64_t burst_until;
+static bool burst_used;
+#ifdef BROKER_TESTING
+#define BURST_DIRECTORY DEVICE_ROOT
+#define BURST_STAMP "rate-experiment-used"
+#else
+/* StateDirectory in the service persists across broker restarts/reboots.
+ * Only an administrator may remove this stamp between separately reviewed rates. */
+#define BURST_DIRECTORY "/var/lib/okeylitctl-rate-experiment"
+#define BURST_STAMP "used"
+#endif
+static bool burst_active(int64_t current)
+{
+    return burst_used && current >= 0 && current < burst_until;
+}
+#else
+#define MAX_READ_LIMIT READ_LIMIT
+#define MAX_STATUS_READ_LIMIT STATUS_READ_LIMIT
+#define MAX_CAS_READ_LIMIT CAS_READ_LIMIT
+#define MAX_WRITE_LIMIT WRITE_LIMIT
+#endif
+
+static size_t read_limit(int64_t current)
+{
+    (void)current;
+#ifdef BROKER_RATE_EXPERIMENT
+    if (burst_active(current)) return MAX_READ_LIMIT;
+#endif
+    return READ_LIMIT;
+}
+static size_t status_limit(int64_t current)
+{
+    (void)current;
+#ifdef BROKER_RATE_EXPERIMENT
+    if (burst_active(current)) return MAX_STATUS_READ_LIMIT;
+#endif
+    return STATUS_READ_LIMIT;
+}
+static size_t cas_limit(int64_t current)
+{
+    (void)current;
+#ifdef BROKER_RATE_EXPERIMENT
+    if (burst_active(current)) return MAX_CAS_READ_LIMIT;
+#endif
+    return CAS_READ_LIMIT;
+}
+static size_t write_limit(int64_t current)
+{
+    (void)current;
+#ifdef BROKER_RATE_EXPERIMENT
+    if (burst_active(current)) return MAX_WRITE_LIMIT;
+#endif
+    return WRITE_LIMIT;
+}
+
 enum result { OK, INVALID, BUSY, MODULE, DENIED, IO, ABI, CONFLICT };
 enum read_kind { SNAPSHOT_READ, CAS_READ };
 enum attribute { ABI_VERSION, COLORS, ORIGINAL, STATE, RESTORE };
@@ -67,15 +132,61 @@ static const char *const attributes[] = {
     "abi_version", "colors", "original", "state", "restore"
 };
 static const mode_t attribute_modes[] = { 0444, 0600, 0444, 0400, 0200 };
-static int64_t write_times[WRITE_LIMIT];
+static int64_t write_times[MAX_WRITE_LIMIT];
 static size_t write_count;
-static int64_t read_times[READ_LIMIT];
+static int64_t read_times[MAX_READ_LIMIT];
 static size_t read_count;
-static int64_t status_times[STATUS_READ_LIMIT];
+static int64_t status_times[MAX_STATUS_READ_LIMIT];
 static size_t status_count;
-static int64_t cas_times[CAS_READ_LIMIT];
+static int64_t cas_times[MAX_CAS_READ_LIMIT];
 static size_t cas_count;
+/* The broker is single-threaded. Keep each prebooked operation's slots until
+ * its last sysfs read has completed, not only until one second after admission:
+ * otherwise late WMI GETs can overlap a new window and exceed the ceiling. */
+static size_t booked_reads, booked_read_offset, booked_kind_offset;
+static enum read_kind booked_kind;
+static bool booked_write;
+static size_t booked_write_offset;
 static uint64_t nonce, sequence;
+
+static int64_t now_ms(void);
+#ifdef BROKER_RATE_EXPERIMENT
+static enum result consume_burst_stamp(void)
+{
+    int dir = open(BURST_DIRECTORY, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) return DENIED;
+    struct stat st;
+    enum result result = DENIED;
+    if (fstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != geteuid() || (st.st_mode & 0022)) goto done;
+    int fd = openat(dir, BURST_STAMP,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) { result = errno == EEXIST ? BUSY : DENIED; goto done; }
+    /* Existence alone consumes the lease; never remove it on a later failure. */
+    close(fd);
+    result = OK;
+done:
+    close(dir);
+    return result;
+}
+#endif
+static void complete_bookings(void)
+{
+    int64_t completed = now_ms();
+    if (completed < 0) return; /* retain conservative original reservations */
+    /* now_ms truncates sub-millisecond time. Ceil the completed reservation
+     * so a new operation cannot start up to 999us before the last GET ages. */
+    if (completed < INT64_MAX) ++completed;
+    for (size_t i = 0; i < booked_reads; ++i) {
+        read_times[booked_read_offset + i] = completed;
+        if (booked_kind == SNAPSHOT_READ)
+            status_times[booked_kind_offset + i] = completed;
+        else
+            cas_times[booked_kind_offset + i] = completed;
+    }
+    if (booked_write)
+        write_times[booked_write_offset] = completed;
+}
 
 static void token_string(char out[34])
 {
@@ -140,7 +251,9 @@ static enum result reserve_slot(int64_t *times, size_t *count, size_t capacity)
         if (current - times[i] < WINDOW_MS)
             times[retained++] = times[i];
     *count = retained;
-    if (*count == capacity) return BUSY;
+    /* A diagnostic lease can expire while more than the ordinary five
+     * entries remain in the rolling window. Never admit or append then. */
+    if (*count >= capacity) return BUSY;
     times[(*count)++] = current; /* failed attempts consume budget */
     return OK;
 }
@@ -164,9 +277,13 @@ static enum result reserve_reads(size_t count, enum read_kind kind)
     read_count = retained;
     status_count = status_retained;
     cas_count = cas_retained;
-    if (read_count + count > READ_LIMIT ||
-        (kind == SNAPSHOT_READ && status_count + count > STATUS_READ_LIMIT) ||
-        (kind == CAS_READ && cas_count + count > CAS_READ_LIMIT)) return BUSY;
+    if (read_count + count > read_limit(current) ||
+        (kind == SNAPSHOT_READ && status_count + count > status_limit(current)) ||
+        (kind == CAS_READ && cas_count + count > cas_limit(current))) return BUSY;
+    booked_reads = count;
+    booked_read_offset = read_count;
+    booked_kind_offset = kind == SNAPSHOT_READ ? status_count : cas_count;
+    booked_kind = kind;
     for (size_t i = 0; i < count; ++i) {
         read_times[read_count++] = current;
         if (kind == SNAPSHOT_READ) status_times[status_count++] = current;
@@ -284,10 +401,10 @@ static enum result reserve_stop_reads(int64_t deadline, int client)
         int64_t current = now_ms();
         if (current < 0) return IO;
         int64_t next = deadline;
-        if (read_count + 2 > READ_LIMIT && read_count > 0 &&
+        if (read_count + 2 > read_limit(current) && read_count > 0 &&
             read_times[0] + WINDOW_MS < next)
             next = read_times[0] + WINDOW_MS;
-        if (status_count + 2 > STATUS_READ_LIMIT && status_count > 0 &&
+        if (status_count + 2 > status_limit(current) && status_count > 0 &&
             status_times[0] + WINDOW_MS < next)
             next = status_times[0] + WINDOW_MS;
         int wait = (int)(next - current);
@@ -310,10 +427,10 @@ static enum result reserve_mutation_reads(size_t count, int64_t deadline, int cl
         int64_t current = now_ms();
         if (current < 0) return IO;
         int64_t next = deadline;
-        if (read_count + count > READ_LIMIT && read_count > 0 &&
+        if (read_count + count > read_limit(current) && read_count > 0 &&
             read_times[0] + WINDOW_MS < next)
             next = read_times[0] + WINDOW_MS;
-        if (cas_count + count > CAS_READ_LIMIT && cas_count > 0 &&
+        if (cas_count + count > cas_limit(current) && cas_count > 0 &&
             cas_times[0] + WINDOW_MS < next)
             next = cas_times[0] + WINDOW_MS;
         int wait = (int)(next - current);
@@ -329,7 +446,11 @@ static enum result reserve_write(int64_t deadline, int client)
     for (;;) {
         enum result result = check_deadline(deadline);
         if (result != OK) return result;
-        result = reserve_slot(write_times, &write_count, WRITE_LIMIT);
+        result = reserve_slot(write_times, &write_count, write_limit(now_ms()));
+        if (result == OK) {
+            booked_write = true;
+            booked_write_offset = write_count - 1;
+        }
         if (result != BUSY) return result;
         int64_t current = now_ms();
         if (current < 0) return IO;
@@ -399,6 +520,13 @@ static enum result transact(const char *request, size_t length,
                wire_valid(request + 6, WIRE_LEN) && request[33] == '\n';
     bool snapshot = length == 11 && memcmp(request, "2 SNAPSHOT\n", 11) == 0;
     bool stop_snapshot = length == 11 && memcmp(request, "2 STOPSHOT\n", 11) == 0;
+#ifdef BROKER_RATE_EXPERIMENT
+    bool burst = length == 10 &&
+                 (memcmp(request, "2 BURST 4\n", 10) == 0 ||
+                  memcmp(request, "2 BURST 5\n", 10) == 0);
+#else
+    bool burst = false;
+#endif
     bool cas = false;
     size_t state_length = 0, expected_offset = 0, desired_offset = 0;
     if ((length == 99 || length == 100) && memcmp(request, "2 CAS ", 6) == 0 &&
@@ -414,7 +542,22 @@ static enum result transact(const char *request, size_t length,
               wire_valid(request + desired_offset, WIRE_LEN) &&
               request[desired_offset + WIRE_LEN] == '\n';
     }
-    if (!status && !restore && !set && !snapshot && !stop_snapshot && !cas) return INVALID;
+    if (!status && !restore && !set && !snapshot && !stop_snapshot && !cas && !burst)
+        return INVALID;
+
+    if (burst) {
+#ifdef BROKER_RATE_EXPERIMENT
+        int64_t current = now_ms();
+        if (current < 0) return IO;
+        if (burst_used || current >= deadline) return BUSY;
+        enum result claim = consume_burst_stamp();
+        if (claim != OK) return claim;
+        burst_used = true;
+        burst_until = current + 3000;
+        strcpy(response, "OK BURST\n");
+        return OK;
+#endif
+    }
 
     int root = -1;
     struct stat st;
@@ -503,7 +646,10 @@ static void serve_one(int client, int64_t deadline)
     result = check_deadline(deadline);
     if (result != OK) goto reply;
     char response[2 * READ_MAX + 16];
+    booked_reads = 0;
+    booked_write = false;
     result = transact(packet, (size_t)size, response, deadline, client);
+    complete_bookings();
     if (result == OK) {
         (void)send(client, response, strlen(response), MSG_DONTWAIT | MSG_NOSIGNAL);
         return;

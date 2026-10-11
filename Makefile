@@ -4,12 +4,20 @@ omen_rgb-y := module/omen_rgb.o
 KDIR ?= /lib/modules/$(if $(KERNELRELEASE),$(KERNELRELEASE),$(shell uname -r))/build
 PWD := $(shell pwd)
 
-.PHONY: all clean test broker
+.PHONY: all clean test broker broker-rate-experiment
 
 all:
 	$(MAKE) -C "$(KDIR)" M="$(PWD)" modules
 
 broker: build/okeylitctl-broker
+
+# Deliberately not a dependency of all, broker, test, or the installer.
+# Review and explicit user approval are required before any laptop use.
+broker-rate-experiment: build/okeylitctl-broker-rate-experiment
+
+build/okeylitctl-broker-rate-experiment: broker/main.c
+	mkdir -p build
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DBROKER_RATE_EXPERIMENT $< -o $@
 
 build/okeylitctl-broker: broker/main.c
 	mkdir -p build

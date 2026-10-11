@@ -129,6 +129,24 @@ class CliTests(unittest.TestCase):
                                       stdout=io.StringIO(), stderr=err), 2)
                 self.assertIn("invalid", err.getvalue())
 
+    def test_explicit_rate_experiment_is_forwarded_only_to_builtin_runner(self):
+        for rate in (4, 5):
+            with self.subTest(rate=rate), patch("okeylitctl.tui.CursesTui") as tui:
+                code = main(["tui", "--test-rate-hz", str(rate), "--rate-experiment"],
+                            backend=FakeBackend(), stdout=io.StringIO(),
+                            stderr=io.StringIO())
+                self.assertEqual(code, 0)
+                self.assertEqual(tui.call_args.kwargs["test_rate_hz"], rate)
+                self.assertTrue(tui.call_args.kwargs["rate_experiment"])
+
+    def test_rate_experiment_without_high_rate_is_rejected_before_device_access(self):
+        backend = FakeBackend()
+        backend.status = lambda: self.fail("invalid rate accessed device")
+        err = io.StringIO()
+        self.assertEqual(main(["tui", "--rate-experiment"], backend=backend,
+                              stdout=io.StringIO(), stderr=err), 2)
+        self.assertIn("--test-rate-hz", err.getvalue())
+
     def test_injected_runner_cannot_silently_ignore_diagnostic_rate(self):
         backend = FakeBackend()
         launched = []

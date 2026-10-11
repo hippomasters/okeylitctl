@@ -64,8 +64,10 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("restore", help="restore colors saved when the module loaded")
     tui = commands.add_parser("tui", help="open the interactive four-zone workspace")
-    tui.add_argument("--test-rate-hz", type=int, choices=(2,),
+    tui.add_argument("--test-rate-hz", type=int, choices=(2, 4, 5),
                      help="provisional effect-write rate for staged laptop validation (Hz)")
+    tui.add_argument("--rate-experiment", action="store_true",
+                     help="one short 4/5 Hz burst with a separately built diagnostic broker")
     return parser
 
 
@@ -200,6 +202,10 @@ def main(
             backend.restore()
             stdout.write("Restored the colors saved when the module loaded.\n")
         elif args.command == "tui":
+            if args.rate_experiment != (args.test_rate_hz in (4, 5)):
+                stderr.write(f"{APP_NAME}: invalid rate experiment: --test-rate-hz 4 or 5 "
+                             "requires --rate-experiment (and vice versa)\n")
+                return 2
             if tui_runner is None:
                 from .tui import run_tui
 
@@ -207,7 +213,8 @@ def main(
                     run_tui(backend, profile_store=profile_store)
                 else:
                     run_tui(backend, profile_store=profile_store,
-                            test_rate_hz=args.test_rate_hz)
+                            test_rate_hz=args.test_rate_hz,
+                            **({"rate_experiment": True} if args.rate_experiment else {}))
             else:
                 if args.test_rate_hz is not None:
                     stderr.write(f"{APP_NAME}: --test-rate-hz requires the built-in TUI runner\n")

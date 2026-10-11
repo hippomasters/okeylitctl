@@ -120,6 +120,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
 
     def setUp(self):
         self.root.chmod(0o755)
+        (self.root / "rate-experiment-used").unlink(missing_ok=True)
         for name in ("abi_version", "colors", "original", "state", "restore"):
             path = self.root / name
             if path.is_symlink():
@@ -329,7 +330,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
             self.assertLessEqual(len(events), 25)
         for timestamp, _ in events:
             self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
-                                     for at, _ in events), 25)
+                                     for at, _ in events), 25, events)
 
     def test_competing_status_cannot_spend_cas_kernel_and_readback_reserve(self):
         trace = self.wmi_trace()
@@ -374,6 +375,118 @@ ssize_t write(int fd, const void *buf, size_t len) {
                              rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
             expected, desired = desired, expected
         self.assertEqual((self.root / "colors").read_bytes(), expected + b"\n")
+
+    def test_default_broker_rejects_rate_experiment_without_elevating_reads(self):
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR INVALID\n")
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR INVALID\n")
+
+    def test_diagnostic_lease_cannot_be_rearmed_by_service_restart(self):
+        self.start_diagnostic()
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"OK BURST\n")
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.launch_broker()
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR BUSY\n")
+
+    def test_diagnostic_four_and_five_hz_trace_tenth_frame_stop_and_contention(self):
+        third = b"010203,040506,070809,0A0B0C"
+        for rate in (4, 5):
+            with self.subTest(rate=rate):
+                self.start_diagnostic()
+                trace = pathlib.Path(self.tmp.name) / f"burst-{rate}-trace"
+                trace.write_text("")
+                self.restart_with_fake_kernel("trace", trace=trace)
+                self.assertEqual(self.request(f"2 BURST {rate}\n".encode()), b"OK BURST\n")
+                expected, desired = BASE, ALT
+                started = time.monotonic()
+                for index in range(10):
+                    target = started + index / rate
+                    if target > time.monotonic():
+                        time.sleep(target - time.monotonic())
+                    token, state, colors, _ = self.snapshot()
+                    self.assertEqual((state, colors), (b"on", expected))
+                    if index == 4:
+                        # Another authorized client consumes status slots while the
+                        # effect holds ownership; it must not consume Stop reserve.
+                        for _ in range(2):
+                            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+                    self.assertTrue(self.cas(token, expected=expected, desired=desired).startswith(b"OK "))
+                    expected, desired = desired, third if desired == ALT else ALT
+                stop = self.request(b"2 STOPSHOT\n")
+                self.assertTrue(stop.startswith(b"OK "), stop)
+                self.assertEqual(stop.split(b" ")[3], expected)
+                self.assertNotEqual(expected, BASE)
+                self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
+                                         desired=BASE).startswith(b"OK "))
+                events = self.observed_wmi(trace)
+                self.assertEqual(len(events), 10 * 7 + 2 * 2 + 2 + 5)
+                for timestamp, _ in events:
+                    self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                             for at, _ in events), 49)
+                self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+                self.proc.terminate()
+                self.proc.communicate(timeout=2)
+                self.binary = self.__class__.binary
+                self.launch_broker()
+                (self.root / "rate-experiment-used").unlink()
+
+    def start_diagnostic(self):
+        diagnostic = pathlib.Path(self.bin_tmp.name) / "diagnostic-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(diagnostic)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = diagnostic
+        self.launch_broker()
+
+    def test_explicit_diagnostic_broker_bounds_five_hz_and_preserves_stop(self):
+        diagnostic = pathlib.Path(self.bin_tmp.name) / "diagnostic-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_RATE_EXPERIMENT",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(diagnostic)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = diagnostic
+        trace = pathlib.Path(self.tmp.name) / "burst-wmi-trace"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"OK BURST\n")
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR BUSY\n")
+        expected, desired = BASE, ALT
+        started = time.monotonic()
+        for index in range(9):
+            target = started + index * 0.2
+            if target > time.monotonic():
+                time.sleep(target - time.monotonic())
+            token, state, colors, _ = self.snapshot()
+            self.assertEqual((state, colors), (b"on", expected))
+            reply = self.cas(token, expected=expected, desired=desired)
+            self.assertRegex(reply, rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
+            expected, desired = desired, expected
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertEqual(expected, ALT)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
+                                 desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
+        self.assertEqual(len(events), 70)
+        for timestamp, _ in events:
+            self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                     for at, _ in events), 49)
+        # The broker lease is one-shot even after its three-second deadline.
+        remaining = started + 3.1 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR BUSY\n")
+        for _ in range(5):
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        self.assertEqual(self.request(b"1 STATUS\n"), b"ERR BUSY\n")
 
     def test_two_hz_stop_snapshot_restores_with_cas(self):
         trace = self.wmi_trace()
@@ -663,6 +776,26 @@ ssize_t write(int fd, const void *buf, size_t len) {
 
 
 class BrokerPackaging(unittest.TestCase):
+    def test_expired_burst_cannot_overfill_downgraded_write_counter(self):
+        (REPO / "build").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="broker-budget-", dir=REPO / "build") as directory:
+            source = pathlib.Path(directory) / "budget.c"
+            binary = pathlib.Path(directory) / "budget"
+            source.write_text('''#define main hidden_broker_main
+#include "broker/main.c"
+#undef main
+int main(void) {
+    write_count = 6;
+    for (size_t i = 0; i < write_count; ++i) write_times[i] = now_ms();
+    return reserve_slot(write_times, &write_count, WRITE_LIMIT) == BUSY &&
+           write_count == 6 ? 0 : 1;
+}
+''')
+            subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                            "-DBROKER_RATE_EXPERIMENT", "-I", str(REPO), str(source),
+                            "-o", str(binary)], check=True)
+            self.assertEqual(subprocess.run([str(binary)]).returncode, 0)
+
     def test_fake_root_cannot_be_enabled_without_test_build(self):
         (REPO / "build").mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="broker-guard-", dir=REPO / "build") as directory:
@@ -684,6 +817,7 @@ class BrokerPackaging(unittest.TestCase):
             self.assertIn(b"/run/okeylitctl.sock", content)
             self.assertNotIn(b"BROKER_TEST_ROOT", content)
             self.assertNotIn(b"/tmp/broker-test-", content)
+            self.assertNotIn(b"OK BURST\n", content)
             result = subprocess.run([str(binary)], capture_output=True, timeout=2)
             self.assertNotEqual(result.returncode, 0, "without systemd activation it must fail")
 

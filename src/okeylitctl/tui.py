@@ -240,11 +240,15 @@ class CursesTui:
     """Interactive adapter; all editing remains local until Apply."""
 
     def __init__(self, backend: SysfsBackend, profile_store: ProfileStore | None = None,
-                 *, test_rate_hz: int | None = None):
-        if test_rate_hz not in (None, 2):
-            raise ValueError("test_rate_hz must be 2; higher rates exceed the provisional WMI budget")
+                 *, test_rate_hz: int | None = None, rate_experiment: bool = False):
+        if (test_rate_hz not in (None, 2, 4, 5) or
+                rate_experiment != (test_rate_hz in (4, 5))):
+            raise ValueError("4/5 Hz requires an explicit bounded rate experiment")
         self.backend = backend
         self.test_rate_hz = test_rate_hz
+        self.rate_experiment = rate_experiment
+        self._experiment_frames = 0
+        self._experiment_auto_stop_attempted = False
         self.profile_store = profile_store or ProfileStore()
         self.power_state = "unknown"
         self.colors_enabled = False
@@ -431,6 +435,11 @@ class CursesTui:
                         self._start_effect(now=monotonic())
                     continue
                 if command is TuiCommand.QUIT:
+                    # A diagnostic frame must not remain live while a dirty
+                    # draft waits indefinitely at the confirmation prompt.
+                    if self.rate_experiment and self.effect_runtime is not None:
+                        if not self._stop_effect():
+                            continue
                     if self.state.dirty:
                         if not self._confirm_action(screen, "Quit?"):
                             self.state.message = "Quit cancelled — local changes preserved"
@@ -1213,6 +1222,21 @@ class CursesTui:
         if power == "off":
             self.state.message = "Effect unavailable: power off"
             return False
+        if self.rate_experiment:
+            begin = getattr(self.backend, "start_rate_experiment", None)
+            if not callable(begin):
+                self.state.message = "Rate experiment needs the opt-in diagnostic broker"
+                return False
+            try:
+                begin(self.test_rate_hz)
+            except (SysfsError, ValidationError) as exc:
+                self.state.message = f"Rate experiment refused: {exc}"
+                return False
+            # The broker starts its independent three-second monotonic lease
+            # on acknowledgement; the frontend also caps frame count/time.
+            now = monotonic() if now is None else now
+            self._experiment_frames = 0
+            self._experiment_auto_stop_attempted = False
         runtime = EffectRuntime(
             backend=self.backend,
             spec=self.state.effect_spec,
@@ -1270,13 +1294,33 @@ class CursesTui:
         self.state.message = "Effect ownership lost; last observed layout shown, draft preserved"
         return True
 
+    def _finish_rate_experiment(self) -> None:
+        """Retry one definite Stop read failure; never retry an uncertain write."""
+        for _ in range(2):
+            runtime = self.effect_runtime
+            if runtime is None:
+                return
+            was_uncertain = runtime.write_state_uncertain
+            if self._stop_effect():
+                return
+            runtime = self.effect_runtime
+            if (runtime is None or was_uncertain or runtime.write_state_uncertain
+                    or runtime.ownership_lost or runtime.observed_power_off):
+                return
+
     def _tick_effect(self, *, now: float | None = None, authorized: bool) -> bool:
         runtime = self.effect_runtime
         if runtime is None:
             return False
+        now = monotonic() if now is None else now
+        if (self.rate_experiment and not self._experiment_auto_stop_attempted
+                and (self._experiment_frames >= 10 or now - runtime.started_at >= 3.0)):
+            self._experiment_auto_stop_attempted = True
+            self._finish_rate_experiment()
+            return False
         try:
             wrote = runtime.tick(
-                now=monotonic() if now is None else now,
+                now=now,
                 authorized=authorized,
             )
         except SysfsError as exc:
@@ -1309,6 +1353,8 @@ class CursesTui:
                 self.state.message = f"Effect stopped after firmware error: {exc}"
             return False
         if wrote and runtime.last_written is not None:
+            if self.rate_experiment:
+                self._experiment_frames += 1
             self.state.effect_frame = runtime.last_written
             self.state.effect_frame_uncertain = False
             self.state.effect_restore_pending = False
@@ -1320,6 +1366,10 @@ class CursesTui:
                     f"TEST {self.test_rate_hz}Hz I/O "
                     f"{runtime.last_io_duration * 1000:.0f}ms, {spacing}; S Stop"
                 )
+            if self.rate_experiment and self._experiment_frames >= 10:
+                self._experiment_auto_stop_attempted = True
+                self._finish_rate_experiment()
+                return wrote
         if runtime.ownership_lost:
             self.power_state = "off" if runtime.observed_power_off else self.power_state
             self.state.effect_running = True
@@ -1742,8 +1792,8 @@ class CursesTui:
 def run_tui(
     backend: SysfsBackend | None = None,
     profile_store: ProfileStore | None = None,
-    *, test_rate_hz: int | None = None,
+    *, test_rate_hz: int | None = None, rate_experiment: bool = False,
 ) -> None:
     """Load verified device state and start the curses application."""
     CursesTui(backend or SysfsBackend(), profile_store=profile_store,
-              test_rate_hz=test_rate_hz).run()
+              test_rate_hz=test_rate_hz, rate_experiment=rate_experiment).run()
