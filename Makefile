@@ -4,7 +4,7 @@ omen_rgb-y := module/omen_rgb.o
 KDIR ?= /lib/modules/$(if $(KERNELRELEASE),$(KERNELRELEASE),$(shell uname -r))/build
 PWD := $(shell pwd)
 
-.PHONY: all clean test broker broker-rate-experiment
+.PHONY: all clean test broker broker-rate-experiment broker-rate-campaign-2
 
 all:
 	$(MAKE) -C "$(KDIR)" M="$(PWD)" modules
@@ -18,6 +18,12 @@ broker-rate-experiment: build/okeylitctl-broker-rate-experiment
 build/okeylitctl-broker-rate-experiment: broker/main.c
 	mkdir -p build
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DBROKER_RATE_EXPERIMENT $< -o $@
+
+broker-rate-campaign-2: build/okeylitctl-broker-rate-campaign-2
+
+build/okeylitctl-broker-rate-campaign-2: broker/main.c
+	mkdir -p build
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DBROKER_RATE_EXPERIMENT -DBROKER_RATE_CAMPAIGN_2 $< -o $@
 
 build/okeylitctl-broker: broker/main.c
 	mkdir -p build
