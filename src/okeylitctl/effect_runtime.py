@@ -38,7 +38,13 @@ class EffectRuntime:
     ownership_lost: bool = field(default=False, init=False)
     last_io_duration: float | None = field(default=None, init=False)
     last_write_spacing: float | None = field(default=None, init=False)
+    last_snapshot_duration: float | None = field(default=None, init=False)
+    last_cas_duration: float | None = field(default=None, init=False)
+    last_frame_start_spacing: float | None = field(default=None, init=False)
+    verified_frames: int = field(default=0, init=False)
+    _first_write_completed_at: float | None = field(default=None, init=False)
     _last_write_completed_at: float | None = field(default=None, init=False)
+    _last_frame_started_at: float | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not isfinite(self.rate_hz) or not 0.0 < self.rate_hz <= 5.0:
@@ -61,14 +67,34 @@ class EffectRuntime:
         self.ownership_lost = False
         self.last_io_duration = None
         self.last_write_spacing = None
+        self.last_snapshot_duration = None
+        self.last_cas_duration = None
+        self.last_frame_start_spacing = None
+        self.verified_frames = 0
+        self._first_write_completed_at = None
         self._last_write_completed_at = None
+        self._last_frame_started_at = None
+
+    @property
+    def effective_write_rate(self) -> float | None:
+        """Observed verified writes/s across completion timestamps, not requested Hz."""
+        if self.verified_frames < 2 or self._first_write_completed_at is None:
+            return None
+        elapsed = self._last_write_completed_at - self._first_write_completed_at
+        return (self.verified_frames - 1) / elapsed if elapsed > 0 else None
 
     def _record_completed_write(self, started: float, completed: float) -> None:
-        """Expose measured I/O and frame spacing without weakening the rate ceiling."""
+        """Count only verified frames; distinguish start and completion spacing."""
         self.last_io_duration = max(0.0, completed - started)
+        if self._last_frame_started_at is not None:
+            self.last_frame_start_spacing = max(0.0, started - self._last_frame_started_at)
+        self._last_frame_started_at = started
         if self._last_write_completed_at is not None:
             self.last_write_spacing = max(0.0, completed - self._last_write_completed_at)
+        if self._first_write_completed_at is None:
+            self._first_write_completed_at = completed
         self._last_write_completed_at = completed
+        self.verified_frames += 1
 
     @property
     def _uses_cas(self) -> bool:
@@ -145,13 +171,15 @@ class EffectRuntime:
         self.attempted_frame = None
         return True
 
-    def _cas_tick(self, *, now: float) -> bool:
+    def _cas_tick(self, *, now: float, io_started: float) -> tuple[bool, float]:
         snapshot = self.backend.snapshot()
+        snapshot_completed = monotonic()
+        self.last_snapshot_duration = max(0.0, snapshot_completed - io_started)
         if snapshot.get("state") != "on":
             self.active = False
             self.observed_power_off = True
             self._lose_ownership()
-            return False
+            return False, snapshot_completed
         self.observed_power_off = False
         live_wire = ",".join(snapshot["colors"])
         if self.owned_token is not None and (
@@ -170,6 +198,7 @@ class EffectRuntime:
         )
         self.attempted_frame = frame
         self.write_state_uncertain = True
+        cas_started = monotonic()
         try:
             token = self.backend.compare_and_write(
                 snapshot["token"], "on", live_wire, frame.to_wire()
@@ -188,7 +217,7 @@ class EffectRuntime:
         self.attempted_frame = None
         if event_expired:
             self.event = None
-        return True
+        return True, cas_started
 
     def trigger(self, zone: Zone, *, now: float) -> bool:
         if not self.active or self.spec.kind not in (
@@ -259,12 +288,13 @@ class EffectRuntime:
         io_started = monotonic()
         if self._uses_cas:
             try:
-                wrote = self._cas_tick(now=now)
+                wrote, cas_started = self._cas_tick(now=now, io_started=io_started)
             except SysfsError:
                 self.active = False
                 raise
             if wrote:
                 io_completed = monotonic()
+                self.last_cas_duration = max(0.0, io_completed - cas_started)
                 self._record_completed_write(io_started, io_completed)
                 self.next_due = now + max(0.0, io_completed - io_started) + self.interval
             return wrote
