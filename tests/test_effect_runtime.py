@@ -121,7 +121,7 @@ class EffectRuntimeSchedulingTests(unittest.TestCase):
         self.assertIsNone(runtime.last_io_duration)
         self.assertIsNone(runtime.last_write_spacing)
         with mock.patch("okeylitctl.effect_runtime.monotonic",
-                        side_effect=(10.0, 10.2, 10.7, 10.9)):
+                        side_effect=(10.0, 10.1, 10.15, 10.2, 10.7, 10.8, 10.85, 10.9)):
             self.assertTrue(runtime.tick(now=0.0))
             self.assertAlmostEqual(runtime.last_io_duration, 0.2)
             self.assertIsNone(runtime.last_write_spacing)
@@ -133,6 +133,27 @@ class EffectRuntimeSchedulingTests(unittest.TestCase):
         runtime.start(now=2.0)
         self.assertIsNone(runtime.last_io_duration)
         self.assertIsNone(runtime.last_write_spacing)
+
+    def test_diagnostic_counts_verified_frames_and_times_snapshot_and_cas_separately(self):
+        backend = CASBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE), rate_hz=2)
+        runtime.start(now=0.0)
+        with mock.patch("okeylitctl.effect_runtime.monotonic",
+                        side_effect=(10.0, 10.04, 10.045, 10.14, 10.5, 10.56, 10.565, 10.66)):
+            self.assertTrue(runtime.tick(now=0.0))
+            self.assertTrue(runtime.tick(now=0.64))
+        self.assertEqual(runtime.verified_frames, 2)
+        self.assertAlmostEqual(runtime.last_snapshot_duration, 0.06)
+        self.assertAlmostEqual(runtime.last_cas_duration, 0.095)
+        self.assertAlmostEqual(runtime.last_frame_start_spacing, 0.5)
+        self.assertAlmostEqual(runtime.last_write_spacing, 0.52)
+        self.assertAlmostEqual(runtime.effective_write_rate, 1 / 0.52)
+        runtime.start(now=1.0)
+        self.assertEqual(runtime.verified_frames, 0)
+        self.assertIsNone(runtime.last_snapshot_duration)
+        self.assertIsNone(runtime.last_cas_duration)
+        self.assertIsNone(runtime.last_frame_start_spacing)
+        self.assertIsNone(runtime.effective_write_rate)
 
     def test_next_deadline_is_measured_from_completed_write(self):
         backend = RecordingBackend()
