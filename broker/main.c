@@ -65,6 +65,9 @@
  * deliberate root-only rearm requires a stopped socket and service. All GETs
  * remain prebooked and verified. Stop falls back to bounded waiting at the
  * ordinary ceiling after expiry. This is not a thermal safety claim. */
+#if defined(BROKER_RATE_CAMPAIGN_2) && !defined(BROKER_RATE_EXPERIMENT)
+#error "campaign 2 requires the bounded rate experiment"
+#endif
 #ifdef BROKER_RATE_EXPERIMENT
 #define MAX_READ_LIMIT 49
 #define MAX_STATUS_READ_LIMIT 16
@@ -74,11 +77,19 @@ static int64_t burst_until;
 static bool burst_used;
 #ifdef BROKER_TESTING
 #define BURST_DIRECTORY DEVICE_ROOT
+#ifdef BROKER_RATE_CAMPAIGN_2
+#define BURST_STAMP "rate-experiment-2-used"
+#else
 #define BURST_STAMP "rate-experiment-used"
+#endif
 #else
 /* StateDirectory in the service persists across broker restarts/reboots.
  * Only an administrator may remove this stamp between separately reviewed rates. */
+#ifdef BROKER_RATE_CAMPAIGN_2
+#define BURST_DIRECTORY "/var/lib/okeylitctl-rate-experiment-2"
+#else
 #define BURST_DIRECTORY "/var/lib/okeylitctl-rate-experiment"
+#endif
 #define BURST_STAMP "used"
 #endif
 static bool burst_active(int64_t current)
