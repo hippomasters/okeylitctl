@@ -80,7 +80,7 @@
 #define CANDIDATE_STATUS_READ_LIMIT 16
 #define CANDIDATE_CAS_READ_LIMIT 30
 #define CANDIDATE_WRITE_LIMIT 6
-#define CANDIDATE_STATUS_ORDINARY 12
+#define CANDIDATE_STATUS_ORDINARY 14 /* five frame snapshots + two startup reads; two Stop slots reserved */
 #define CANDIDATE_CAS_ORDINARY 25
 #define CANDIDATE_WRITE_ORDINARY 5
 #endif
