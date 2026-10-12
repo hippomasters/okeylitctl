@@ -110,6 +110,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(launched), 1)
         self.assertIsInstance(launched[0], IPCBackend)
 
+    def test_builtin_tui_receives_same_broker_client_and_reads_over_socket(self):
+        from test_ipc import BrokerFixture
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sock"
+            fixture = BrokerFixture(path, b"OK on 111111,222222,333333,444444 AAAAAA,BBBBBB,CCCCCC,DDDDDD\n")
+            created = []
+            def make_backend():
+                backend = IPCBackend(socket_path=path)
+                created.append(backend)
+                return backend
+
+            try:
+                with patch("okeylitctl.cli.IPCBackend", side_effect=make_backend), \
+                     patch("okeylitctl.tui.SysfsBackend", side_effect=AssertionError("sysfs fallback")), \
+                     patch("okeylitctl.tui.CursesTui") as app:
+                    app.side_effect = lambda backend, **kwargs: (backend.status(), app.return_value)[1]
+                    code = main(["tui"], stdout=io.StringIO(), stderr=io.StringIO())
+                    forwarded = app.call_args.args[0]
+            finally:
+                fixture.close()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(created), 1)
+        self.assertIs(forwarded, created[0])
+        self.assertEqual(fixture.requests, [b"1 STATUS\n"])
+        app.return_value.run.assert_called_once_with()
+
     def test_staged_rate_selects_only_explicit_diagnostic_setting(self):
         for rate in (2,):
             with self.subTest(rate=rate), patch("okeylitctl.tui.CursesTui") as tui:
