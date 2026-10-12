@@ -28,6 +28,32 @@ from okeylitctl.tui import (
 from okeylitctl.tui_state import TuiState
 
 
+class TuiRunnerBackendTests(unittest.TestCase):
+    def test_direct_runner_defaults_to_ipc_without_sysfs_fallback(self):
+        from okeylitctl.ipc import IPCBackend
+
+        with mock.patch.object(tui_module, "SysfsBackend", side_effect=AssertionError("sysfs fallback")), \
+             mock.patch.object(tui_module, "CursesTui") as app:
+            tui_module.run_tui()
+
+        backend = app.call_args.args[0]
+        self.assertIsInstance(backend, IPCBackend)
+        app.return_value.run.assert_called_once_with()
+
+    def test_direct_runner_preserves_injected_backend_and_options(self):
+        backend = object()
+        profiles = object()
+        with mock.patch.object(tui_module, "SysfsBackend", side_effect=AssertionError("sysfs fallback")), \
+             mock.patch.object(tui_module, "IPCBackend", side_effect=AssertionError("replaced injection")), \
+             mock.patch.object(tui_module, "CursesTui") as app:
+            tui_module.run_tui(backend, profile_store=profiles, test_rate_hz=2)
+
+        self.assertIs(app.call_args.args[0], backend)
+        self.assertIs(app.call_args.kwargs["profile_store"], profiles)
+        self.assertEqual(app.call_args.kwargs["test_rate_hz"], 2)
+        app.return_value.run.assert_called_once_with()
+
+
 class TuiInteractionTests(unittest.TestCase):
     def setUp(self):
         self.state = TuiState(
