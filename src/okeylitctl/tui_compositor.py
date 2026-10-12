@@ -480,6 +480,15 @@ def _draw_footer(canvas: _Canvas, state: TuiState, power_state: str) -> None:
     canvas.put(51, 5, second, "footer")
 
 
+def _editor_message(state: TuiState, available: int) -> str:
+    message = state.message
+    if (len(message) > available and state.effect_frame_uncertain
+            and message.startswith("Effect stopped after firmware error:")):
+        # Never clip the only recovery instruction off a long broker error.
+        return "Effect I/O failed; Live unknown; S Verify before any restore"
+    return message[:available]
+
+
 def compose_editor(
     state: TuiState,
     *,
@@ -498,7 +507,7 @@ def compose_editor(
     _draw_motion(canvas, state)
     _draw_footer(canvas, state, power_state)
     if state.message and state.message != "Ready":
-        canvas.put(2, 3, state.message[: canvas.width - 6], "muted")
+        canvas.put(2, 3, _editor_message(state, canvas.width - 6), "muted")
     if state.help_visible:
         _draw_help_overlay(canvas, state)
     return canvas.finish()
@@ -524,7 +533,7 @@ def compose_adaptive_editor(
                _responsive_status_role(state, power_state))
     canvas.put(1, width - len(device) - 3, device, "device_badge")
     if state.message and state.message != "Ready":
-        canvas.put(2, 3, state.message[: width - 6], "muted")
+        canvas.put(2, 3, _editor_message(state, width - 6), "muted")
 
     keyboard_height = min(21, height - 20)
     spare = height - keyboard_height - 20
@@ -759,7 +768,7 @@ def compose_narrow_editor(
                _responsive_status_role(state, power_state))
     canvas.put(1, width - len(device) - 3, device, "device_badge")
     if state.message and state.message != "Ready":
-        canvas.put(2, 3, state.message[: width - 6], "muted")
+        canvas.put(2, 3, _editor_message(state, width - 6), "muted")
 
     keyboard_height = min(21, height - 14)
     if height - 3 - (3 + keyboard_height + 5) < 4:
