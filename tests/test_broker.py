@@ -447,6 +447,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
                 expected, desired = BASE, ALT
                 started = time.monotonic()
                 lateness = []
+                extra_statuses = []
                 for index in range(rate * 3):
                     due = started + index / rate
                     if due > time.monotonic():
@@ -455,7 +456,10 @@ ssize_t write(int fd, const void *buf, size_t len) {
                     self.assertEqual((state, colors), (b"on", expected))
                     if index == rate:
                         for _ in range(2):
-                            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+                            reply = self.request(b"1 STATUS\n")
+                            self.assertTrue(reply.startswith(b"OK on ") or
+                                            reply == b"ERR BUSY\n", reply)
+                            extra_statuses.append(reply)
                     reply = self.cas(token, expected=expected, desired=desired)
                     self.assertTrue(reply.startswith(b"OK "), reply)
                     lateness.append(time.monotonic() - due)
@@ -470,13 +474,16 @@ ssize_t write(int fd, const void *buf, size_t len) {
                                          desired=BASE).startswith(b"OK "))
                 self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
                 events = self.observed_wmi(trace)
-                self.assertEqual(len(events), rate * 3 * 7 + 4 + 7)
+                self.assertEqual(len(events), rate * 3 * 7 +
+                                 2 * sum(reply.startswith(b"OK ") for reply in extra_statuses) + 7)
                 for at, _ in events:
-                    self.assertLessEqual(sum(at <= when < at + 1_000_000_000
-                                             for when, _ in events), 49, events)
+                    window = [kind for when, kind in events
+                              if at <= when < at + 1_000_000_000]
+                    self.assertLessEqual(len(window), 49, events)
+                    self.assertLessEqual(window.count("I"), 12, events)
         self.binary = self.__class__.binary
 
-    def test_candidate_saturated_status_clients_delay_stop_without_bypassing_reads(self):
+    def test_candidate_saturated_status_clients_leave_priority_stop_headroom(self):
         candidate = pathlib.Path(self.bin_tmp.name) / "candidate-broker"
         subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
                         "-DBROKER_TESTING", "-DBROKER_SUSTAINED_CANDIDATE",
@@ -500,20 +507,86 @@ ssize_t write(int fd, const void *buf, size_t len) {
             self.assertTrue(self.cas(token, expected=expected,
                                      desired=desired).startswith(b"OK "))
             expected, desired = desired, expected
-        # Five frame snapshots consume ten of sixteen snapshot slots.
-        for _ in range(3):
-            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
-        self.assertEqual(self.request(b"1 STATUS\n"), b"ERR BUSY\n")
+        # Three competing readers may be refused, but cannot take Stop's
+        # reserved snapshot admission or make it wait for a rolling expiry.
+        statuses = [self.request(b"1 STATUS\n") for _ in range(3)]
+        self.assertEqual(sum(reply.startswith(b"OK on ") for reply in statuses), 1,
+                         statuses)
+        self.assertEqual(statuses.count(b"ERR BUSY\n"), 2, statuses)
         began = time.monotonic()
         stop = self.request(b"2 STOPSHOT\n")
         self.assertTrue(stop.startswith(b"OK "), stop)
-        self.assertGreater(time.monotonic() - began, 0.08)
+        self.assertLess(time.monotonic() - began, 0.12)
         self.assertEqual(stop.split(b" ")[3], expected)
+        self.assertNotEqual(stop.split(b" ")[1], token)
         self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
                                  desired=BASE).startswith(b"OK "))
         self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
         events = self.observed_wmi(trace)
-        self.assertEqual(len(events), 5 * 7 + 3 * 2 + 2 + 5)
+        self.assertEqual(len(events), 5 * 7 +
+                         2 * sum(reply.startswith(b"OK ") for reply in statuses) + 2 + 5)
+        for at, _ in events:
+            window = [kind for when, kind in events
+                      if at <= when < at + 1_000_000_000]
+            self.assertLessEqual(len(window), 49, events)
+            self.assertLessEqual(window.count("I"), 12, events)
+        self.binary = self.__class__.binary
+
+    def test_candidate_stop_token_cannot_restore_after_external_write(self):
+        candidate = pathlib.Path(self.bin_tmp.name) / "candidate-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_SUSTAINED_CANDIDATE",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(candidate)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = candidate
+        trace = pathlib.Path(self.tmp.name) / "candidate-owner-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+        first = self.snapshot()[0]
+        self.assertTrue(self.cas(first).startswith(b"OK "))
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        third = b"010203,040506,070809,0A0B0C"
+        self.assertEqual(self.request(b"1 SET " + third + b"\n"), b"OK\n")
+        self.assertEqual(self.cas(stop.split(b" ")[1], expected=ALT, desired=BASE),
+                         b"ERR CONFLICT\n")
+        self.assertEqual((self.root / "colors").read_bytes(), third + b"\n")
+        events = self.observed_wmi(trace)
+        self.assertEqual(len(events), 2 + 5 + 2 + 4)
+        self.assertEqual([kind for _, kind in events[-4:]], ["S", "I", "I", "C"])
+        self.binary = self.__class__.binary
+
+    def test_candidate_slow_stop_read_times_out_without_restoration(self):
+        candidate = pathlib.Path(self.bin_tmp.name) / "candidate-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_SUSTAINED_CANDIDATE",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(candidate)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = candidate
+        trace = pathlib.Path(self.tmp.name) / "candidate-slow-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+        token = self.snapshot()[0]
+        self.assertTrue(self.cas(token).startswith(b"OK "))
+        marker = pathlib.Path(str(trace) + ".slow")
+        marker.touch()
+        try:
+            self.assertEqual(self.request(b"2 STOPSHOT\n"), b"ERR BUSY\n")
+        finally:
+            marker.unlink(missing_ok=True)
+        self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=ALT,
+                                 desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
         for at, _ in events:
             self.assertLessEqual(sum(at <= when < at + 1_000_000_000
                                      for when, _ in events), 49, events)
