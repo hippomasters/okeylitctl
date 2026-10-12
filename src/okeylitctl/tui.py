@@ -9,7 +9,7 @@ from typing import Any
 
 from . import __version__
 from .effect_runtime import EffectRuntime
-from .ipc import ConflictError
+from .ipc import ConflictError, IPCBackend
 from .effects import EffectEvent, EffectKind, PHYSICAL_ZONE_ORDER, frame_at
 from .keyboard_layout import key_zone_by_id
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
@@ -239,7 +239,7 @@ def handle_key(
 class CursesTui:
     """Interactive adapter; all editing remains local until Apply."""
 
-    def __init__(self, backend: SysfsBackend, profile_store: ProfileStore | None = None,
+    def __init__(self, backend: IPCBackend | SysfsBackend, profile_store: ProfileStore | None = None,
                  *, test_rate_hz: int | None = None, rate_experiment: bool = False):
         if (test_rate_hz not in (None, 2, 4, 5) or
                 rate_experiment != (test_rate_hz in (4, 5))):
@@ -1809,10 +1809,10 @@ class CursesTui:
 
 
 def run_tui(
-    backend: SysfsBackend | None = None,
+    backend: IPCBackend | SysfsBackend | None = None,
     profile_store: ProfileStore | None = None,
     *, test_rate_hz: int | None = None, rate_experiment: bool = False,
 ) -> None:
     """Load verified device state and start the curses application."""
-    CursesTui(backend or SysfsBackend(), profile_store=profile_store,
+    CursesTui(backend if backend is not None else IPCBackend(), profile_store=profile_store,
               test_rate_hz=test_rate_hz, rate_experiment=rate_experiment).run()
