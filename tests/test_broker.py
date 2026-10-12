@@ -427,6 +427,98 @@ ssize_t write(int fd, const void *buf, size_t len) {
                                              for when, _ in events), 25, events)
                 self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
 
+    def test_candidate_sustains_four_and_five_hz_with_stop_headroom(self):
+        # A test-only candidate; the installed/default broker stays ordinary.
+        candidate = pathlib.Path(self.bin_tmp.name) / "candidate-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_SUSTAINED_CANDIDATE",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(candidate)], check=True)
+        for rate in (4, 5):
+            with self.subTest(rate=rate):
+                self.proc.terminate()
+                self.proc.communicate(timeout=2)
+                self.put("colors", BASE + b"\n")
+                trace = pathlib.Path(self.tmp.name) / f"candidate-{rate}-wmi"
+                trace.write_text("")
+                self.binary = candidate
+                self.launch_broker("trace", trace=trace)
+                expected, desired = BASE, ALT
+                started = time.monotonic()
+                lateness = []
+                for index in range(rate * 3):
+                    due = started + index / rate
+                    if due > time.monotonic():
+                        time.sleep(due - time.monotonic())
+                    token, state, colors, _ = self.snapshot()
+                    self.assertEqual((state, colors), (b"on", expected))
+                    if index == rate:
+                        for _ in range(2):
+                            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+                    reply = self.cas(token, expected=expected, desired=desired)
+                    self.assertTrue(reply.startswith(b"OK "), reply)
+                    lateness.append(time.monotonic() - due)
+                    expected, desired = desired, expected
+                self.assertLess(max(lateness), 0.18, lateness)
+                began = time.monotonic()
+                stop = self.request(b"2 STOPSHOT\n")
+                self.assertTrue(stop.startswith(b"OK "), stop)
+                self.assertLess(time.monotonic() - began, 0.18)
+                self.assertEqual(stop.split(b" ")[3], expected)
+                self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
+                                         desired=BASE).startswith(b"OK "))
+                self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+                events = self.observed_wmi(trace)
+                self.assertEqual(len(events), rate * 3 * 7 + 4 + 7)
+                for at, _ in events:
+                    self.assertLessEqual(sum(at <= when < at + 1_000_000_000
+                                             for when, _ in events), 49, events)
+        self.binary = self.__class__.binary
+
+    def test_candidate_saturated_status_clients_delay_stop_without_bypassing_reads(self):
+        candidate = pathlib.Path(self.bin_tmp.name) / "candidate-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_SUSTAINED_CANDIDATE",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(candidate)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = candidate
+        trace = pathlib.Path(self.tmp.name) / "saturated-candidate-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+        expected, desired = BASE, ALT
+        started = time.monotonic()
+        for index in range(5):
+            due = started + index * 0.2
+            if due > time.monotonic():
+                time.sleep(due - time.monotonic())
+            token, state, colors, _ = self.snapshot()
+            self.assertEqual((state, colors), (b"on", expected))
+            self.assertTrue(self.cas(token, expected=expected,
+                                     desired=desired).startswith(b"OK "))
+            expected, desired = desired, expected
+        # Five frame snapshots consume ten of sixteen snapshot slots.
+        for _ in range(3):
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        self.assertEqual(self.request(b"1 STATUS\n"), b"ERR BUSY\n")
+        began = time.monotonic()
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertGreater(time.monotonic() - began, 0.08)
+        self.assertEqual(stop.split(b" ")[3], expected)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
+                                 desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
+        self.assertEqual(len(events), 5 * 7 + 3 * 2 + 2 + 5)
+        for at, _ in events:
+            self.assertLessEqual(sum(at <= when < at + 1_000_000_000
+                                     for when, _ in events), 49, events)
+        self.binary = self.__class__.binary
+
     def test_stop_read_timeout_preserves_ownership_before_competing_write(self):
         trace = self.wmi_trace()
         token = self.snapshot()[0]
@@ -930,6 +1022,14 @@ int main(void) {
                             "-DBROKER_RATE_EXPERIMENT", "-I", str(REPO), str(source),
                             "-o", str(binary)], check=True)
             self.assertEqual(subprocess.run([str(binary)]).returncode, 0)
+
+    def test_sustained_candidate_cannot_compile_for_installed_broker(self):
+        with tempfile.TemporaryDirectory(prefix="broker-candidate-", dir=REPO / "build") as directory:
+            command = ["cc", "-std=c11", "-DBROKER_SUSTAINED_CANDIDATE",
+                       str(REPO / "broker" / "main.c"), "-o", str(pathlib.Path(directory) / "broker")]
+            failed = subprocess.run(command, capture_output=True, text=True, cwd=REPO)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("sustained candidate requires a fake-kernel test build", failed.stderr)
 
     def test_fake_root_cannot_be_enabled_without_test_build(self):
         (REPO / "build").mkdir(exist_ok=True)
