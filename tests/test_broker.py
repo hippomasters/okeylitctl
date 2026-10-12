@@ -75,7 +75,17 @@ static char attribute_kind(int fd) {
 }
 ssize_t read(int fd, void *buf, size_t len) {
     ssize_t n = syscall(SYS_read, fd, buf, len);
-    if (n > 0 && attribute_kind(fd)) trace_wmi(attribute_kind(fd));
+    char kind = attribute_kind(fd);
+    if (n > 0 && kind) trace_wmi(kind); /* timestamp the actual read */
+    const char *log = getenv("BROKER_WMI_TRACE");
+    if (n > 0 && kind == 'S' && log) {
+        char marker[1024];
+        int size = snprintf(marker, sizeof(marker), "%s.slow", log);
+        if (size > 0 && size < (int)sizeof(marker) && access(marker, F_OK) == 0) {
+            struct timespec delay = { .tv_sec = 1, .tv_nsec = 50000000 };
+            nanosleep(&delay, NULL);
+        }
+    }
     return n;
 }
 ssize_t write(int fd, const void *buf, size_t len) {
@@ -377,6 +387,101 @@ ssize_t write(int fd, const void *buf, size_t len) {
                              rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
             expected, desired = desired, expected
         self.assertEqual((self.root / "colors").read_bytes(), expected + b"\n")
+
+    def test_ordinary_sustained_four_and_five_hz_hit_rolling_read_ceiling(self):
+        # A kernel-facing trace includes two hidden store GETs per CAS, not
+        # merely the broker's state/colors/readback sysfs reads.
+        for rate in (4, 5):
+            with self.subTest(rate=rate):
+                self.put("colors", BASE + b"\n")
+                trace = self.wmi_trace()
+                expected, desired = BASE, ALT
+                lateness = []
+                started = time.monotonic()
+                for index in range(6):
+                    due = started + index / rate
+                    if due > time.monotonic():
+                        time.sleep(due - time.monotonic())
+                    token, state, colors, _ = self.snapshot()
+                    self.assertEqual((state, colors), (b"on", expected))
+                    reply = self.cas(token, expected=expected, desired=desired)
+                    lateness.append(time.monotonic() - due)
+                    self.assertRegex(reply, rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
+                    expected, desired = desired, expected
+                # Deadline-to-ack lateness includes waits in either SNAPSHOT
+                # or CAS: four seven-GET frames cannot fit within a second.
+                self.assertGreater(lateness[3], 0.12, lateness)
+                stop = self.request(b"2 STOPSHOT\n")
+                self.assertTrue(stop.startswith(b"OK "), stop)
+                self.assertEqual(stop.split(b" ")[3], expected)
+                self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
+                                         desired=BASE).startswith(b"OK "))
+                events = self.observed_wmi(trace)
+                self.assertEqual(len(events), 6 * 7 + 2 + 5)
+                self.assertEqual([kind for _, kind in events[:7]],
+                                 ["C", "S", "S", "C", "I", "I", "C"])
+                self.assertEqual([kind for _, kind in events[-7:]],
+                                 ["C", "S", "S", "C", "I", "I", "C"])
+                for at, _ in events:
+                    self.assertLessEqual(sum(at <= when < at + 1_000_000_000
+                                             for when, _ in events), 25, events)
+                self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+
+    def test_stop_read_timeout_preserves_ownership_before_competing_write(self):
+        trace = self.wmi_trace()
+        token = self.snapshot()[0]
+        verified = self.cas(token)[3:-1]
+        self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        marker = pathlib.Path(str(trace) + ".slow")
+        third = b"010203,040506,070809,0A0B0C"
+        marker.touch()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as stopping, \
+                 socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as competitor:
+                for client in (stopping, competitor):
+                    client.settimeout(3)
+                    client.connect(str(self.sockpath))
+                began = time.monotonic()
+                stopping.sendall(b"2 STOPSHOT\n")
+                # Let the Stop read enter the fake kernel before the competing
+                # authorized request arrives; it queues on the same broker.
+                time.sleep(0.05)
+                competitor.sendall(b"1 STATUS\n")
+                self.assertEqual(stopping.recv(256), b"ERR BUSY\n")
+                self.assertLess(time.monotonic() - began, 1.5)
+                marker.unlink()
+                try:
+                    queued_reply = competitor.recv(256)
+                except ConnectionResetError:
+                    # The broker may close an expired unread packet with RST.
+                    queued_reply = b"ERR BUSY\n"
+                self.assertTrue(queued_reply == b"ERR BUSY\n" or
+                                queued_reply.startswith(b"OK on "), queued_reply)
+                self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        finally:
+            marker.unlink(missing_ok=True)
+        # The competing status is read-only even if serviced after Stop;
+        # a fresh authorized mutation can change ownership before recovery.
+        self.assertEqual(self.request(b"1 SET " + third + b"\n"), b"OK\n")
+        response = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(response.startswith(b"OK "), response)
+        self.assertEqual(response.split(b" ")[3], third)
+        self.assertNotEqual(response.split(b" ")[1], verified)
+        self.assertEqual(self.cas(verified, expected=ALT, desired=BASE),
+                         b"ERR CONFLICT\n")
+        self.assertEqual((self.root / "colors").read_bytes(), third + b"\n")
+        events = self.observed_wmi(trace)
+        expected_trace = ["C", "S", "S", "C", "I", "I", "C", "C", "S"]
+        self.assertEqual([kind for _, kind in events[:9]], expected_trace)
+        queued_kinds = [kind for _, kind in events[9:-6]]
+        self.assertIn(queued_kinds, ([], ["C"], ["C", "S"]))
+        if queued_reply.startswith(b"OK "):
+            self.assertEqual(queued_kinds, ["C", "S"])
+        self.assertEqual([kind for _, kind in events[-6:]],
+                         ["S", "I", "I", "C", "C", "S"])
+        for at, _ in events:
+            self.assertLessEqual(sum(at <= when < at + 1_000_000_000
+                                     for when, _ in events), 25, events)
 
     def test_default_broker_rejects_rate_experiment_without_elevating_reads(self):
         self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR INVALID\n")
