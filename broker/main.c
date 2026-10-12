@@ -59,6 +59,22 @@
 #define CAS_READ_LIMIT 20
 #define WINDOW_MS 1000
 #define WIRE_LEN 27
+/* Test-only provisional sustained-rate policy; no installed target enables it.
+ * A snapshot/CAS frame costs seven WMI GETs. At five attempted frames/s,
+ * 49/16/30/6 leaves room in the tested phase for two other snapshots,
+ * Stop's read and conditional restoration. No priority or physical guarantee. */
+#if defined(BROKER_SUSTAINED_CANDIDATE) && !defined(BROKER_TESTING)
+#error "sustained candidate requires a fake-kernel test build"
+#endif
+#if defined(BROKER_SUSTAINED_CANDIDATE) && defined(BROKER_RATE_EXPERIMENT)
+#error "sustained candidate and diagnostic lease are mutually exclusive"
+#endif
+#ifdef BROKER_SUSTAINED_CANDIDATE
+#define CANDIDATE_READ_LIMIT 49
+#define CANDIDATE_STATUS_READ_LIMIT 16
+#define CANDIDATE_CAS_READ_LIMIT 30
+#define CANDIDATE_WRITE_LIMIT 6
+#endif
 
 /* Not built or installed by the normal broker target. One root-owned persistent
  * stamp allows only one three-second lease across service restarts/reboots;
@@ -103,6 +119,11 @@ static bool burst_active(int64_t current)
 {
     return burst_used && current >= 0 && current < burst_until;
 }
+#elif defined(BROKER_SUSTAINED_CANDIDATE)
+#define MAX_READ_LIMIT CANDIDATE_READ_LIMIT
+#define MAX_STATUS_READ_LIMIT CANDIDATE_STATUS_READ_LIMIT
+#define MAX_CAS_READ_LIMIT CANDIDATE_CAS_READ_LIMIT
+#define MAX_WRITE_LIMIT CANDIDATE_WRITE_LIMIT
 #else
 #define MAX_READ_LIMIT READ_LIMIT
 #define MAX_STATUS_READ_LIMIT STATUS_READ_LIMIT
@@ -115,6 +136,8 @@ static size_t read_limit(int64_t current)
     (void)current;
 #ifdef BROKER_RATE_EXPERIMENT
     if (burst_active(current)) return MAX_READ_LIMIT;
+#elif defined(BROKER_SUSTAINED_CANDIDATE)
+    return CANDIDATE_READ_LIMIT;
 #endif
     return READ_LIMIT;
 }
@@ -123,6 +146,8 @@ static size_t status_limit(int64_t current)
     (void)current;
 #ifdef BROKER_RATE_EXPERIMENT
     if (burst_active(current)) return MAX_STATUS_READ_LIMIT;
+#elif defined(BROKER_SUSTAINED_CANDIDATE)
+    return CANDIDATE_STATUS_READ_LIMIT;
 #endif
     return STATUS_READ_LIMIT;
 }
@@ -131,6 +156,8 @@ static size_t cas_limit(int64_t current)
     (void)current;
 #ifdef BROKER_RATE_EXPERIMENT
     if (burst_active(current)) return MAX_CAS_READ_LIMIT;
+#elif defined(BROKER_SUSTAINED_CANDIDATE)
+    return CANDIDATE_CAS_READ_LIMIT;
 #endif
     return CAS_READ_LIMIT;
 }
@@ -139,6 +166,8 @@ static size_t write_limit(int64_t current)
     (void)current;
 #ifdef BROKER_RATE_EXPERIMENT
     if (burst_active(current)) return MAX_WRITE_LIMIT;
+#elif defined(BROKER_SUSTAINED_CANDIDATE)
+    return CANDIDATE_WRITE_LIMIT;
 #endif
     return WRITE_LIMIT;
 }
