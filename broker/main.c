@@ -61,8 +61,9 @@
 #define WIRE_LEN 27
 /* Test-only provisional sustained-rate policy; no installed target enables it.
  * A snapshot/CAS frame costs seven WMI GETs. At five attempted frames/s,
- * 49/16/30/6 leaves room in the tested phase for two other snapshots,
- * Stop's read and conditional restoration. No priority or physical guarantee. */
+ * Keep one complete Stop snapshot/CAS restoration (2+5 GETs and one SET)
+ * outside ordinary status, CAS and write admission. This is a quota policy,
+ * not a physical safety claim or a guarantee against slow I/O/queued writers. */
 #if defined(BROKER_SUSTAINED_CANDIDATE) && !defined(BROKER_TESTING)
 #error "sustained candidate requires a fake-kernel test build"
 #endif
@@ -74,6 +75,9 @@
 #define CANDIDATE_STATUS_READ_LIMIT 16
 #define CANDIDATE_CAS_READ_LIMIT 30
 #define CANDIDATE_WRITE_LIMIT 6
+#define CANDIDATE_STATUS_ORDINARY 12
+#define CANDIDATE_CAS_ORDINARY 25
+#define CANDIDATE_WRITE_ORDINARY 5
 #endif
 
 /* Not built or installed by the normal broker target. One root-owned persistent
@@ -195,6 +199,9 @@ static enum read_kind booked_kind;
 static bool booked_write;
 static size_t booked_write_offset;
 static uint64_t nonce, sequence;
+#ifdef BROKER_SUSTAINED_CANDIDATE
+static bool stop_token_ready;
+#endif
 
 static int64_t now_ms(void);
 #ifdef BROKER_RATE_EXPERIMENT
@@ -239,6 +246,16 @@ static void token_string(char out[34])
 {
     snprintf(out, 34, "%016" PRIX64 ":%016" PRIX64, nonce, sequence);
 }
+
+#ifdef BROKER_SUSTAINED_CANDIDATE
+/* A distinct test-only token grants the reserved restoration slot only to
+ * a client that actually obtained a Stop snapshot of this version. */
+static void stop_token_string(char out[34])
+{
+    snprintf(out, 34, "%016" PRIX64 ":%016" PRIX64,
+             nonce ^ UINT64_C(0x8000000000000000), sequence);
+}
+#endif
 
 static bool token_valid(const char *s)
 {
@@ -307,7 +324,7 @@ static enum result reserve_slot(int64_t *times, size_t *count, size_t capacity)
 
 /* Reserve all firmware-facing GETs before starting each operation, including
  * the two GETs executed inside the kernel's colors_store/restore_store. */
-static enum result reserve_reads(size_t count, enum read_kind kind)
+static enum result reserve_reads(size_t count, enum read_kind kind, bool stop_priority)
 {
     int64_t current = now_ms();
     if (current < 0) return IO;
@@ -324,9 +341,18 @@ static enum result reserve_reads(size_t count, enum read_kind kind)
     read_count = retained;
     status_count = status_retained;
     cas_count = cas_retained;
+    size_t status_cap = status_limit(current), cas_cap = cas_limit(current);
+#ifdef BROKER_SUSTAINED_CANDIDATE
+    if (!stop_priority) {
+        status_cap = CANDIDATE_STATUS_ORDINARY;
+        cas_cap = CANDIDATE_CAS_ORDINARY;
+    }
+#else
+    (void)stop_priority;
+#endif
     if (read_count + count > read_limit(current) ||
-        (kind == SNAPSHOT_READ && status_count + count > status_limit(current)) ||
-        (kind == CAS_READ && cas_count + count > cas_limit(current))) return BUSY;
+        (kind == SNAPSHOT_READ && status_count + count > status_cap) ||
+        (kind == CAS_READ && cas_count + count > cas_cap)) return BUSY;
     booked_reads = count;
     booked_read_offset = read_count;
     booked_kind_offset = kind == SNAPSHOT_READ ? status_count : cas_count;
@@ -443,7 +469,7 @@ static enum result reserve_stop_reads(int64_t deadline, int client)
     for (;;) {
         enum result result = check_deadline(deadline);
         if (result != OK) return result;
-        result = reserve_reads(2, SNAPSHOT_READ);
+        result = reserve_reads(2, SNAPSHOT_READ, true);
         if (result != BUSY) return result;
         int64_t current = now_ms();
         if (current < 0) return IO;
@@ -464,12 +490,13 @@ static enum result reserve_stop_reads(int64_t deadline, int client)
 
 /* Mutation admission waits only until the request deadline. The complete
  * kernel pre-read, kernel verification and broker readback are prebooked. */
-static enum result reserve_mutation_reads(size_t count, int64_t deadline, int client)
+static enum result reserve_mutation_reads(size_t count, int64_t deadline, int client,
+                                          bool stop_priority)
 {
     for (;;) {
         enum result result = check_deadline(deadline);
         if (result != OK) return result;
-        result = reserve_reads(count, CAS_READ);
+        result = reserve_reads(count, CAS_READ, stop_priority);
         if (result != BUSY) return result;
         int64_t current = now_ms();
         if (current < 0) return IO;
@@ -488,12 +515,18 @@ static enum result reserve_mutation_reads(size_t count, int64_t deadline, int cl
     }
 }
 
-static enum result reserve_write(int64_t deadline, int client)
+static enum result reserve_write(int64_t deadline, int client, bool stop_priority)
 {
     for (;;) {
         enum result result = check_deadline(deadline);
         if (result != OK) return result;
-        result = reserve_slot(write_times, &write_count, write_limit(now_ms()));
+        size_t capacity = write_limit(now_ms());
+#ifdef BROKER_SUSTAINED_CANDIDATE
+        if (!stop_priority) capacity = CANDIDATE_WRITE_ORDINARY;
+#else
+        (void)stop_priority;
+#endif
+        result = reserve_slot(write_times, &write_count, capacity);
         if (result == OK) {
             booked_write = true;
             booked_write_offset = write_count - 1;
@@ -523,21 +556,30 @@ static enum result write_attribute(int root, const struct stat *st,
     int fd = -1;
     result = open_attribute(root, st, which, O_WRONLY, &fd);
     if (result == OK) result = check_deadline(deadline);
-    if (result == OK) result = reserve_write(deadline, client);
+    bool stop_priority = false;
+#ifdef BROKER_SUSTAINED_CANDIDATE
+    if (cas_token && stop_token_ready) {
+        char stop_token[34];
+        stop_token_string(stop_token);
+        stop_priority = memcmp(cas_token, stop_token, 33) == 0;
+    }
+#endif
+    if (result == OK) result = reserve_write(deadline, client, stop_priority);
     if (result == OK) result = check_deadline(deadline);
     if (result == OK) result = peer_present(client);
     char state[READ_MAX + 1];
     if (result == OK && cas_token) {
         char current_token[34], colors[READ_MAX + 1];
         token_string(current_token);
-        if (memcmp(cas_token, current_token, 33)) result = CONFLICT;
-        if (result == OK) result = reserve_mutation_reads(5, deadline, client);
+        if (memcmp(cas_token, current_token, 33) && !stop_priority) result = CONFLICT;
+        if (result == OK) result = reserve_mutation_reads(5, deadline, client,
+                                                         stop_priority);
         if (result == OK) result = read_state(root, st, state, deadline);
         if (result == OK) result = read_wire(root, st, COLORS, colors, deadline);
         if (result == OK && (strcmp(state, cas_state) ||
                             memcmp(colors, cas_expected, WIRE_LEN))) result = CONFLICT;
     } else if (result == OK) {
-        result = reserve_mutation_reads(4, deadline, client);
+        result = reserve_mutation_reads(4, deadline, client, false);
         if (result == OK) result = read_state(root, st, state, deadline);
     }
     if (result == OK && strcmp(state, "on")) result = CONFLICT;
@@ -547,6 +589,9 @@ static enum result write_attribute(int root, const struct stat *st,
     if (result == OK) {
         if (sequence == UINT64_MAX) { result = IO; goto done; }
         ++sequence; /* Any attempted write, including an uncertain one, invalidates snapshots. */
+#ifdef BROKER_SUSTAINED_CANDIDATE
+        stop_token_ready = false;
+#endif
         ssize_t sent = write(fd, value, size); /* NEVER retry ambiguous writes. */
         if (sent < 0) result = IO; /* even EAGAIN may have changed firmware */
         else if ((size_t)sent != size) result = IO;
@@ -612,7 +657,8 @@ static enum result transact(const char *request, size_t length,
     if (result == OK) result = check_abi(root, &st, deadline);
     char expected[READ_MAX + 1], actual[READ_MAX + 1];
     if (result == OK && stop_snapshot) result = reserve_stop_reads(deadline, client);
-    else if (result == OK && (status || snapshot)) result = reserve_reads(2, SNAPSHOT_READ);
+    else if (result == OK && (status || snapshot))
+        result = reserve_reads(2, SNAPSHOT_READ, false);
     if (result == OK && (status || snapshot || stop_snapshot)) {
         result = read_wire(root, &st, COLORS, actual, deadline);
         if (result == OK) result = read_wire(root, &st, ORIGINAL, expected, deadline);
@@ -622,6 +668,12 @@ static enum result transact(const char *request, size_t length,
             if (result == OK && (snapshot || stop_snapshot)) {
                 char token[34];
                 token_string(token);
+#ifdef BROKER_SUSTAINED_CANDIDATE
+                if (stop_snapshot) {
+                    stop_token_string(token);
+                    stop_token_ready = true;
+                }
+#endif
                 snprintf(response, 2 * READ_MAX + 16, "OK %s %.3s %.27s %.27s\n",
                          token, state, actual, expected);
             } else if (result == OK)
