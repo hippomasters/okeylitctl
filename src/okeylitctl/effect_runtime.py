@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import isfinite
-from time import monotonic
+from time import monotonic, sleep
 from typing import Protocol
 
 from .effects import EffectEvent, EffectKind, EffectSpec, frame_at
-from .ipc import ConflictError
+from .ipc import BrokerBusyError, BrokerTimeoutError, ConflictError
 from .models import ColorLayout, Zone
 from .sysfs import SysfsError
 
@@ -111,7 +111,16 @@ class EffectRuntime:
 
     def _stop_snapshot(self) -> dict[str, object]:
         stop_snapshot = getattr(self.backend, "stop_snapshot", None)
-        return stop_snapshot() if callable(stop_snapshot) else self.backend.snapshot()
+        read = stop_snapshot if callable(stop_snapshot) else self.backend.snapshot
+        # A failed Stop read has not requested any mutation. One fresh read
+        # after bounded backoff can recover from a transient broker deadline;
+        # the broker still admits and charges each attempt under its quotas.
+        # Never retry CAS here: an unacknowledged write remains uncertain.
+        try:
+            return read()
+        except (BrokerBusyError, BrokerTimeoutError):
+            sleep(0.05)
+            return read()
 
     def _owns_stop_token(self, token: object) -> bool:
         if token == self.owned_token:
