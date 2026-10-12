@@ -113,6 +113,24 @@ class EffectRuntime:
         stop_snapshot = getattr(self.backend, "stop_snapshot", None)
         return stop_snapshot() if callable(stop_snapshot) else self.backend.snapshot()
 
+    def _owns_stop_token(self, token: object) -> bool:
+        if token == self.owned_token:
+            return True  # Older brokers return the ordinary CAS token.
+        # The bounded broker flips only the high nonce bit for STOPSHOT. The
+        # revision must still match the last acknowledged CAS exactly; colors
+        # alone never establish ownership (including across ABA writes).
+        if not isinstance(token, str) or self.owned_token is None:
+            return False
+        parts, owned = token.split(":"), self.owned_token.split(":")
+        if (len(parts) != 2 or len(owned) != 2 or
+                any(len(part) != 16 for part in (*parts, *owned))):
+            return False
+        try:
+            return (parts[1] == owned[1] and
+                    int(parts[0], 16) ^ int(owned[0], 16) == 0x8000000000000000)
+        except ValueError:
+            return False
+
     def _cas_stop(self) -> bool:
         if self.ownership_lost:
             return False
@@ -128,7 +146,7 @@ class EffectRuntime:
                 self.observed_power_off = True
                 return False
             self.observed_power_off = False
-            if (snapshot.get("token") != self.owned_token
+            if (not self._owns_stop_token(snapshot.get("token"))
                     or snapshot.get("colors") != self.last_written.to_wire().split(",")):
                 self._lose_ownership()
                 return False
@@ -144,7 +162,7 @@ class EffectRuntime:
             return False
         self.observed_power_off = False
         expected = self.last_written.to_wire()
-        if (snapshot.get("token") != self.owned_token
+        if (not self._owns_stop_token(snapshot.get("token"))
                 or snapshot.get("colors") != expected.split(",")):
             self._lose_ownership()
             return False
@@ -154,7 +172,7 @@ class EffectRuntime:
         self.write_state_uncertain = True
         try:
             token = self.backend.compare_and_write(
-                self.owned_token, "on", expected, self.spec.base.to_wire()
+                snapshot["token"], "on", expected, self.spec.base.to_wire()
             )
         except ConflictError:
             self.write_state_uncertain = False

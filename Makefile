@@ -33,7 +33,7 @@ build/okeylitctl-broker-rate-campaign-3: broker/main.c
 
 build/okeylitctl-broker: broker/main.c
 	mkdir -p build
-	$(CC) -std=c11 -O2 -Wall -Wextra -Werror $< -o $@
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DBROKER_BOUNDED_NORMAL $< -o $@
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi

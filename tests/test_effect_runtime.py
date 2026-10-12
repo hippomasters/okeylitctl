@@ -114,6 +114,34 @@ class EffectRuntimeSchedulingTests(unittest.TestCase):
         self.assertEqual((backend.frame_reads, backend.stop_reads), (1, 1))
         self.assertEqual(backend.writes[-1], BASE.to_wire())
 
+    def test_bounded_stop_token_restores_only_acknowledged_revision(self):
+        class PriorityStopBackend(CASBackend):
+            @property
+            def priority_token(self):
+                return f"8000000000000001:{self.revision:016X}"
+
+            def stop_snapshot(self):
+                return {**self.snapshot(), "token": self.priority_token}
+
+            def compare_and_write(self, token, state, expected_wire, desired_wire):
+                if token == self.priority_token:
+                    token = self.token
+                return super().compare_and_write(token, state, expected_wire, desired_wire)
+
+        backend = PriorityStopBackend()
+        runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE), rate_hz=5)
+        runtime.start(now=0.0)
+        self.assertTrue(runtime.tick(now=0.0))
+        self.assertTrue(runtime.stop())
+        self.assertEqual(backend.colors, BASE.to_wire())
+
+        runtime.start(now=1.0)
+        self.assertTrue(runtime.tick(now=1.0))
+        backend.external_write(runtime.last_written.to_wire())  # ABA colors, new token
+        self.assertFalse(runtime.stop())
+        self.assertTrue(runtime.ownership_lost)
+        self.assertEqual(len(backend.writes), 3)
+
     def test_reports_completed_frame_io_and_real_write_spacing_without_changing_cadence(self):
         backend = CASBackend()
         runtime = EffectRuntime(backend, EffectSpec(kind=EffectKind.CYCLE, base=BASE), rate_hz=2.0)

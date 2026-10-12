@@ -133,6 +133,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
         (self.root / "rate-experiment-used").unlink(missing_ok=True)
         (self.root / "rate-experiment-2-used").unlink(missing_ok=True)
         (self.root / "rate-experiment-3-used").unlink(missing_ok=True)
+        (self.root / "normal-bounded-used").unlink(missing_ok=True)
         for name in ("abi_version", "colors", "original", "state", "restore"):
             path = self.root / name
             if path.is_symlink():
@@ -482,6 +483,173 @@ ssize_t write(int fd, const void *buf, size_t len) {
                     self.assertLessEqual(len(window), 49, events)
                     self.assertLessEqual(window.count("I"), 12, events)
         self.binary = self.__class__.binary
+
+    def test_normal_build_opt_in_lease_admits_five_hz_with_owned_stop(self):
+        # Ordinary build policy in a fake-device compilation, not a campaign.
+        source = (REPO / "Makefile").read_text()
+        rule = source.split("build/okeylitctl-broker: broker/main.c")[1].split("\n\n")[0]
+        self.assertIn("-DBROKER_BOUNDED_NORMAL", rule)
+        normal = pathlib.Path(self.bin_tmp.name) / "bounded-normal-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = normal
+        trace = pathlib.Path(self.tmp.name) / "bounded-normal-wmi"
+        trace.write_text("")
+        legacy = self.root / "rate-experiment-used"
+        legacy.write_bytes(b"consumed earlier diagnostic")
+        self.launch_broker("trace", trace=trace)
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"OK BURST\n")
+        self.assertEqual(legacy.read_bytes(), b"consumed earlier diagnostic")
+        self.assertTrue((self.root / "normal-bounded-used").exists())
+        expected, desired = BASE, ALT
+        started = time.monotonic()
+        for index in range(5):
+            due = started + index * 0.2
+            if due > time.monotonic():
+                time.sleep(due - time.monotonic())
+            token, state, colors, _ = self.snapshot()
+            self.assertEqual((state, colors), (b"on", expected))
+            reply = self.cas(token, expected=expected, desired=desired)
+            self.assertTrue(reply.startswith(b"OK "), reply)
+            expected, desired = desired, expected
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
+                                 desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR BUSY\n")
+        # A 1.05s blocked firmware read still defeats the one-second request
+        # deadline. Preserve the frame; a later owned Stop may restore it.
+        remaining = started + 1.1 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        self.assertTrue(self.cas(self.snapshot()[0], expected=BASE,
+                                 desired=ALT).startswith(b"OK "))
+        slow = pathlib.Path(str(trace) + ".slow")
+        slow.touch()
+        try:
+            self.assertEqual(self.request(b"2 STOPSHOT\n"), b"ERR BUSY\n")
+        finally:
+            slow.unlink(missing_ok=True)
+        self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=ALT,
+                                 desired=BASE).startswith(b"OK "))
+        remaining = started + 3.1 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        time.sleep(1.1)  # all lease-era reservations have left the window
+        for _ in range(5):
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        self.assertEqual(self.request(b"1 STATUS\n"), b"ERR BUSY\n")
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.launch_broker()
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR BUSY\n")
+        self.assertEqual(legacy.read_bytes(), b"consumed earlier diagnostic")
+        events = self.observed_wmi(trace)
+        for timestamp, _ in events:
+            self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                     for at, _ in events), 49, events)
+
+    def test_normal_build_four_hz_uses_same_lease_and_priority_stop(self):
+        normal = pathlib.Path(self.bin_tmp.name) / "bounded-normal-4"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = normal
+        trace = pathlib.Path(self.tmp.name) / "bounded-normal-4-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"OK BURST\n")
+        started = time.monotonic()
+        expected, desired = BASE, ALT
+        for index in range(4):
+            due = started + index * 0.25
+            if due > time.monotonic():
+                time.sleep(due - time.monotonic())
+            token, state, colors, _ = self.snapshot()
+            self.assertEqual((state, colors), (b"on", expected))
+            self.assertTrue(self.cas(token, expected=expected,
+                                     desired=desired).startswith(b"OK "))
+            expected, desired = desired, expected
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertEqual(stop.split(b" ")[3], expected)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=expected,
+                                 desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
+        for timestamp, _ in events:
+            self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                     for at, _ in events), 49, events)
+
+    def test_normal_cli_tui_start_tick_visible_stop_uses_ipc_and_restores(self):
+        import io
+        from unittest import mock
+        from okeylitctl.cli import main
+        from okeylitctl.ipc import IPCBackend
+        from test_tui import FakeProfileStore
+
+        normal = pathlib.Path(self.bin_tmp.name) / "normal-tui-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = normal
+        trace = pathlib.Path(self.tmp.name) / "normal-tui-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+
+        class Screen:
+            def __init__(self):
+                self.keys = iter((9, -1, ord("s"), ord("q")))
+                self.drawn = []
+
+            def keypad(self, _enabled): pass
+            def timeout(self, _value): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, _y, _x, text, _length, *_attr):
+                self.drawn.append(text)
+            def refresh(self): pass
+            def getch(self):
+                key = next(self.keys)
+                if key == -1:
+                    time.sleep(0.28)
+                return key
+
+        screen = Screen()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("okeylitctl.cli.IPCBackend",
+                        side_effect=lambda: IPCBackend(socket_path=self.sockpath)), \
+             mock.patch("okeylitctl.tui.curses.wrapper", side_effect=lambda fn: fn(screen)), \
+             mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            code = main(["tui", "--test-rate-hz", "5", "--rate-experiment"],
+                        profile_store=FakeProfileStore(), stdout=out, stderr=err)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertTrue(any("S Stop" in text for text in screen.drawn), screen.drawn[-20:])
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n",
+                         [text for text in screen.drawn if any(word in text.lower() for word in
+                          ("stop", "restore", "unknown", "ownership", "pending", "effect state", "broker"))][-25:])
+        events = self.observed_wmi(trace)
+        self.assertGreaterEqual(sum(kind == "I" for _, kind in events), 2)
+        for timestamp, _ in events:
+            self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
+                                     for at, _ in events), 49, events)
 
     def test_candidate_saturated_status_clients_leave_priority_stop_headroom(self):
         candidate = pathlib.Path(self.bin_tmp.name) / "candidate-broker"

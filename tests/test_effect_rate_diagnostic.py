@@ -32,13 +32,17 @@ class RateDiagnosticTests(unittest.TestCase):
                 app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
                 self.assertTrue(app._start_effect(now=0.0))
                 self.assertEqual(backend.started_rate, rate)
-                for frame in range(10):
+                frames = rate * 2
+                for frame in range(frames):
                     with mock.patch("okeylitctl.effect_runtime.monotonic",
                                     side_effect=(10.0 + frame, 10.005 + frame, 10.007 + frame, 10.01 + frame)):
-                        self.assertTrue(app._tick_effect(now=frame * 0.3, authorized=True))
+                        self.assertTrue(app._tick_effect(now=frame * (1 / rate + 0.01),
+                                                         authorized=True))
+                if rate == 4:
+                    self.assertFalse(app._tick_effect(now=2.0, authorized=True))
                 self.assertFalse(app.state.effect_running)
                 self.assertIsNone(app.effect_runtime)
-                self.assertEqual(len(backend.cas_writes), 11)  # ten frames and one Stop
+                self.assertEqual(len(backend.cas_writes), frames + 1)
                 self.assertEqual(backend.cas_writes[-1], app.state.current.to_wire())
 
     def test_burst_refuses_unsafe_backend_before_any_write(self):
@@ -59,13 +63,13 @@ class RateDiagnosticTests(unittest.TestCase):
         self.assertIsNone(backend.started_rate)
         self.assertEqual(backend.cas_writes, [])
 
-    def test_burst_deadline_stops_without_late_frame(self):
+    def test_burst_deadline_stops_before_broker_lease_expires_without_late_frame(self):
         backend = self.BurstBackend()
         app = CursesTui(backend, profile_store=FakeProfileStore(),
                         test_rate_hz=5, rate_experiment=True)
         app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
         self.assertTrue(app._start_effect(now=0.0))
-        self.assertFalse(app._tick_effect(now=3.0, authorized=True))
+        self.assertFalse(app._tick_effect(now=2.0, authorized=True))
         self.assertEqual(backend.cas_writes, [])
         self.assertIsNone(app.effect_runtime)
 
@@ -89,6 +93,23 @@ class RateDiagnosticTests(unittest.TestCase):
         self.assertEqual(backend.stops, 2)
         self.assertIsNone(app.effect_runtime)
         self.assertEqual(len(backend.cas_writes), 2)
+
+    def test_failed_auto_stop_never_writes_another_frame_past_deadline(self):
+        class BusyStopRead(self.BurstBackend):
+            def stop_snapshot(self):
+                raise BackendIOError("broker read quota busy")
+
+        backend = BusyStopRead()
+        app = CursesTui(backend, profile_store=FakeProfileStore(),
+                        test_rate_hz=5, rate_experiment=True)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        self.assertFalse(app._tick_effect(now=2.0, authorized=True))
+        self.assertTrue(app.state.effect_restore_pending)
+        self.assertFalse(app._tick_effect(now=2.3, authorized=True))
+        self.assertEqual(len(backend.cas_writes), 1)
+        self.assertIsNotNone(app.effect_runtime)
 
     def test_burst_write_failure_keeps_unknown_locked(self):
         class UncertainBurst(self.BurstBackend):
@@ -121,7 +142,7 @@ class RateDiagnosticTests(unittest.TestCase):
         for frame in range(10):
             with mock.patch("okeylitctl.effect_runtime.monotonic",
                             side_effect=(10.0 + frame, 10.005 + frame, 10.007 + frame, 10.01 + frame)):
-                app._tick_effect(now=frame * 0.3, authorized=True)
+                app._tick_effect(now=frame * 0.21, authorized=True)
         self.assertIsNone(app.effect_runtime)
         self.assertFalse(app.state.effect_running)
         self.assertTrue(app.state.live_last_observed)

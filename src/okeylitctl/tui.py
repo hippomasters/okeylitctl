@@ -248,6 +248,7 @@ class CursesTui:
         self.test_rate_hz = test_rate_hz
         self.rate_experiment = rate_experiment
         self._experiment_frames = 0
+        self._experiment_started_at = 0.0
         self._experiment_auto_stop_attempted = False
         self.profile_store = profile_store or ProfileStore()
         self.power_state = "unknown"
@@ -1227,14 +1228,17 @@ class CursesTui:
             if not callable(begin):
                 self.state.message = "Rate experiment needs the opt-in diagnostic broker"
                 return False
+            # Start the shorter frontend window before the broker exchange:
+            # a delayed acknowledgement must not extend a three-second lease.
+            now = monotonic() if now is None else now
             try:
                 begin(self.test_rate_hz)
             except (SysfsError, ValidationError) as exc:
                 self.state.message = f"Rate experiment refused: {exc}"
                 return False
             # The broker starts its independent three-second monotonic lease
-            # on acknowledgement; the frontend also caps frame count/time.
-            now = monotonic() if now is None else now
+            # on acknowledgement; this is headroom, not a Stop guarantee.
+            self._experiment_started_at = now
             self._experiment_frames = 0
             self._experiment_auto_stop_attempted = False
         runtime = EffectRuntime(
@@ -1314,7 +1318,8 @@ class CursesTui:
             return False
         now = monotonic() if now is None else now
         if (self.rate_experiment and not self._experiment_auto_stop_attempted
-                and (self._experiment_frames >= 10 or now - runtime.started_at >= 3.0)):
+                and (self._experiment_frames >= 10
+                     or now - self._experiment_started_at >= 2.0)):
             self._experiment_auto_stop_attempted = True
             self._finish_rate_experiment()
             return False

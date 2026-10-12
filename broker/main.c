@@ -52,14 +52,16 @@
  * SNAPSHOT: colors + state = 2 GETs (original and ABI are cached sysfs).
  * CAS: state + colors + kernel pre-read + kernel verification + broker
  * readback = 5 GETs. A complete snapshot/CAS frame costs 7 GETs.
- * Thus sustained 4/5 Hz cannot fit this 25 GET/s rolling ceiling.
+ * Without an explicit lease, 4/5 Hz cannot fit this rolling ceiling.
  */
 #define READ_LIMIT 25
 #define STATUS_READ_LIMIT 10 /* read-only clients cannot starve writes */
 #define CAS_READ_LIMIT 20
 #define WINDOW_MS 1000
 #define WIRE_LEN 27
-/* Test-only provisional sustained-rate policy; no installed target enables it.
+/* Provisional sustained-rate policy. The normal build enables it only during
+ * one explicit, persistent-stamp-bounded lease; the unrestricted candidate
+ * remains fake-kernel-only. Ordinary traffic retains the 25 GET ceiling.
  * A snapshot/CAS frame costs seven WMI GETs. At five attempted frames/s,
  * Keep one complete Stop snapshot/CAS restoration (2+5 GETs and one SET)
  * outside ordinary status, CAS and write admission. This is a quota policy,
@@ -67,10 +69,13 @@
 #if defined(BROKER_SUSTAINED_CANDIDATE) && !defined(BROKER_TESTING)
 #error "sustained candidate requires a fake-kernel test build"
 #endif
+#ifdef BROKER_BOUNDED_NORMAL
+#define BROKER_RATE_EXPERIMENT
+#endif
 #if defined(BROKER_SUSTAINED_CANDIDATE) && defined(BROKER_RATE_EXPERIMENT)
 #error "sustained candidate and diagnostic lease are mutually exclusive"
 #endif
-#ifdef BROKER_SUSTAINED_CANDIDATE
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
 #define CANDIDATE_READ_LIMIT 49
 #define CANDIDATE_STATUS_READ_LIMIT 16
 #define CANDIDATE_CAS_READ_LIMIT 30
@@ -100,7 +105,9 @@ static int64_t burst_until;
 static bool burst_used;
 #ifdef BROKER_TESTING
 #define BURST_DIRECTORY DEVICE_ROOT
-#ifdef BROKER_RATE_CAMPAIGN_3
+#ifdef BROKER_BOUNDED_NORMAL
+#define BURST_STAMP "normal-bounded-used"
+#elif defined(BROKER_RATE_CAMPAIGN_3)
 #define BURST_STAMP "rate-experiment-3-used"
 #elif defined(BROKER_RATE_CAMPAIGN_2)
 #define BURST_STAMP "rate-experiment-2-used"
@@ -110,14 +117,20 @@ static bool burst_used;
 #else
 /* StateDirectory in the service persists across broker restarts/reboots.
  * Only an administrator may remove this stamp between separately reviewed rates. */
-#ifdef BROKER_RATE_CAMPAIGN_3
+#ifdef BROKER_BOUNDED_NORMAL
+#define BURST_DIRECTORY "/var/lib/okeylitctl-rate-experiment"
+#elif defined(BROKER_RATE_CAMPAIGN_3)
 #define BURST_DIRECTORY "/var/lib/okeylitctl-rate-experiment-3"
 #elif defined(BROKER_RATE_CAMPAIGN_2)
 #define BURST_DIRECTORY "/var/lib/okeylitctl-rate-experiment-2"
 #else
 #define BURST_DIRECTORY "/var/lib/okeylitctl-rate-experiment"
 #endif
+#ifdef BROKER_BOUNDED_NORMAL
+#define BURST_STAMP "normal-bounded-used"
+#else
 #define BURST_STAMP "used"
+#endif
 #endif
 static bool burst_active(int64_t current)
 {
@@ -148,7 +161,9 @@ static size_t read_limit(int64_t current)
 static size_t status_limit(int64_t current)
 {
     (void)current;
-#ifdef BROKER_RATE_EXPERIMENT
+#ifdef BROKER_BOUNDED_NORMAL
+    if (burst_active(current)) return CANDIDATE_STATUS_READ_LIMIT;
+#elif defined(BROKER_RATE_EXPERIMENT)
     if (burst_active(current)) return MAX_STATUS_READ_LIMIT;
 #elif defined(BROKER_SUSTAINED_CANDIDATE)
     return CANDIDATE_STATUS_READ_LIMIT;
@@ -158,7 +173,9 @@ static size_t status_limit(int64_t current)
 static size_t cas_limit(int64_t current)
 {
     (void)current;
-#ifdef BROKER_RATE_EXPERIMENT
+#ifdef BROKER_BOUNDED_NORMAL
+    if (burst_active(current)) return CANDIDATE_CAS_READ_LIMIT;
+#elif defined(BROKER_RATE_EXPERIMENT)
     if (burst_active(current)) return MAX_CAS_READ_LIMIT;
 #elif defined(BROKER_SUSTAINED_CANDIDATE)
     return CANDIDATE_CAS_READ_LIMIT;
@@ -168,7 +185,9 @@ static size_t cas_limit(int64_t current)
 static size_t write_limit(int64_t current)
 {
     (void)current;
-#ifdef BROKER_RATE_EXPERIMENT
+#ifdef BROKER_BOUNDED_NORMAL
+    if (burst_active(current)) return CANDIDATE_WRITE_LIMIT;
+#elif defined(BROKER_RATE_EXPERIMENT)
     if (burst_active(current)) return MAX_WRITE_LIMIT;
 #elif defined(BROKER_SUSTAINED_CANDIDATE)
     return CANDIDATE_WRITE_LIMIT;
@@ -199,7 +218,7 @@ static enum read_kind booked_kind;
 static bool booked_write;
 static size_t booked_write_offset;
 static uint64_t nonce, sequence;
-#ifdef BROKER_SUSTAINED_CANDIDATE
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
 static bool stop_token_ready;
 #endif
 
@@ -247,9 +266,9 @@ static void token_string(char out[34])
     snprintf(out, 34, "%016" PRIX64 ":%016" PRIX64, nonce, sequence);
 }
 
-#ifdef BROKER_SUSTAINED_CANDIDATE
-/* A distinct test-only token grants the reserved restoration slot only to
- * a client that actually obtained a Stop snapshot of this version. */
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
+/* A distinct Stop token grants reserved restoration capacity only to a
+ * client that obtained a STOPSHOT of this exact broker revision. */
 static void stop_token_string(char out[34])
 {
     snprintf(out, 34, "%016" PRIX64 ":%016" PRIX64,
@@ -342,8 +361,12 @@ static enum result reserve_reads(size_t count, enum read_kind kind, bool stop_pr
     status_count = status_retained;
     cas_count = cas_retained;
     size_t status_cap = status_limit(current), cas_cap = cas_limit(current);
-#ifdef BROKER_SUSTAINED_CANDIDATE
-    if (!stop_priority) {
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
+    if (!stop_priority
+#ifdef BROKER_BOUNDED_NORMAL
+        && burst_active(current)
+#endif
+    ) {
         status_cap = CANDIDATE_STATUS_ORDINARY;
         cas_cap = CANDIDATE_CAS_ORDINARY;
     }
@@ -521,8 +544,12 @@ static enum result reserve_write(int64_t deadline, int client, bool stop_priorit
         enum result result = check_deadline(deadline);
         if (result != OK) return result;
         size_t capacity = write_limit(now_ms());
-#ifdef BROKER_SUSTAINED_CANDIDATE
-        if (!stop_priority) capacity = CANDIDATE_WRITE_ORDINARY;
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
+        if (!stop_priority
+#ifdef BROKER_BOUNDED_NORMAL
+            && burst_active(now_ms())
+#endif
+        ) capacity = CANDIDATE_WRITE_ORDINARY;
 #else
         (void)stop_priority;
 #endif
@@ -557,7 +584,7 @@ static enum result write_attribute(int root, const struct stat *st,
     result = open_attribute(root, st, which, O_WRONLY, &fd);
     if (result == OK) result = check_deadline(deadline);
     bool stop_priority = false;
-#ifdef BROKER_SUSTAINED_CANDIDATE
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
     if (cas_token && stop_token_ready) {
         char stop_token[34];
         stop_token_string(stop_token);
@@ -589,7 +616,7 @@ static enum result write_attribute(int root, const struct stat *st,
     if (result == OK) {
         if (sequence == UINT64_MAX) { result = IO; goto done; }
         ++sequence; /* Any attempted write, including an uncertain one, invalidates snapshots. */
-#ifdef BROKER_SUSTAINED_CANDIDATE
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
         stop_token_ready = false;
 #endif
         ssize_t sent = write(fd, value, size); /* NEVER retry ambiguous writes. */
@@ -668,7 +695,7 @@ static enum result transact(const char *request, size_t length,
             if (result == OK && (snapshot || stop_snapshot)) {
                 char token[34];
                 token_string(token);
-#ifdef BROKER_SUSTAINED_CANDIDATE
+#if defined(BROKER_SUSTAINED_CANDIDATE) || defined(BROKER_BOUNDED_NORMAL)
                 if (stop_snapshot) {
                     stop_token_string(token);
                     stop_token_ready = true;
