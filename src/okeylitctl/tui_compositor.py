@@ -201,7 +201,8 @@ def _responsive_effect_shortcut(state: TuiState, power_state: str) -> str:
     if state.live_unknown:
         return "R Verify  ? help  Q quit"
     if not state.effect_running:
-        return "A apply  X discard  O original  M profiles  R refresh  ? help  Q quit"
+        action = "apply" if state.effect_kind is EffectKind.STATIC else "start"
+        return f"A {action}  X discard  O original  M profiles  R refresh  ? help  Q quit"
     if power_state == "off":
         return (
             "POWER ON, THEN S TO VERIFY  ? help"
@@ -473,7 +474,8 @@ def _draw_footer(canvas: _Canvas, state: TuiState, power_state: str) -> None:
             if state.effect_kind is EffectKind.CYCLE else
             "↔  zone    ↑↓  channel    + -  adjust    Tab  effect    [ ]  speed    E  hex    P  preset"
         )
-        second = "A  apply    X  discard    O  original    M  profiles    R  refresh    ?  help    Q  quit"
+        action = "apply" if state.effect_kind is EffectKind.STATIC else "start"
+        second = f"A  {action}    X  discard    O  original    M  profiles    R  refresh    ?  help    Q  quit"
     canvas.put(49, 5, first, "footer")
     canvas.put(51, 5, second, "footer")
 
