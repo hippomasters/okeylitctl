@@ -24,18 +24,24 @@ _WIRE = rb"[0-9A-F]{6}(?:,[0-9A-F]{6}){3}"
 _STATUS = re.compile(rb"OK (on|off) (" + _WIRE + rb") (" + _WIRE + rb")\n")
 _TOKEN = rb"[0-9A-F]{16}:[0-9A-F]{16}"
 _SNAPSHOT = re.compile(rb"OK (" + _TOKEN + rb") (on|off) (" + _WIRE + rb") (" + _WIRE + rb")\n")
+
+class ConflictError(BackendIOError):
+    """The broker definitively rejected CAS without applying the mutation."""
+
+class BrokerBusyError(BackendIOError):
+    """The broker could not admit or complete this request by its deadline."""
+
+class BrokerTimeoutError(BackendIOError):
+    """The client timed out waiting for the broker (read outcome unknown)."""
+
 _ERRORS = {
     b"INVALID": (ValidationError, "broker rejected invalid request"),
-    b"BUSY": (BackendIOError, "broker is busy"),
+    b"BUSY": (BrokerBusyError, "broker is busy"),
     b"MODULE": (ModuleUnavailable, "omen_rgb kernel module is unavailable"),
     b"DENIED": (PermissionDenied, "broker denied access"),
     b"IO": (BackendIOError, "broker I/O failure"),
     b"ABI": (UnsupportedABI, "unsupported kernel ABI"),
 }
-
-
-class ConflictError(BackendIOError):
-    """The broker definitively rejected CAS without applying the mutation."""
 
 
 class IPCBackend:
@@ -100,7 +106,7 @@ class IPCBackend:
                 return raw
         except (socket.timeout, TimeoutError) as exc:
             detail = f"broker timed out; {_UNCERTAIN}" if mutation and sent else "broker timed out"
-            raise BackendIOError(detail) from None
+            raise BrokerTimeoutError(detail) from None
         except OSError as exc:
             if exc.errno in (errno.EACCES, errno.EPERM) and not (mutation and sent):
                 raise PermissionDenied("broker socket permission denied") from None
