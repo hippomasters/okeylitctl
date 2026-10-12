@@ -192,6 +192,22 @@ class ResponsiveEditorTests(unittest.TestCase):
                 self.assertIn("FROM/TO/SAT", footer)
                 self.assertNotIn("↑↓ RGB", footer)
 
+    def test_nonstatic_effect_footer_says_start_not_apply_at_layout_boundaries(self):
+        app = CursesTui(ReadOnlyBackend())
+        for width, height in ((78, 24), (100, 30), (160, 55)):
+            with self.subTest(size=(width, height)):
+                screen = StrictScreen(width, height)
+                app.state.effect_index = tuple(EffectKind).index(EffectKind.STATIC)
+                self.assertTrue(app._draw(screen))
+                static_footer = "\n".join(screen.lines()[-6:])
+                self.assertRegex(static_footer, r"A\s+apply")
+
+                app.state.effect_index = tuple(EffectKind).index(EffectKind.WAVE)
+                self.assertTrue(app._draw(screen))
+                effect_footer = "\n".join(screen.lines()[-6:])
+                self.assertRegex(effect_footer, r"A\s+start")
+                self.assertNotRegex(effect_footer, r"A\s+apply")
+
     def test_tall_narrow_cycle_effect_strip_is_multicolor(self):
         app = CursesTui(ReadOnlyBackend())
         app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
