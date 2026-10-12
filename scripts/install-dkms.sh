@@ -244,7 +244,7 @@ TMP=$(mktemp /tmp/okeylitctl.XXXXXX)
 python3 -I -m zipapp "$SOURCE/src" -m okeylitctl.cli:entrypoint \
     -p /usr/bin/python3 -o "$TMP"
 BROKER_TMP=$(mktemp /tmp/okeylitctl-broker.XXXXXX)
-cc -std=c11 -O2 -Wall -Wextra -Werror "$BROKER_SOURCE" -o "$BROKER_TMP"
+cc -std=c11 -O2 -Wall -Wextra -Werror -DBROKER_BOUNDED_NORMAL "$BROKER_SOURCE" -o "$BROKER_TMP"
 INSTALLED_CLI=1
 install -m 0755 "$TMP" "$CLI_DEST"
 INSTALLED_BROKER=1
