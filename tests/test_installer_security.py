@@ -12,7 +12,7 @@ ROOT = Path(__file__).parents[1]
 
 class InstallerSafetyTests(unittest.TestCase):
     @contextmanager
-    def isolated(self):
+    def isolated(self, *, broker_root=None, broker_socket=None):
         # The scripts' fixed system paths are rewritten into a private tree.
         # Only command wrappers in build/ are executable (tmp may be noexec).
         with tempfile.TemporaryDirectory(dir=ROOT / "build") as raw:
@@ -25,9 +25,14 @@ class InstallerSafetyTests(unittest.TestCase):
             shutil.copyfile(ROOT / "scripts/export-profiles.py", repo / "scripts/export-profiles.py")
             for name in ("omen_rgb.c", "omen_rgb_protocol.h"):
                 shutil.copyfile(ROOT / "module" / name, repo / "module" / name)
-            (repo / "src/okeylitctl/__init__.py").write_text('__version__ = "0.2.0"\n')
-            (repo / "src/okeylitctl/cli.py").write_text('APP_NAME = "okeylitctl"\ndef entrypoint(): pass\n')
-            (repo / "broker/main.c").write_text("int main(void){return 0;}\n")
+            if broker_root is None:
+                (repo / "src/okeylitctl/__init__.py").write_text('__version__ = "0.2.0"\n')
+                (repo / "src/okeylitctl/cli.py").write_text('APP_NAME = "okeylitctl"\ndef entrypoint(): pass\n')
+                (repo / "broker/main.c").write_text("int main(void){return 0;}\n")
+            else:
+                shutil.copytree(ROOT / "src", repo / "src", dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                shutil.copyfile(ROOT / "broker/main.c", repo / "broker/main.c")
             for name in ("okeylitctl-broker.service", "okeylitctl-broker.socket"):
                 shutil.copyfile(ROOT / "packaging" / name, repo / "packaging" / name)
             prefix = root / "target"
@@ -35,6 +40,14 @@ class InstallerSafetyTests(unittest.TestCase):
             commands.mkdir()
             for name in ("id", "dkms", "modprobe", "systemctl", "getent", "groupadd", "groupdel", "usermod", "cc"):
                 wrapper = commands / name
+                if name == "cc" and broker_root is not None:
+                    wrapper.write_text("#!/usr/bin/env python3\n"
+                                       "import os, sys\n"
+                                       "os.execv('/usr/bin/cc', ['/usr/bin/cc', '-DBROKER_TESTING', "
+                                       f"'-DBROKER_TEST_ROOT=\"{broker_root}\"', "
+                                       f"'-DBROKER_TEST_SOCKET=\"{broker_socket}\"', *sys.argv[1:]])\n")
+                    wrapper.chmod(0o755)
+                    continue
                 wrapper.write_text("#!/usr/bin/env python3\n" + '''import os, pathlib, sys
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -60,7 +73,8 @@ elif name == "groupadd": (state / "group").touch()
 elif name == "groupdel": (state / "group").unlink()
 elif name == "cc":
     out = pathlib.Path(args[args.index("-o") + 1])
-    out.write_text("broker\\n")
+    policy = "bounded" if "-DBROKER_BOUNDED_NORMAL" in args else "unbounded"
+    out.write_text("#!/bin/sh\\nprintf '%s\\n' " + policy + "\\n")
 ''')
                 wrapper.chmod(0o755)
             substitutions = {
@@ -88,6 +102,13 @@ elif name == "cc":
                 return subprocess.run(["/bin/sh", str(repo / "scripts" / script), *args],
                                       env={**env, "FAIL_COMMAND": fail}, capture_output=True, text=True)
             yield root, repo, prefix, run
+
+    def test_installed_ordinary_broker_uses_bounded_policy(self):
+        with self.isolated() as (_, __, prefix, run):
+            result = run("install-dkms.sh")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            broker = prefix / "usr/local/libexec/okeylitctl-broker"
+            self.assertEqual(subprocess.check_output([broker], text=True).strip(), "bounded")
 
     def test_legacy_020_uninstall_without_broker_socket_and_reinstall(self):
         with self.isolated() as (root, repo, prefix, run):
