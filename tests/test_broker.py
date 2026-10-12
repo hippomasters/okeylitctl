@@ -1,13 +1,22 @@
 """Device-free protocol and security integration tests for the native broker."""
 import os
 import pathlib
+import pty
 import re
+import select
 import shlex
+import signal
 import socket
+import struct
 import subprocess
+import sys
 import tempfile
+import termios
 import time
 import unittest
+import zipapp
+import fcntl
+import hashlib
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BASE = b"112233,445566,778899,AABBCC"
@@ -82,6 +91,12 @@ ssize_t read(int fd, void *buf, size_t len) {
         char marker[1024];
         int size = snprintf(marker, sizeof(marker), "%s.slow", log);
         if (size > 0 && size < (int)sizeof(marker) && access(marker, F_OK) == 0) {
+            struct timespec delay = { .tv_sec = 1, .tv_nsec = 50000000 };
+            nanosleep(&delay, NULL);
+        } else if (size > 0 && size < (int)sizeof(marker) &&
+                   snprintf(marker, sizeof(marker), "%s.slow-once", log) > 0 &&
+                   access(marker, F_OK) == 0) {
+            unlink(marker); /* exactly one delayed state read, then recover */
             struct timespec delay = { .tv_sec = 1, .tv_nsec = 50000000 };
             nanosleep(&delay, NULL);
         }
@@ -593,6 +608,14 @@ ssize_t write(int fd, const void *buf, size_t len) {
         for timestamp, _ in events:
             self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
                                      for at, _ in events), 49, events)
+        remaining = started + 3.1 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        time.sleep(1.1)  # former lease reservations must leave rolling window
+        for _ in range(5):
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        self.assertEqual(self.request(b"1 STATUS\n"), b"ERR BUSY\n")
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR BUSY\n")
 
     def test_normal_cli_tui_start_tick_visible_stop_uses_ipc_and_restores(self):
         import io
@@ -651,6 +674,649 @@ ssize_t write(int fd, const void *buf, size_t len) {
             self.assertLessEqual(sum(timestamp <= at < timestamp + 1_000_000_000
                                      for at, _ in events), 49, events)
 
+    def _sweep_normal_tui_effect(self, effect, rate):
+        """Each test's setUp provides a fresh fake device/broker lease."""
+        import io
+        from unittest import mock
+        from okeylitctl.cli import main
+        from okeylitctl.effects import EffectKind
+        from okeylitctl.ipc import IPCBackend
+        from okeylitctl.tui import CursesTui
+        from test_tui import FakeProfileStore
+
+        normal = pathlib.Path(self.bin_tmp.name) / "normal-effect-sweep"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = normal
+        trace = pathlib.Path(self.tmp.name) / f"sweep-{effect.value}-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+
+        class Screen:
+            def __init__(self):
+                # Tab enters the same input router as the physical TUI. The
+                # event effects receive actual foreground input, not an event
+                # injected into the frame generator.
+                keys = [9]
+                if effect in (EffectKind.REACTIVE, EffectKind.RIPPLE):
+                    keys.append(ord("z"))
+                keys.extend([-1] * 6)
+                keys.extend((ord("s"), ord("q")))
+                self.keys = iter(keys)
+                self.drawn = []
+                self.stops = []
+                self.live_frames = []
+
+            def keypad(self, _enabled): pass
+            def timeout(self, _value): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, _y, _x, text, _length, *_attr):
+                self.drawn.append(text)
+            def refresh(self): pass
+            def getch(self):
+                key = next(self.keys)
+                if key == -1:
+                    self.live_frames.append((root / "colors").read_bytes())
+                    time.sleep(0.22 if rate == 5 else 0.28)
+                return key
+
+        root = self.root
+        screen = Screen()
+        load_state = CursesTui._load_state
+        stop_effect = CursesTui._stop_effect
+        exchanges = []
+
+        class TracedIPCBackend(IPCBackend):
+            def _exchange(self, request, *, mutation):
+                response = super()._exchange(request, mutation=mutation)
+                exchanges.append((request, response))
+                return response
+
+        def selected_state(app):
+            state = load_state(app)
+            state.effect_index = list(EffectKind).index(effect) - 1
+            return state
+
+        def observed_stop(app):
+            result = stop_effect(app)
+            screen.stops.append((result, app.effect_runtime is None,
+                                 app.state.effect_restore_pending,
+                                 (self.root / "colors").read_bytes()))
+            return result
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("okeylitctl.cli.IPCBackend",
+                        side_effect=lambda: TracedIPCBackend(socket_path=self.sockpath)), \
+             mock.patch("okeylitctl.tui.curses.wrapper", side_effect=lambda fn: fn(screen)), \
+             mock.patch("okeylitctl.tui.initialize_colors", return_value=False), \
+             mock.patch.object(CursesTui, "_load_state", selected_state), \
+             mock.patch.object(CursesTui, "_stop_effect", observed_stop):
+            code = main(["tui", "--test-rate-hz", str(rate), "--rate-experiment"],
+                        profile_store=FakeProfileStore(), stdout=out, stderr=err)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertTrue(screen.stops, (effect, screen.drawn[-20:]))
+        self.assertEqual(screen.stops[0], (True, True, False, BASE + b"\n"),
+                         (effect, screen.stops, screen.drawn[-20:]))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        self.assertTrue((self.root / "normal-bounded-used").exists())
+        self.assertTrue(any(frame != BASE + b"\n" for frame in screen.live_frames),
+                        (effect, screen.live_frames))
+        self.assertGreater(len(set(screen.live_frames)), 1,
+                           (effect, screen.live_frames,
+                            self.observed_wmi(trace), screen.drawn[-30:]))
+        events = self.observed_wmi(trace)
+        writes = sum(kind == "I" for _, kind in events)
+        self.assertGreater(writes, 0, (effect, events))
+        self.assertEqual(writes % 2, 0, (effect, events))
+        self.assertLessEqual(writes, 22, (effect, events))  # ten frames + Stop
+        mutations = [request for request, _ in exchanges
+                     if request.startswith((b"2 CAS ", b"1 SET ", b"1 RESTORE"))]
+        self.assertEqual(len(mutations), writes // 2, (effect, exchanges))
+        self.assertTrue(all(request.startswith(b"2 CAS ") for request in mutations),
+                        (effect, exchanges))
+        snapshot = None
+        for request, response in exchanges:
+            if request in (b"2 SNAPSHOT\n", b"2 STOPSHOT\n") and response.startswith(b"OK "):
+                snapshot = response.split()
+            if request.startswith(b"2 CAS "):
+                parts = request.split()
+                self.assertIsNotNone(snapshot, (effect, exchanges))
+                self.assertEqual(parts[2], snapshot[1], (effect, exchanges))
+                self.assertEqual(parts[4], snapshot[3], (effect, exchanges))
+                self.assertTrue(response.startswith(b"OK "), (effect, exchanges))
+                snapshot = None
+        for at, _ in events:
+            self.assertLessEqual(sum(at <= when < at + 1_000_000_000
+                                     for when, _ in events), 49, (effect, events))
+
+    def _pty_frontend(self, rate, *, packaged, fake_mode="trace", size=(30, 110),
+                      installed_broker=None, installed_archive=None):
+        """Run real curses/entrypoint; only redirect its default broker socket."""
+        normal = installed_broker or pathlib.Path(self.bin_tmp.name) / "normal-pty-broker"
+        if installed_broker is None:
+            subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                            "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                            f'-DBROKER_TEST_ROOT="{self.root}"',
+                            f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                            str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = normal
+        trace = pathlib.Path(self.tmp.name) / f"pty-{rate}-{packaged}-{fake_mode}.trace"
+        trace.write_text("")
+        self.launch_broker(fake_mode, trace=trace)
+
+        hook = pathlib.Path(self.tmp.name) / "sitecustomize.py"
+        hook.write_text("from pathlib import Path\n"
+                        "from okeylitctl.ipc import IPCBackend\n"
+                        f"IPCBackend.__init__.__kwdefaults__['socket_path'] = Path({str(self.sockpath)!r})\n")
+        if packaged:
+            archive = installed_archive or pathlib.Path(self.tmp.name) / "okeylitctl.pyz"
+            if installed_archive is None:
+                zipapp.create_archive(REPO / "src", target=archive,
+                                      main="okeylitctl.cli:entrypoint")
+            command = [sys.executable, str(archive), "tui", "--test-rate-hz",
+                       str(rate), "--rate-experiment"]
+            package_path = archive
+        else:
+            command = [sys.executable, "-c",
+                       "from okeylitctl.tui import run_tui; "
+                       f"run_tui(test_rate_hz={rate}, rate_experiment=True)"]
+            package_path = REPO / "src"
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
+        env = dict(os.environ, TERM="xterm-256color", XDG_DATA_HOME=str(self.root),
+                   PYTHONPATH=os.pathsep.join((str(self.tmp.name), str(package_path))))
+        child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
+                                 env=env, start_new_session=True,
+                                 preexec_fn=lambda: fcntl.ioctl(slave, termios.TIOCSCTTY, 0))
+        os.close(slave)
+        self.addCleanup(lambda: self._close_pty(child, master))
+        return child, master, trace
+
+    @staticmethod
+    def _close_pty(child, master):
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        os.close(master)
+
+    def _pty_until(self, child, master, predicate, *, timeout=4):
+        output = bytearray()
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if predicate(bytes(output)):
+                return bytes(output)
+            ready, _, _ = select.select([master], [], [], 0.02)
+            if ready:
+                try:
+                    output.extend(os.read(master, 65536))
+                except OSError:
+                    if child.poll() is not None and predicate(bytes(output)):
+                        return bytes(output)
+                    break
+            if child.poll() is not None and not ready:
+                if predicate(bytes(output)):
+                    return bytes(output)
+                break
+        plain = re.sub(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\([^)]|\)[^)])", b"", bytes(output))
+        found = re.search(rb"static|effects|preview|stop", plain, re.I)
+        context = plain[max(0, found.start()-120):found.start()+350] if found else None
+        self.fail(f"PTY condition not met; exit={child.poll()}, match={context!r}, text tail={plain[-500:]!r}")
+
+    def _assert_pty_quota(self, trace, *, minimum_writes, maximum_writes):
+        events = self.observed_wmi(trace)
+        self.assertEqual(sum(kind == "I" for _, kind in events) % 2, 0, events)
+        writes = sum(kind == "I" for _, kind in events) // 2
+        self.assertGreaterEqual(writes, minimum_writes, events)
+        self.assertLessEqual(writes, maximum_writes, events)
+        for at, _ in events:
+            self.assertLessEqual(sum(at <= when < at + 1_000_000_000
+                                     for when, _ in events), 49, events)
+        return writes
+
+    def _assert_pty_effect(self, rate, *, packaged):
+        child, master, trace = self._pty_frontend(rate, packaged=packaged)
+        # Wait for the actual curses editor before sending physical key bytes.
+        opening = self._pty_until(child, master, lambda data: b"EFFECT STATIC" in data)
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        os.write(master, b"\t")  # Tab selects first animated effect and starts it.
+        activated = self._pty_until(child, master,
+                                    lambda data: (self.root / "colors").read_bytes()
+                                    != BASE + b"\n" and b"Stop" in data)
+        self.assertIn(b"S Stop", activated)
+        self.assertIn(b"EFFECT ACTIVE", activated)
+        self.assertTrue((self.root / "normal-bounded-used").exists())
+        first_frame = (self.root / "colors").read_bytes()
+        self.assertNotEqual(first_frame, BASE + b"\n")
+        os.write(master, b"s")
+        stopped = self._pty_until(child, master,
+                                  lambda data: (self.root / "colors").read_bytes()
+                                  == BASE + b"\n" and b"restored; Stop" in data)
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0, (opening, activated, stopped))
+        # Read the fake-kernel attribute independently of the TUI/backend.
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+        self._assert_pty_quota(trace, minimum_writes=2, maximum_writes=11)
+
+    def test_packaged_4hz_curses_pty_tab_start_explicit_stop_and_quit(self):
+        self._assert_pty_effect(4, packaged=True)
+
+    def test_fake_installed_real_broker_matches_make_and_zipapp_stops_bounded_effect(self):
+        from test_installer_security import InstallerSafetyTests
+
+        with InstallerSafetyTests().isolated(broker_root=self.root,
+                                             broker_socket=self.sockpath) as (root, repo, prefix, run):
+            result = run("install-dkms.sh")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installed = prefix / "usr/local/libexec/okeylitctl-broker"
+            archive = prefix / "usr/local/bin/okeylitctl"
+            built = repo / "build/okeylitctl-broker"
+            subprocess.run(["make", "-C", str(repo), "broker",
+                            f"CC={root / 'commands/cc'}"], check=True,
+                           capture_output=True, text=True)
+            self.assertEqual(hashlib.sha256(installed.read_bytes()).digest(),
+                             hashlib.sha256(built.read_bytes()).digest(),
+                             "fake-installed broker differs from normal Makefile broker")
+            child, master, trace = self._pty_frontend(
+                4, packaged=True, installed_broker=installed, installed_archive=archive)
+            self._pty_until(child, master, lambda data: b"EFFECT STATIC" in data)
+            os.write(master, b"\t")
+            active = self._pty_until(child, master,
+                                     lambda data: b"EFFECT ACTIVE" in data and
+                                     (self.root / "colors").read_bytes() != BASE + b"\n")
+            self.assertIn(b"S Stop", active)
+            self.assertTrue((self.root / "normal-bounded-used").exists())
+            os.write(master, b"s")
+            self._pty_until(child, master,
+                            lambda data: b"restored; Stop" in data and
+                            (self.root / "colors").read_bytes() == BASE + b"\n")
+            os.write(master, b"q")
+            self._pty_until(child, master, lambda _: child.poll() is not None)
+            self.assertEqual(child.returncode, 0)
+            self.assertEqual((self.root / "colors").read_bytes(),
+                             (self.root / "original").read_bytes())
+            self._assert_pty_quota(trace, minimum_writes=2, maximum_writes=11)
+            self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR BUSY\n")
+
+    def test_direct_5hz_curses_pty_tab_start_explicit_stop_and_quit(self):
+        self._assert_pty_effect(5, packaged=False)
+
+    def test_packaged_5hz_curses_pty_auto_stop_after_bounded_lease(self):
+        child, master, trace = self._pty_frontend(5, packaged=True)
+        self._pty_until(child, master, lambda data: b"EFFECT STATIC" in data)
+        started = time.monotonic()
+        os.write(master, b"\t")
+        output = self._pty_until(child, master,
+                                 lambda data: b"verified frames" in data and
+                                 (self.root / "colors").read_bytes() == BASE + b"\n",
+                                 timeout=5)
+        self.assertIn(b"Stop", output)
+        self.assertIn(b"verified frames", output)
+        self.assertTrue((self.root / "normal-bounded-used").exists())
+        writes = self._assert_pty_quota(trace, minimum_writes=3, maximum_writes=11)
+        # The lease cannot silently resume writing after auto-Stop.
+        time.sleep(0.35)
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual(self._assert_pty_quota(trace, minimum_writes=writes,
+                                               maximum_writes=writes), writes)
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+        time.sleep(max(0, started + 3.2 - time.monotonic()))
+        # Independently read through the broker after its three-second lease;
+        # the one-shot lease cannot be rearmed by a fresh client.
+        self.assertEqual(self.request(b"1 STATUS\n"),
+                         b"OK on " + BASE + b" " + BASE + b"\n")
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR BUSY\n")
+        self.assertEqual(self._assert_pty_quota(trace, minimum_writes=writes,
+                                               maximum_writes=writes), writes)
+
+    def test_direct_4hz_curses_pty_quit_restores_without_stop_key(self):
+        child, master, trace = self._pty_frontend(4, packaged=False)
+        self._pty_until(child, master, lambda data: b"EFFECT STATIC" in data)
+        os.write(master, b"\t")
+        self._pty_until(child, master,
+                        lambda data: b"Stop" in data and
+                        (self.root / "colors").read_bytes() != BASE + b"\n")
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+        self._assert_pty_quota(trace, minimum_writes=2, maximum_writes=11)
+
+    def test_pty_competing_cas_before_stop_preserves_newer_layout(self):
+        # One end-to-end race at both the reference canvas and narrow minimum;
+        # both entrypoints must use the same broker ownership boundary.
+        for size, packaged in (((55, 160), True), ((24, 78), False)):
+            with self.subTest(size=size, packaged=packaged):
+                self.put("colors", BASE + b"\n")
+                (self.root / "normal-bounded-used").unlink(missing_ok=True)
+                self._assert_pty_competing_cas(size=size, packaged=packaged)
+
+    def _assert_pty_competing_cas(self, *, size, packaged):
+        def visible(data):
+            return re.sub(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\([^)]|\)[^)])", b"", data)
+
+        child, master, trace = self._pty_frontend(4, packaged=packaged, size=size)
+        self._pty_until(child, master, lambda data: b"STATIC" in visible(data))
+        os.write(master, b"\t")
+        self._pty_until(child, master,
+                        lambda data: b"EFFECT ACTIVE" in visible(data) and
+                        (self.root / "colors").read_bytes() != BASE + b"\n")
+        frame = (self.root / "colors").read_bytes().strip()
+        self.assertNotEqual(frame, BASE)
+        # A separate authorized broker client wins the revision while the
+        # foreground TUI still has a verified non-base frame to restore.
+        token, state, colors, _ = self.snapshot()
+        self.assertEqual((state, colors), (b"on", frame))
+        self.assertRegex(self.cas(token, expected=frame, desired=ALT),
+                         rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
+        self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        writes_after_competitor = sum(kind == "I" for _, kind in self.observed_wmi(trace))
+
+        os.write(master, b"s")
+        stopped = visible(self._pty_until(child, master,
+                                          lambda data: b"ownership lost" in visible(data).lower()
+                                          and (size[1] == 78 or b"LAST OBSERVED" in visible(data))))
+        if size[1] != 78:
+            self.assertIn(b"LAST OBSERVED", stopped)
+        self.assertNotIn(b"IN SYNC", stopped)
+        self.assertNotIn(b"S Restore", stopped)
+        self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        self.assertEqual(sum(kind == "I" for _, kind in self.observed_wmi(trace)),
+                         writes_after_competitor)
+
+        time.sleep(1.2)  # Ordinary read quota rolls forward after Stop contention.
+        os.write(master, b"r")  # read-only; never regain CAS ownership
+        refreshed = visible(self._pty_until(child, master,
+                                            lambda data: (b"Last observed layout verified" in visible(data)
+                                                          or b"Live unknown" in visible(data))))
+        self.assertIn(b"Last observed layout verified", refreshed[-500:])
+        self.assertNotIn(b"IN SYNC", refreshed)
+        self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda data: b"Quit?" in visible(data))
+        os.write(master, b"y")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual((self.root / "colors").read_bytes(), ALT + b"\n")
+        self.assertEqual(sum(kind == "I" for _, kind in self.observed_wmi(trace)),
+                         writes_after_competitor)
+
+    def test_packaged_4hz_curses_pty_interrupt_restores_active_frame(self):
+        child, master, trace = self._pty_frontend(4, packaged=True)
+        self._pty_until(child, master, lambda data: b"EFFECT STATIC" in data)
+        os.write(master, b"\t")
+        self._pty_until(child, master,
+                        lambda data: b"Stop" in data and
+                        (self.root / "colors").read_bytes() != BASE + b"\n")
+        os.kill(child.pid, signal.SIGINT)
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+        self._assert_pty_quota(trace, minimum_writes=2, maximum_writes=11)
+
+    def test_direct_5hz_curses_pty_readback_failure_keeps_editor_locked(self):
+        child, master, trace = self._pty_frontend(5, packaged=False, fake_mode="mismatch")
+        self._pty_until(child, master, lambda data: b"EFFECT STATIC" in data)
+        os.write(master, b"\t")
+        output = self._pty_until(child, master,
+                                 lambda data: b"Effect I/O failed" in data and
+                                 b"Verify  ? help" in data)
+        self.assertIn(b"EFFECT UNKNOWN", output)
+        self.assertIn(b"S Verify before any restore", output)
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        self.assertEqual(self._assert_pty_quota(trace, minimum_writes=1,
+                                               maximum_writes=1), 1)
+        os.write(master, b"s")  # read-only reconciliation; no blind retry
+        observed = self._pty_until(child, master,
+                                   lambda data: b"state remains uncertain" in data,
+                                   timeout=3)
+        self.assertIn(b"restoration is blocked", observed)
+        self.assertEqual(self._assert_pty_quota(trace, minimum_writes=1,
+                                               maximum_writes=1), 1)
+        os.write(master, b"q")
+        time.sleep(0.1)
+        self.assertIsNone(child.poll(), "unknown effect must not silently exit")
+        self.assertEqual(self._assert_pty_quota(trace, minimum_writes=1,
+                                               maximum_writes=1), 1)
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+
+    def test_packaged_4hz_curses_pty_power_off_refuses_start_without_writes(self):
+        self.put("state", b"off\n")
+        child, master, trace = self._pty_frontend(4, packaged=True)
+        self._pty_until(child, master, lambda data: b"EFFECT STATIC" in data)
+        os.write(master, b"\t")
+        output = self._pty_until(child, master,
+                                 lambda data: b"power off" in data.lower())
+        self.assertIn(b"power off", output.lower())
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
+        self._assert_pty_quota(trace, minimum_writes=0, maximum_writes=0)
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+
+    def test_normal_tui_static_apply_stop_restore_baseline(self):
+        import io
+        from unittest import mock
+        from okeylitctl.cli import main
+        from okeylitctl.ipc import IPCBackend
+        from test_tui import FakeProfileStore
+
+        trace = self.wmi_trace()
+        # The fake kernel must implement restore_store's effect on colors,
+        # not merely count the write; otherwise this tests an impossible device.
+        self.restart_with_fake_kernel("restore", trace=trace)
+
+        class Screen:
+            def __init__(self):
+                self.keys = iter((ord("p"), ord("a"), ord("s"), ord("o"), ord("q")))
+                self.applied = None
+                self.stopped = None
+                self.restored = None
+
+            def keypad(self, _enabled): pass
+            def timeout(self, _value): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self):
+                key = next(self.keys)
+                if key == ord("s"):
+                    self.applied = (root / "colors").read_bytes()
+                if key == ord("o"):
+                    self.stopped = (root / "colors").read_bytes()
+                if key == ord("q"):
+                    self.restored = (root / "colors").read_bytes()
+                return key
+
+        root = self.root
+        screen = Screen()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("okeylitctl.cli.IPCBackend",
+                        side_effect=lambda: IPCBackend(socket_path=self.sockpath)), \
+             mock.patch("okeylitctl.tui.curses.wrapper", side_effect=lambda fn: fn(screen)), \
+             mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            code = main(["tui"], profile_store=FakeProfileStore(),
+                        stdout=out, stderr=err)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertNotEqual(screen.applied, BASE + b"\n")
+        self.assertEqual(screen.stopped, screen.applied)
+        self.assertEqual(screen.restored, BASE + b"\n")
+        self.assertEqual((root / "colors").read_bytes(), BASE + b"\n")
+        self.assertEqual(sum(kind == "I" for _, kind in self.observed_wmi(trace)), 4)
+
+    def test_tui_stop_recovers_from_one_slow_kernel_read_before_next_key(self):
+        for rate in (4, 5):
+            with self.subTest(rate=rate):
+                self._run_tui_stop_after_one_slow_read(rate)
+
+    def _run_tui_stop_after_one_slow_read(self, rate):
+        import io
+        import threading
+        from unittest import mock
+        from okeylitctl.cli import main
+        from okeylitctl.ipc import IPCBackend
+        from okeylitctl.tui import CursesTui
+        from test_tui import FakeProfileStore
+
+        normal = pathlib.Path(self.bin_tmp.name) / "normal-slow-tui-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = normal
+        (self.root / "normal-bounded-used").unlink(missing_ok=True)
+        trace = pathlib.Path(self.tmp.name) / f"normal-slow-tui-{rate}-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+
+        class Screen:
+            def __init__(self, test):
+                self.test = test
+                self.keys = iter((9, -1, ord("s"), ord("q")))
+                self.stop_elapsed = None
+                self.stops = []
+
+            def keypad(self, _enabled): pass
+            def timeout(self, _value): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self):
+                key = next(self.keys)
+                if key == -1:
+                    time.sleep(0.05)  # below the next-tick deadline
+                    self.frame = (self.test.root / "colors").read_bytes()
+                    self.test.assertNotEqual(self.frame, BASE + b"\n")
+                    pathlib.Path(str(trace) + ".slow-once").touch()
+                    self.started = time.monotonic()
+                    def competing_statuses():
+                        time.sleep(0.1)  # queue behind the delayed Stop read
+                        self.statuses = [self.test.request(b"1 STATUS\n")
+                                         for _ in range(2)]
+                    self.competitor = threading.Thread(target=competing_statuses)
+                    self.competitor.start()
+                if key == ord("q"):
+                    self.stop_elapsed = time.monotonic() - self.started
+                return key
+
+        screen = Screen(self)
+        original_stop = CursesTui._stop_effect
+        def observed_stop(app):
+            result = original_stop(app)
+            screen.stops.append((result, (self.root / "colors").read_bytes(),
+                                 app.state.effect_restore_pending))
+            return result
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("okeylitctl.cli.IPCBackend",
+                        side_effect=lambda: IPCBackend(socket_path=self.sockpath)), \
+             mock.patch("okeylitctl.tui.curses.wrapper", side_effect=lambda fn: fn(screen)), \
+             mock.patch.object(CursesTui, "_stop_effect", observed_stop), \
+             mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            code = main(["tui", "--test-rate-hz", str(rate), "--rate-experiment"],
+                        profile_store=FakeProfileStore(), stdout=out, stderr=err)
+        self.assertEqual(code, 0, err.getvalue())
+        screen.competitor.join(timeout=4)
+        self.assertFalse(screen.competitor.is_alive())
+        self.assertTrue(all(reply.startswith(b"OK on ") or reply == b"ERR BUSY\n"
+                            for reply in screen.statuses), screen.statuses)
+        self.assertEqual(screen.stops[0], (True, BASE + b"\n", False), screen.stops)
+        self.assertLess(screen.stop_elapsed, 3.0)
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
+        self.assertEqual(sum(kind == "I" for _, kind in events), 4)  # frame + restore
+        for at, _ in events:
+            self.assertLessEqual(sum(at <= when < at + 1_000_000_000
+                                     for when, _ in events), 49, events)
+
+    def test_tui_persistent_slow_stop_keeps_frame_and_editor_locked(self):
+        import io
+        from unittest import mock
+        from okeylitctl.cli import main
+        from okeylitctl.ipc import IPCBackend
+        from okeylitctl.tui import CursesTui
+        from test_tui import FakeProfileStore
+
+        normal = pathlib.Path(self.bin_tmp.name) / "normal-persistent-tui-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = normal
+        trace = pathlib.Path(self.tmp.name) / "normal-persistent-tui-wmi"
+        trace.write_text("")
+        self.launch_broker("trace", trace=trace)
+
+        class Screen:
+            keys = iter((9, -1, ord("s")))
+            frame = None
+            stops = []
+            def keypad(self, _enabled): pass
+            def timeout(self, _value): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self):
+                key = next(self.keys)
+                if key == -1:
+                    time.sleep(0.05)
+                    self.frame = (root / "colors").read_bytes()
+                    pathlib.Path(str(trace) + ".slow").touch()
+                return key
+
+        root = self.root
+        screen = Screen()
+        original_stop = CursesTui._stop_effect
+        def observed_stop(app):
+            result = original_stop(app)
+            screen.stops.append((result, app.state.effect_running,
+                                 app.state.effect_restore_pending,
+                                 app.effect_runtime is not None,
+                                 (root / "colors").read_bytes()))
+            return result
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with mock.patch("okeylitctl.cli.IPCBackend",
+                            side_effect=lambda: IPCBackend(socket_path=self.sockpath, timeout=2.5)), \
+                 mock.patch("okeylitctl.tui.curses.wrapper", side_effect=lambda fn: fn(screen)), \
+                 mock.patch.object(CursesTui, "_stop_effect", observed_stop), \
+                 mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+                code = main(["tui", "--test-rate-hz", "4", "--rate-experiment"],
+                            profile_store=FakeProfileStore(), stdout=out, stderr=err)
+        finally:
+            pathlib.Path(str(trace) + ".slow").unlink(missing_ok=True)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertNotEqual(screen.frame, BASE + b"\n")
+        self.assertGreaterEqual(len(screen.stops), 2)
+        self.assertTrue(all(stop == (False, True, True, True, screen.frame)
+                            for stop in screen.stops), screen.stops)
+        self.assertEqual(sum(kind == "I" for _, kind in self.observed_wmi(trace)), 2)
+
     def test_candidate_saturated_status_clients_leave_priority_stop_headroom(self):
         candidate = pathlib.Path(self.bin_tmp.name) / "candidate-broker"
         subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
@@ -678,9 +1344,9 @@ ssize_t write(int fd, const void *buf, size_t len) {
         # Three competing readers may be refused, but cannot take Stop's
         # reserved snapshot admission or make it wait for a rolling expiry.
         statuses = [self.request(b"1 STATUS\n") for _ in range(3)]
-        self.assertEqual(sum(reply.startswith(b"OK on ") for reply in statuses), 1,
+        self.assertEqual(sum(reply.startswith(b"OK on ") for reply in statuses), 2,
                          statuses)
-        self.assertEqual(statuses.count(b"ERR BUSY\n"), 2, statuses)
+        self.assertEqual(statuses.count(b"ERR BUSY\n"), 1, statuses)
         began = time.monotonic()
         stop = self.request(b"2 STOPSHOT\n")
         self.assertTrue(stop.startswith(b"OK "), stop)
@@ -1241,6 +1907,22 @@ ssize_t write(int fd, const void *buf, size_t len) {
                 abandoned.sendall(b"1 SET " + ALT + b"\n")
             self.assertEqual(blocker.recv(256), b"ERR BUSY\n")
             self.assertEqual(self.request(b"1 STATUS\n"), b"OK on " + BASE + b" " + BASE + b"\n")
+
+
+from okeylitctl.effects import EffectKind
+
+
+# A separate unittest fixture (fresh fake broker and unconsumed one-shot lease)
+# is required for each effect; subtests inside one broker would be dishonest.
+for _effect in EffectKind:
+    if _effect is EffectKind.STATIC:
+        continue
+    for _rate in (4, 5):
+        def _case(self, effect=_effect, rate=_rate):
+            self._sweep_normal_tui_effect(effect, rate)
+
+        setattr(BrokerIntegration,
+                f"test_normal_tui_effect_{_effect.value.lower()}_{_rate}hz", _case)
 
 
 class BrokerPackaging(unittest.TestCase):
