@@ -206,6 +206,95 @@ class RateDiagnosticTests(unittest.TestCase):
         self.assertFalse(app.state.effect_running)
         self.assertEqual(backend.cas_writes[-1], app.state.current.to_wire())
 
+    def test_running_effect_polls_to_next_due_instead_of_fixed_50ms(self):
+        backend = self.BurstBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore(),
+                        test_rate_hz=5, rate_experiment=True)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertTrue(app._start_effect(now=0.0))
+        app.effect_runtime.next_due = 0.24
+
+        class Screen:
+            keys = iter((-1,))
+
+            def __init__(self):
+                self.timeouts = []
+
+            def keypad(self, _enabled): pass
+            def timeout(self, value): self.timeouts.append(value)
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self): return next(self.keys)
+
+        screen = Screen()
+        with mock.patch("okeylitctl.tui.monotonic", return_value=0.20), \
+             mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(screen)
+        self.assertTrue(any(0 < timeout < 50 for timeout in screen.timeouts),
+                        screen.timeouts)
+        self.assertEqual(backend.cas_writes, [])
+
+    def test_poll_accounts_for_next_redraw_without_shortening_io_spacing(self):
+        backend = self.BurstBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore(),
+                        test_rate_hz=5, rate_experiment=True)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertTrue(app._start_effect(now=0.0))
+        app.effect_runtime.next_due = 0.26
+
+        class Screen:
+            def __init__(self): self.timeouts = []
+            def keypad(self, _enabled): pass
+            def timeout(self, value): self.timeouts.append(value)
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self): raise StopIteration
+
+        screen = Screen()
+        # Drawing consumed 20ms; wake early enough for the next redraw.
+        runtime = app.effect_runtime
+        with mock.patch("okeylitctl.tui.monotonic",
+                        side_effect=(0.20, 0.20, 0.22, 0.22, 0.22, 0.22, 0.22)), \
+             mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(screen)
+        self.assertTrue(any(19 <= timeout <= 21 for timeout in screen.timeouts),
+                        screen.timeouts)
+        self.assertEqual(runtime.next_due, 0.26)
+        self.assertEqual(backend.cas_writes, [])
+
+    def test_poll_timeout_returns_to_50ms_after_stop(self):
+        backend = self.BurstBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore(),
+                        test_rate_hz=5, rate_experiment=True)
+        app.state.effect_index = tuple(EffectKind).index(EffectKind.CYCLE)
+        self.assertTrue(app._start_effect(now=0.0))
+        app.effect_runtime.next_due = 0.24
+
+        class Screen:
+            keys = iter((ord("s"), -1))
+
+            def __init__(self):
+                self.timeouts = []
+
+            def keypad(self, _enabled): pass
+            def timeout(self, value): self.timeouts.append(value)
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self): return next(self.keys)
+
+        screen = Screen()
+        with mock.patch("okeylitctl.tui.monotonic", return_value=0.20), \
+             mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(screen)
+        self.assertTrue(any(0 < value < 50 for value in screen.timeouts))
+        self.assertEqual(screen.timeouts[-1], 50)
+
     def test_opt_in_rate_reports_measured_io_and_spacing_without_advancing_deadline(self):
         for rate in (2,):
             with self.subTest(rate=rate):
