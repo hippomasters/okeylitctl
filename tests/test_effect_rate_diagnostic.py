@@ -23,6 +23,33 @@ class RateDiagnosticTests(unittest.TestCase):
                 CursesTui(CasEffectBackend(), profile_store=FakeProfileStore(),
                           test_rate_hz=rate)
 
+    def test_named_effect_requires_experiment_before_status_read(self):
+        for effect in (EffectKind.STATIC, "Wave", EffectKind.WAVE):
+            with self.subTest(effect=effect):
+                backend = self.BurstBackend()
+                backend.status = lambda: self.fail("invalid effect accessed device")
+                with self.assertRaises(ValueError):
+                    CursesTui(backend, profile_store=FakeProfileStore(),
+                              test_rate_hz=5, rate_experiment=effect is not EffectKind.WAVE,
+                              test_effect=effect)
+
+    def test_named_effect_is_local_until_deliberate_start(self):
+        backend = self.BurstBackend()
+        app = CursesTui(backend, profile_store=FakeProfileStore(),
+                        test_rate_hz=4, rate_experiment=True,
+                        test_effect=EffectKind.WAVE)
+        self.assertEqual(app.state.effect_kind, EffectKind.WAVE)
+        self.assertIsNone(backend.started_rate)
+        self.assertEqual(backend.cas_writes, [])
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertEqual(backend.started_rate, 4)
+        self.assertTrue(app._stop_effect())
+        self.assertIsNone(app.effect_runtime)
+
+    def test_normal_tui_selection_remains_static(self):
+        app = CursesTui(self.BurstBackend(), profile_store=FakeProfileStore())
+        self.assertEqual(app.state.effect_kind, EffectKind.STATIC)
+
     def test_explicit_burst_ends_after_bounded_frames_and_restores_base(self):
         for rate in (4, 5):
             with self.subTest(rate=rate):
