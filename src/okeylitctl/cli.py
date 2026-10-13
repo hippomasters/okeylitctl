@@ -9,6 +9,7 @@ import sys
 from typing import Callable, Protocol, Sequence, TextIO
 
 from . import __version__
+from .effects import EffectKind
 from .ipc import ConflictError, IPCBackend
 from .models import ColorLayout, Zone
 from .profiles import ProfileError, ProfileStore, normalize_profile_name
@@ -68,6 +69,9 @@ def _parser() -> argparse.ArgumentParser:
                      help="provisional effect-write rate for staged laptop validation (Hz)")
     tui.add_argument("--rate-experiment", action="store_true",
                      help="one short 4/5 Hz burst with a separately built diagnostic broker")
+    tui.add_argument("--test-effect", choices=tuple(kind.value for kind in EffectKind
+                                                     if kind is not EffectKind.STATIC),
+                     help="preselect a named effect locally for an explicit rate experiment")
     return parser
 
 
@@ -89,7 +93,6 @@ def main(
     """Run the CLI and return a stable process exit code."""
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
-    backend = backend if backend is not None else IPCBackend()
     parser = _parser()
 
     try:
@@ -97,6 +100,20 @@ def main(
             args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
+
+    if args.command == "tui":
+        if args.rate_experiment != (args.test_rate_hz in (4, 5)):
+            stderr.write(f"{APP_NAME}: invalid rate experiment: --test-rate-hz 4 or 5 "
+                         "requires --rate-experiment (and vice versa)\n")
+            return 2
+        if args.test_effect is not None and not args.rate_experiment:
+            stderr.write(f"{APP_NAME}: --test-effect requires --rate-experiment\n")
+            return 2
+        if args.test_effect is not None and tui_runner is not None:
+            stderr.write(f"{APP_NAME}: --test-effect requires the built-in TUI runner\n")
+            return 2
+
+    backend = backend if backend is not None else IPCBackend()
 
     try:
         if args.command == "status":
@@ -202,10 +219,6 @@ def main(
             backend.restore()
             stdout.write("Restored the colors saved when the module loaded.\n")
         elif args.command == "tui":
-            if args.rate_experiment != (args.test_rate_hz in (4, 5)):
-                stderr.write(f"{APP_NAME}: invalid rate experiment: --test-rate-hz 4 or 5 "
-                             "requires --rate-experiment (and vice versa)\n")
-                return 2
             if tui_runner is None:
                 from .tui import run_tui
 
@@ -214,7 +227,9 @@ def main(
                 else:
                     run_tui(backend, profile_store=profile_store,
                             test_rate_hz=args.test_rate_hz,
-                            **({"rate_experiment": True} if args.rate_experiment else {}))
+                            **({"rate_experiment": True} if args.rate_experiment else {}),
+                            **({"test_effect": EffectKind(args.test_effect)}
+                               if args.test_effect is not None else {}))
             else:
                 if args.test_rate_hz is not None:
                     stderr.write(f"{APP_NAME}: --test-rate-hz requires the built-in TUI runner\n")
