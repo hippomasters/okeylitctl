@@ -796,7 +796,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
                                      for when, _ in events), 49, (effect, events))
 
     def _pty_frontend(self, rate, *, packaged, fake_mode="trace", size=(30, 110),
-                      installed_broker=None, installed_archive=None):
+                      installed_broker=None, installed_archive=None, test_effect=None):
         """Run real curses/entrypoint; only redirect its default broker socket."""
         normal = installed_broker or pathlib.Path(self.bin_tmp.name) / "normal-pty-broker"
         if installed_broker is None:
@@ -823,6 +823,8 @@ ssize_t write(int fd, const void *buf, size_t len) {
                                       main="okeylitctl.cli:entrypoint")
             command = [sys.executable, str(archive), "tui", "--test-rate-hz",
                        str(rate), "--rate-experiment"]
+            if test_effect is not None:
+                command.extend(("--test-effect", test_effect))
             package_path = archive
         else:
             command = [sys.executable, "-c",
@@ -910,6 +912,38 @@ ssize_t write(int fd, const void *buf, size_t len) {
 
     def test_packaged_4hz_curses_pty_tab_start_explicit_stop_and_quit(self):
         self._assert_pty_effect(4, packaged=True)
+
+    def _assert_packaged_named_effect_starts_without_tab(self, rate, effect):
+        child, master, trace = self._pty_frontend(rate, packaged=True,
+                                                  test_effect=effect)
+        opening = self._pty_until(child, master,
+                                  lambda data: f"EFFECT {effect.upper()}".encode() in data)
+        self.assertNotIn(b"EFFECT ACTIVE", opening)
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        self.assertFalse((self.root / "normal-bounded-used").exists())
+        os.write(master, b"a")  # No Tab: Start the locally selected effect.
+        active = self._pty_until(child, master,
+                                 lambda data: b"EFFECT ACTIVE" in data and
+                                 (self.root / "colors").read_bytes() != BASE + b"\n")
+        self.assertIn(b"S Stop", active)
+        self.assertTrue((self.root / "normal-bounded-used").exists())
+        os.write(master, b"s")
+        self._pty_until(child, master,
+                        lambda data: b"restored; Stop" in data and
+                        (self.root / "colors").read_bytes() == BASE + b"\n")
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+        self._assert_pty_quota(trace, minimum_writes=2, maximum_writes=2 * rate + 1)
+        self.assertEqual(self.request(f"2 BURST {rate}\n".encode()), b"ERR BUSY\n")
+
+    def test_packaged_4hz_wave_a_starts_directly_and_restores(self):
+        self._assert_packaged_named_effect_starts_without_tab(4, "Wave")
+
+    def test_packaged_5hz_scanner_a_starts_directly_and_restores(self):
+        self._assert_packaged_named_effect_starts_without_tab(5, "Scanner")
 
     def test_fake_installed_real_broker_matches_make_and_zipapp_stops_bounded_effect(self):
         from test_installer_security import InstallerSafetyTests
