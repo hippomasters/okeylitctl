@@ -240,10 +240,15 @@ class CursesTui:
     """Interactive adapter; all editing remains local until Apply."""
 
     def __init__(self, backend: IPCBackend | SysfsBackend, profile_store: ProfileStore | None = None,
-                 *, test_rate_hz: int | None = None, rate_experiment: bool = False):
+                 *, test_rate_hz: int | None = None, rate_experiment: bool = False,
+                 test_effect: EffectKind | None = None):
         if (test_rate_hz not in (None, 2, 4, 5) or
                 rate_experiment != (test_rate_hz in (4, 5))):
             raise ValueError("4/5 Hz requires an explicit bounded rate experiment")
+        if test_effect is not None and (not rate_experiment or
+                                        not isinstance(test_effect, EffectKind) or
+                                        test_effect is EffectKind.STATIC):
+            raise ValueError("--test-effect requires a named non-Static rate experiment")
         self.backend = backend
         self.test_rate_hz = test_rate_hz
         self.rate_experiment = rate_experiment
@@ -259,6 +264,8 @@ class CursesTui:
         self.effect_runtime: EffectRuntime | None = None
         self._terminal_cleanup_forced = False
         self.state = self._load_state()
+        if test_effect is not None:
+            self.state.effect_index = tuple(EffectKind).index(test_effect)
 
     def _load_state(self) -> TuiState:
         status = self.backend.status()
@@ -1817,7 +1824,9 @@ def run_tui(
     backend: IPCBackend | SysfsBackend | None = None,
     profile_store: ProfileStore | None = None,
     *, test_rate_hz: int | None = None, rate_experiment: bool = False,
+    test_effect: EffectKind | None = None,
 ) -> None:
     """Load verified device state and start the curses application."""
     CursesTui(backend if backend is not None else IPCBackend(), profile_store=profile_store,
-              test_rate_hz=test_rate_hz, rate_experiment=rate_experiment).run()
+              test_rate_hz=test_rate_hz, rate_experiment=rate_experiment,
+              test_effect=test_effect).run()
