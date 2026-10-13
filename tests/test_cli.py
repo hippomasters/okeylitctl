@@ -167,6 +167,48 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(tui.call_args.kwargs["test_rate_hz"], rate)
                 self.assertTrue(tui.call_args.kwargs["rate_experiment"])
 
+    def test_named_diagnostic_effect_is_selected_without_starting_it(self):
+        for effect in ("Wave", "Scanner"):
+            with self.subTest(effect=effect), patch("okeylitctl.tui.CursesTui") as tui:
+                code = main(["tui", "--test-rate-hz", "5", "--rate-experiment",
+                             "--test-effect", effect], backend=FakeBackend(),
+                            stdout=io.StringIO(), stderr=io.StringIO())
+                self.assertEqual(code, 0)
+                self.assertEqual(tui.call_args.kwargs["test_effect"].value, effect)
+                tui.return_value.run.assert_called_once_with()
+
+    def test_named_effect_requires_explicit_rate_experiment_before_backend_construction(self):
+        for args in (("--test-effect", "Wave"),
+                     ("--test-rate-hz", "2", "--test-effect", "Wave"),
+                     ("--rate-experiment", "--test-effect", "Wave")):
+            with self.subTest(args=args), patch("okeylitctl.cli.IPCBackend") as backend:
+                err = io.StringIO()
+                self.assertEqual(main(["tui", *args], stdout=io.StringIO(), stderr=err), 2)
+                self.assertIn("--rate-experiment" if "--rate-experiment" not in args
+                              else "--test-rate-hz", err.getvalue())
+                backend.assert_not_called()
+
+    def test_invalid_or_missing_named_effect_never_constructs_backend(self):
+        for args in (("--test-effect", "NotAnEffect"), ("--test-effect", "Static"),
+                     ("--test-effect", "wave"), ("--test-effect",)):
+            with self.subTest(args=args), patch("okeylitctl.cli.IPCBackend") as backend:
+                err = io.StringIO()
+                self.assertEqual(main(["tui", "--test-rate-hz", "4",
+                                       "--rate-experiment", *args],
+                                      stdout=io.StringIO(), stderr=err), 2)
+                self.assertIn("--test-effect", err.getvalue())
+                backend.assert_not_called()
+
+    def test_named_effect_cannot_be_ignored_by_injected_runner(self):
+        launched = []
+        err = io.StringIO()
+        self.assertEqual(main(["tui", "--test-rate-hz", "4", "--rate-experiment",
+                               "--test-effect", "Wave"], backend=FakeBackend(),
+                              stdout=io.StringIO(), stderr=err,
+                              tui_runner=launched.append), 2)
+        self.assertEqual(launched, [])
+        self.assertIn("built-in", err.getvalue())
+
     def test_rate_experiment_without_high_rate_is_rejected_before_device_access(self):
         backend = FakeBackend()
         backend.status = lambda: self.fail("invalid rate accessed device")
