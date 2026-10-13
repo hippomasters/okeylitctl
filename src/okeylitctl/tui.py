@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import curses
 from enum import Enum, auto
+from math import ceil
 from time import monotonic, sleep
 from typing import Any
 
@@ -346,7 +347,9 @@ class CursesTui:
         try:
             while True:
                 self._update_preview(now=monotonic())
+                draw_started = monotonic()
                 workspace_visible = self._draw(screen)
+                draw_duration = max(0.0, monotonic() - draw_started)
                 rendered_geometry = self._rendered_geometry
                 if rendered_geometry is None:
                     if self.effect_runtime is not None:
@@ -376,6 +379,20 @@ class CursesTui:
                         if self.effect_runtime is not None and not self._stop_effect():
                             continue
                         return
+                runtime = self.effect_runtime
+                poll_ms = 50
+                if (actions_enabled and runtime is not None and runtime.active
+                        and (runtime.spec.kind not in (EffectKind.REACTIVE, EffectKind.RIPPLE)
+                             or runtime.event is not None)):
+                    # Wake before the deadline by one measured redraw; the
+                    # runtime still gates every write on completion + interval.
+                    remaining_ms = ceil((runtime.next_due - monotonic()
+                                         - draw_duration) * 1000)
+                    poll_ms = max(1, min(50, remaining_ms))
+                try:
+                    screen.timeout(poll_ms)
+                except (AttributeError, curses.error):
+                    pass
                 try:
                     key = screen.getch()
                 except curses.error:
