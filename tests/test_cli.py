@@ -217,6 +217,38 @@ class CliTests(unittest.TestCase):
                               stdout=io.StringIO(), stderr=err), 2)
         self.assertIn("--test-rate-hz", err.getvalue())
 
+    def test_long_diagnostic_requires_exact_opt_in_before_backend_construction(self):
+        for args in (("--test-duration-seconds", "12"),
+                     ("--test-rate-hz", "4", "--test-duration-seconds", "12"),
+                     ("--rate-experiment", "--test-duration-seconds", "12"),
+                     ("--test-rate-hz", "5", "--rate-experiment", "--test-effect", "Wave",
+                      "--test-duration-seconds", "12"),
+                     ("--test-rate-hz", "4", "--rate-experiment", "--test-effect", "Wave",
+                      "--test-duration-seconds", "2"),
+                     ("--test-rate-hz", "4", "--rate-experiment", "--test-effect", "Wave",
+                      "--test-duration-seconds", "012")):
+            with self.subTest(args=args), patch("okeylitctl.cli.IPCBackend") as backend:
+                err = io.StringIO()
+                self.assertEqual(main(["tui", *args], stdout=io.StringIO(), stderr=err), 2)
+                backend.assert_not_called()
+
+    def test_long_diagnostic_forwards_bounded_session_to_builtin_runner(self):
+        with patch("okeylitctl.tui.CursesTui") as tui:
+            self.assertEqual(main(["tui", "--test-rate-hz", "4", "--rate-experiment",
+                                   "--test-effect", "Wave", "--test-duration-seconds", "12"],
+                                  backend=FakeBackend(), stdout=io.StringIO(),
+                                  stderr=io.StringIO()), 0)
+            self.assertEqual(tui.call_args.kwargs["test_duration_seconds"], 12)
+            self.assertEqual(tui.call_args.kwargs["test_effect"].value, "Wave")
+
+    def test_long_diagnostic_injected_runner_cannot_ignore_duration(self):
+        launched = []
+        self.assertEqual(main(["tui", "--test-rate-hz", "4", "--rate-experiment",
+                               "--test-effect", "Wave", "--test-duration-seconds", "12"],
+                              backend=FakeBackend(), stdout=io.StringIO(),
+                              stderr=io.StringIO(), tui_runner=launched.append), 2)
+        self.assertEqual(launched, [])
+
     def test_injected_runner_cannot_silently_ignore_diagnostic_rate(self):
         backend = FakeBackend()
         launched = []
