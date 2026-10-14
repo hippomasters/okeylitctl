@@ -71,6 +71,20 @@ class IPCTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             IPCBackend().start_rate_experiment(3)
 
+    def test_long_rate_requires_dedicated_broker_ack(self):
+        result, requests = self.exchange(
+            lambda backend: backend.start_long_rate_experiment(4), b"OK LONG4\n")
+        self.assertIsNone(result)
+        self.assertEqual(requests, [b"2 LONG4\n"])
+        for response in (b"ERR INVALID\n", b"OK BURST\n", b"OK LONG4 extra\n"):
+            with self.subTest(response=response), self.assertRaises((BackendIOError, UnsupportedABI)):
+                self.exchange(lambda backend: backend.start_long_rate_experiment(4), response)
+
+    def test_long_rate_rejects_other_rates_before_broker_access(self):
+        for rate in (True, 2, 5, "4"):
+            with self.subTest(rate=rate), self.assertRaises(ValidationError):
+                IPCBackend().start_long_rate_experiment(rate)
+
     def test_snapshot_uses_v2_packet_and_returns_token_plus_status(self):
         result, requests = self.exchange(
             lambda backend: backend.snapshot(),
