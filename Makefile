@@ -4,7 +4,7 @@ omen_rgb-y := module/omen_rgb.o
 KDIR ?= /lib/modules/$(if $(KERNELRELEASE),$(KERNELRELEASE),$(shell uname -r))/build
 PWD := $(shell pwd)
 
-.PHONY: all clean test broker broker-rate-experiment broker-rate-campaign-2 broker-rate-campaign-3
+.PHONY: all clean test broker broker-rate-experiment broker-rate-campaign-2 broker-rate-campaign-3 broker-long-4hz-diagnostic
 
 all:
 	$(MAKE) -C "$(KDIR)" M="$(PWD)" modules
@@ -30,6 +30,15 @@ broker-rate-campaign-3: build/okeylitctl-broker-rate-campaign-3
 build/okeylitctl-broker-rate-campaign-3: broker/main.c
 	mkdir -p build
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DBROKER_RATE_EXPERIMENT -DBROKER_RATE_CAMPAIGN_3 $< -o $@
+
+# Device-free preparation only: never installed by this target or default broker.
+# Requires a separately staged, root-owned /var/lib/okeylitctl-long-4hz-diagnostic
+# directory for an explicitly authorized laptop trial; do not rearm its stamp.
+broker-long-4hz-diagnostic: build/okeylitctl-broker-long-4hz-diagnostic
+
+build/okeylitctl-broker-long-4hz-diagnostic: broker/main.c
+	mkdir -p build
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DBROKER_LONG_4HZ_DIAGNOSTIC $< -o $@
 
 build/okeylitctl-broker: broker/main.c
 	mkdir -p build
