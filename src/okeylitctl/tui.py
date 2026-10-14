@@ -242,7 +242,8 @@ class CursesTui:
 
     def __init__(self, backend: IPCBackend | SysfsBackend, profile_store: ProfileStore | None = None,
                  *, test_rate_hz: int | None = None, rate_experiment: bool = False,
-                 test_effect: EffectKind | None = None):
+                 test_effect: EffectKind | None = None,
+                 test_duration_seconds: int | None = None):
         if (test_rate_hz not in (None, 2, 4, 5) or
                 rate_experiment != (test_rate_hz in (4, 5))):
             raise ValueError("4/5 Hz requires an explicit bounded rate experiment")
@@ -250,9 +251,16 @@ class CursesTui:
                                         not isinstance(test_effect, EffectKind) or
                                         test_effect is EffectKind.STATIC):
             raise ValueError("--test-effect requires a named non-Static rate experiment")
+        if test_duration_seconds is not None and (
+                type(test_duration_seconds) is not int or test_duration_seconds != 12
+                or test_rate_hz != 4 or not rate_experiment or test_effect is None):
+            raise ValueError("12-second diagnostic requires 4 Hz, opt-in, and a named effect")
         self.backend = backend
         self.test_rate_hz = test_rate_hz
         self.rate_experiment = rate_experiment
+        self.test_duration_seconds = test_duration_seconds
+        self._long_test_effect = test_effect if test_duration_seconds is not None else None
+        self._long_test_started_once = False
         self._experiment_frames = 0
         self._experiment_started_at = 0.0
         self._experiment_auto_stop_attempted = False
@@ -267,6 +275,9 @@ class CursesTui:
         self.state = self._load_state()
         if test_effect is not None:
             self.state.effect_index = tuple(EffectKind).index(test_effect)
+        if test_duration_seconds is not None:
+            self.state.message = (f"{test_effect.value} 4Hz diagnostic (12s/40 frames); "
+                                  "A Start, S Stop")
 
     def _load_state(self) -> TuiState:
         status = self.backend.status()
@@ -430,6 +441,9 @@ class CursesTui:
                     continue
                 if self.state.live_unknown and key not in (ord("r"), ord("q"), ord("?"), 27):
                     self.state.message = "Live unknown; press R to verify before another write"
+                    continue
+                if self.test_duration_seconds is not None and key in (9, curses.KEY_BTAB):
+                    self.state.message = "Named diagnostic fixed; press A Start or S Stop"
                     continue
                 if key in (9, curses.KEY_BTAB) and self.effect_runtime is not None:
                     if not self._stop_effect():
@@ -1226,6 +1240,10 @@ class CursesTui:
         return triggered
 
     def _start_effect(self, *, now: float | None = None) -> bool:
+        if self.test_duration_seconds is not None and (
+                self._long_test_started_once or self.state.effect_kind != self._long_test_effect):
+            self.state.message = "Named diagnostic can start only once with its selected effect"
+            return False
         if self.state.live_unknown:
             self.state.message = "Live unknown; press R to verify before another write"
             return False
@@ -1248,23 +1266,27 @@ class CursesTui:
             self.state.message = "Effect unavailable: power off"
             return False
         if self.rate_experiment:
-            begin = getattr(self.backend, "start_rate_experiment", None)
+            begin = getattr(self.backend, ("start_long_rate_experiment"
+                                           if self.test_duration_seconds is not None
+                                           else "start_rate_experiment"), None)
             if not callable(begin):
                 self.state.message = "Rate experiment needs the opt-in diagnostic broker"
                 return False
-            # Start the shorter frontend window before the broker exchange:
-            # a delayed acknowledgement must not extend a three-second lease.
+            # Start before the broker exchange so a delayed ACK never extends
+            # the shorter frontend window beyond either broker lease.
             now = monotonic() if now is None else now
             try:
                 begin(self.test_rate_hz)
             except (SysfsError, ValidationError) as exc:
                 self.state.message = f"Rate experiment refused: {exc}"
                 return False
-            # The broker starts its independent three-second monotonic lease
-            # on acknowledgement; this is headroom, not a Stop guarantee.
+            # The broker independently starts its one-shot lease on ACK;
+            # the frontend deadline is additional headroom, not a Stop guarantee.
             self._experiment_started_at = now
             self._experiment_frames = 0
             self._experiment_auto_stop_attempted = False
+            if self.test_duration_seconds is not None:
+                self._long_test_started_once = True
         runtime = EffectRuntime(
             backend=self.backend,
             spec=self.state.effect_spec,
@@ -1278,6 +1300,8 @@ class CursesTui:
         self.state.effect_restore_pending = False
         self.state.effect_ownership_lost = False
         self.state.message = (
+            f"{self.state.effect_kind.value} 4Hz diagnostic (12s/40 frames); S Stop"
+            if self.test_duration_seconds is not None else
             f"{self.state.effect_kind.value} effect started at "
             f"{runtime.rate_hz:g} Hz (provisional test)"
             if self.test_rate_hz is not None else
@@ -1341,9 +1365,11 @@ class CursesTui:
         if runtime is None:
             return False
         now = monotonic() if now is None else now
+        frame_limit = 40 if self.test_duration_seconds is not None else 10
+        deadline = self.test_duration_seconds or 2.0
         if (self.rate_experiment and not self._experiment_auto_stop_attempted
-                and (self._experiment_frames >= 10
-                     or now - self._experiment_started_at >= 2.0)):
+                and (self._experiment_frames >= frame_limit
+                     or now - self._experiment_started_at >= deadline)):
             self._experiment_auto_stop_attempted = True
             self._finish_rate_experiment()
             return False
@@ -1406,7 +1432,10 @@ class CursesTui:
                     f"{runtime.last_io_duration * 1000:.0f}ms {spacing}"
                     f"{start_spacing}{phase}"
                 )
-            if self.rate_experiment and self._experiment_frames >= 10:
+            if (self.rate_experiment and
+                    (self._experiment_frames >= frame_limit or
+                     (self.test_duration_seconds is not None and
+                      monotonic() - self._experiment_started_at >= deadline))):
                 self._experiment_auto_stop_attempted = True
                 self._finish_rate_experiment()
                 return wrote
@@ -1842,8 +1871,15 @@ def run_tui(
     profile_store: ProfileStore | None = None,
     *, test_rate_hz: int | None = None, rate_experiment: bool = False,
     test_effect: EffectKind | None = None,
+    test_duration_seconds: int | None = None,
 ) -> None:
     """Load verified device state and start the curses application."""
+    if test_duration_seconds is not None and (
+            type(test_duration_seconds) is not int or test_duration_seconds != 12
+            or test_rate_hz != 4 or not rate_experiment
+            or not isinstance(test_effect, EffectKind)
+            or test_effect is EffectKind.STATIC):
+        raise ValueError("12-second diagnostic requires 4 Hz, opt-in, and a named effect")
     CursesTui(backend if backend is not None else IPCBackend(), profile_store=profile_store,
               test_rate_hz=test_rate_hz, rate_experiment=rate_experiment,
-              test_effect=test_effect).run()
+              test_effect=test_effect, test_duration_seconds=test_duration_seconds).run()
