@@ -149,6 +149,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
         (self.root / "rate-experiment-2-used").unlink(missing_ok=True)
         (self.root / "rate-experiment-3-used").unlink(missing_ok=True)
         (self.root / "normal-bounded-used").unlink(missing_ok=True)
+        (self.root / "long-4hz-diagnostic-used").unlink(missing_ok=True)
         for name in ("abi_version", "colors", "original", "state", "restore"):
             path = self.root / name
             if path.is_symlink():
@@ -518,6 +519,7 @@ ssize_t write(int fd, const void *buf, size_t len) {
         legacy = self.root / "rate-experiment-used"
         legacy.write_bytes(b"consumed earlier diagnostic")
         self.launch_broker("trace", trace=trace)
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR INVALID\n")
         self.assertEqual(self.request(b"2 BURST 5\n"), b"OK BURST\n")
         self.assertEqual(legacy.read_bytes(), b"consumed earlier diagnostic")
         self.assertTrue((self.root / "normal-bounded-used").exists())
@@ -796,12 +798,15 @@ ssize_t write(int fd, const void *buf, size_t len) {
                                      for when, _ in events), 49, (effect, events))
 
     def _pty_frontend(self, rate, *, packaged, fake_mode="trace", size=(30, 110),
-                      installed_broker=None, installed_archive=None, test_effect=None):
+                      installed_broker=None, installed_archive=None, test_effect=None,
+                      long_session=False):
         """Run real curses/entrypoint; only redirect its default broker socket."""
-        normal = installed_broker or pathlib.Path(self.bin_tmp.name) / "normal-pty-broker"
+        normal = installed_broker or pathlib.Path(self.bin_tmp.name) / (
+            "long-pty-broker" if long_session else "normal-pty-broker")
         if installed_broker is None:
             subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-                            "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                            "-DBROKER_TESTING", ("-DBROKER_LONG_4HZ_DIAGNOSTIC"
+                                                 if long_session else "-DBROKER_BOUNDED_NORMAL"),
                             f'-DBROKER_TEST_ROOT="{self.root}"',
                             f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
                             str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
@@ -825,6 +830,8 @@ ssize_t write(int fd, const void *buf, size_t len) {
                        str(rate), "--rate-experiment"]
             if test_effect is not None:
                 command.extend(("--test-effect", test_effect))
+            if long_session:
+                command.extend(("--test-duration-seconds", "12"))
             package_path = archive
         else:
             command = [sys.executable, "-c",
@@ -944,6 +951,55 @@ ssize_t write(int fd, const void *buf, size_t len) {
 
     def test_packaged_5hz_scanner_a_starts_directly_and_restores(self):
         self._assert_packaged_named_effect_starts_without_tab(5, "Scanner")
+
+    def test_packaged_long_four_hz_scanner_runs_past_short_limit_then_stops(self):
+        child, master, trace = self._pty_frontend(
+            4, packaged=True, test_effect="Scanner", long_session=True)
+        self._pty_until(child, master, lambda data: b"EFFECT SCANNER" in data)
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        os.write(master, b"a")
+        active = self._pty_until(child, master,
+                                 lambda data: b"EFFECT ACTIVE" in data and
+                                 (self.root / "colors").read_bytes() != BASE + b"\n")
+        self.assertIn(b"S Stop", active)
+        self.assertTrue((self.root / "long-4hz-diagnostic-used").exists())
+        self.assertFalse((self.root / "normal-bounded-used").exists())
+        time.sleep(2.5)
+        self.assertIsNone(child.poll())
+        self.assertNotEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        self.assertGreaterEqual(sum(kind == "I" for _, kind in self.observed_wmi(trace)), 10)
+        os.write(master, b"s")
+        self._pty_until(child, master,
+                        lambda data: b"restored; Stop" in data and
+                        (self.root / "colors").read_bytes() == BASE + b"\n")
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual((self.root / "colors").read_bytes(),
+                         (self.root / "original").read_bytes())
+        self._assert_pty_quota(trace, minimum_writes=6, maximum_writes=41)
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR BUSY\n")
+
+    def test_packaged_long_session_refuses_normal_broker_without_writing(self):
+        normal = pathlib.Path(self.bin_tmp.name) / "ordinary-for-long-refusal"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_BOUNDED_NORMAL",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(normal)], check=True)
+        child, master, trace = self._pty_frontend(
+            4, packaged=True, test_effect="Wave", long_session=True,
+            installed_broker=normal)
+        self._pty_until(child, master, lambda data: b"EFFECT WAVE" in data)
+        os.write(master, b"a")
+        self._pty_until(child, master,
+                        lambda data: b"needs the dedicated broker" in data)
+        self.assertFalse((self.root / "normal-bounded-used").exists())
+        self.assertFalse((self.root / "long-4hz-diagnostic-used").exists())
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        os.write(master, b"q")
+        self._pty_until(child, master, lambda _: child.poll() is not None)
+        self.assertEqual(child.returncode, 0)
 
     def test_fake_installed_real_broker_matches_make_and_zipapp_stops_bounded_effect(self):
         from test_installer_security import InstallerSafetyTests
@@ -1519,6 +1575,135 @@ ssize_t write(int fd, const void *buf, size_t len) {
     def test_default_broker_rejects_rate_experiment_without_elevating_reads(self):
         self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR INVALID\n")
         self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR INVALID\n")
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR INVALID\n")
+
+    def start_long_diagnostic(self, *, trace=None):
+        binary = pathlib.Path(self.bin_tmp.name) / "long-4hz-broker"
+        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-DBROKER_TESTING", "-DBROKER_LONG_4HZ_DIAGNOSTIC",
+                        f'-DBROKER_TEST_ROOT="{self.root}"',
+                        f'-DBROKER_TEST_SOCKET="{self.sockpath}"',
+                        str(REPO / "broker" / "main.c"), "-o", str(binary)], check=True)
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = binary
+        self.launch_broker("trace" if trace else None, trace=trace)
+
+    def test_long_four_hz_diagnostic_sustains_40_frames_12_seconds_and_owned_stop(self):
+        makefile = (REPO / "Makefile").read_text()
+        self.assertIn("broker-long-4hz-diagnostic: build/okeylitctl-broker-long-4hz-diagnostic", makefile)
+        ordinary = makefile.split("build/okeylitctl-broker: broker/main.c")[1].split("\n\n")[0]
+        self.assertNotIn("BROKER_LONG_4HZ_DIAGNOSTIC", ordinary)
+        prior = {name: self.root / name for name in
+                 ("normal-bounded-used", "rate-experiment-used",
+                  "rate-experiment-2-used", "rate-experiment-3-used")}
+        for stamp in prior.values():
+            stamp.write_bytes(b"previous campaign")
+        trace = pathlib.Path(self.tmp.name) / "long-4hz-wmi"
+        trace.write_text("")
+        self.start_long_diagnostic(trace=trace)
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR INVALID\n")
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR INVALID\n")
+        self.assertEqual(self.request(b"2 LONG4\n"), b"OK LONG4\n")
+        stamp = self.root / "long-4hz-diagnostic-used"
+        self.assertEqual(stamp.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(all(path.read_bytes() == b"previous campaign" for path in prior.values()))
+        started = time.monotonic()
+        third = b"010203,040506,070809,0A0B0C"
+        expected = BASE
+        for index in range(40):
+            due = started + index * 0.25
+            if due > time.monotonic():
+                time.sleep(due - time.monotonic())
+            token, state, colors, original = self.snapshot()
+            self.assertEqual((state, colors, original), (b"on", expected, BASE))
+            desired = ALT if index % 2 == 0 else third
+            self.assertRegex(self.cas(token, expected=expected, desired=desired),
+                             rb"\AOK [0-9A-F]{16}:[0-9A-F]{16}\n\Z")
+            expected = desired
+        self.assertEqual(expected, third)
+        remaining = started + 12 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        # Competing read-only clients fill their class while Stop retains two
+        # status slots, five CAS slots, one write and seven total GET slots.
+        for _ in range(8):
+            reply = self.request(b"1 STATUS\n")
+            if reply == b"ERR BUSY\n":
+                break
+            self.assertTrue(reply.startswith(b"OK on "), reply)
+        else:
+            self.fail("competing STATUS clients did not saturate their quota")
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertEqual(stop.split(b" ")[3], third)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=third,
+                                 desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
+        events = self.observed_wmi(trace)
+        self.assertEqual(sum(kind == "I" for _, kind in events), 82)
+        for timestamp, _ in events:
+            window = [kind for at, kind in events if timestamp <= at < timestamp + 1_000_000_000]
+            self.assertLessEqual(len(window), 49, window)
+            self.assertLessEqual(window.count("I"), 12, window)
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR BUSY\n")
+        remaining = started + 15.15 - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        time.sleep(1.1)  # Drain lease-era rolling reservations.
+        for _ in range(5):
+            self.assertTrue(self.request(b"1 STATUS\n").startswith(b"OK on "))
+        self.assertEqual(self.request(b"1 STATUS\n"), b"ERR BUSY\n")
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR BUSY\n")
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.launch_broker()
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR BUSY\n")
+        self.assertTrue(stamp.exists())
+
+    def test_long_diagnostic_restart_cannot_rearm_and_default_remains_ordinary(self):
+        self.start_long_diagnostic()
+        self.assertEqual(self.request(b"2 LONG4\n"), b"OK LONG4\n")
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.launch_broker()
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR BUSY\n")
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR INVALID\n")
+        self.proc.terminate()
+        self.proc.communicate(timeout=2)
+        self.binary = self.__class__.binary
+        self.launch_broker()
+        self.assertEqual(self.request(b"2 BURST 4\n"), b"ERR INVALID\n")
+        self.assertEqual(self.request(b"2 BURST 5\n"), b"ERR INVALID\n")
+        self.assertEqual(self.request(b"2 LONG4\n"), b"ERR INVALID\n")
+
+    def test_long_diagnostic_fifth_write_waits_for_four_hz_and_preserves_stop(self):
+        trace = pathlib.Path(self.tmp.name) / "long-4hz-fifth-write"
+        trace.write_text("")
+        self.start_long_diagnostic(trace=trace)
+        self.assertEqual(self.request(b"2 LONG4\n"), b"OK LONG4\n")
+        started = time.monotonic()
+        expected = BASE
+        for index in range(4):
+            token, state, colors, original = self.snapshot()
+            self.assertEqual((state, colors, original), (b"on", expected, BASE))
+            desired = ALT if index % 2 == 0 else BASE
+            self.assertTrue(self.cas(token, expected=expected,
+                                     desired=desired).startswith(b"OK "))
+            expected = desired
+        token, _, colors, _ = self.snapshot()
+        self.assertEqual(colors, BASE)
+        self.assertTrue(self.cas(token, expected=BASE, desired=ALT).startswith(b"OK "))
+        self.assertGreaterEqual(time.monotonic() - started, 1.0)
+        writes = [at for at, kind in self.observed_wmi(trace) if kind == "I"][::2]
+        self.assertEqual(len(writes), 5)
+        for before, after in zip(writes, writes[1:]):
+            self.assertGreaterEqual(after - before, 250_000_000)
+        stop = self.request(b"2 STOPSHOT\n")
+        self.assertTrue(stop.startswith(b"OK "), stop)
+        self.assertTrue(self.cas(stop.split(b" ")[1], expected=ALT,
+                                 desired=BASE).startswith(b"OK "))
+        self.assertEqual((self.root / "colors").read_bytes(), BASE + b"\n")
 
     def test_campaign_two_lease_does_not_consume_legacy_stamp(self):
         legacy = self.root / "rate-experiment-used"
