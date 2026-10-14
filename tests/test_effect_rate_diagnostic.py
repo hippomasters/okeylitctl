@@ -17,6 +17,189 @@ class RateDiagnosticTests(unittest.TestCase):
         def start_rate_experiment(self, rate):
             self.started_rate = rate
 
+        def start_long_rate_experiment(self, rate):
+            self.long_started_rate = rate
+
+    def long_app(self, backend=None):
+        backend = backend or self.BurstBackend()
+        return CursesTui(backend, profile_store=FakeProfileStore(),
+                         test_rate_hz=4, rate_experiment=True,
+                         test_effect=EffectKind.WAVE, test_duration_seconds=12)
+
+    def test_long_session_rejects_wrong_opt_in_before_status(self):
+        for options in ({"test_rate_hz": 4, "rate_experiment": True},
+                        {"test_rate_hz": 5, "rate_experiment": True,
+                         "test_effect": EffectKind.WAVE},
+                        {"test_rate_hz": 4, "rate_experiment": True,
+                         "test_effect": EffectKind.STATIC},
+                        {"test_rate_hz": 4, "rate_experiment": True,
+                         "test_effect": EffectKind.WAVE, "test_duration_seconds": 11}):
+            backend = self.BurstBackend()
+            backend.status = lambda: self.fail("invalid long session read status")
+            duration = options.get("test_duration_seconds", 12)
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                CursesTui(backend, profile_store=FakeProfileStore(),
+                          test_duration_seconds=duration,
+                          **{key: value for key, value in options.items()
+                             if key != "test_duration_seconds"})
+
+    def test_direct_runner_rejects_invalid_duration_before_backend_construction(self):
+        from okeylitctl.tui import run_tui
+        with mock.patch("okeylitctl.tui.IPCBackend") as backend:
+            with self.assertRaises(ValueError):
+                run_tui(test_duration_seconds=12)
+            backend.assert_not_called()
+
+    def test_long_session_start_needs_separate_broker_ack(self):
+        backend = self.BurstBackend()
+        backend.start_long_rate_experiment = None
+        app = self.long_app(backend)
+        self.assertFalse(app._start_effect(now=0.0))
+        self.assertIsNone(app.effect_runtime)
+        self.assertEqual(backend.cas_writes, [])
+        self.assertIsNone(backend.started_rate)
+
+    def test_long_session_displays_manual_controls_and_bounds(self):
+        app = self.long_app()
+        self.assertIn("A Start", app.state.message)
+        self.assertIn("S Stop", app.state.message)
+        self.assertIn("12s/40 frames", app.state.message)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertIn("S Stop", app.state.message)
+        self.assertIn("12s/40 frames", app.state.message)
+
+    def test_long_session_uses_separate_lease_and_stops_at_40_frames(self):
+        backend = self.BurstBackend()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertEqual(backend.long_started_rate, 4)
+        self.assertIsNone(backend.started_rate)
+        for frame in range(40):
+            with mock.patch("okeylitctl.effect_runtime.monotonic",
+                            side_effect=(100 + frame, 100.005 + frame,
+                                         100.007 + frame, 100.01 + frame)), \
+                 mock.patch("okeylitctl.tui.monotonic", return_value=frame * 0.26 + 0.01):
+                app._tick_effect(now=frame * 0.26, authorized=True)
+        self.assertIsNone(app.effect_runtime)
+        self.assertEqual(len(backend.cas_writes), 41)
+        self.assertEqual(backend.cas_writes[-1], app.state.current.to_wire())
+
+    def test_long_session_stops_at_12_seconds_without_late_frame(self):
+        backend = self.BurstBackend()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertFalse(app._tick_effect(now=12.0, authorized=True))
+        self.assertIsNone(app.effect_runtime)
+        self.assertEqual(backend.cas_writes, [])
+
+    def test_long_session_stop_failure_retains_lock_and_prevents_later_frames(self):
+        class DenyStop(self.BurstBackend):
+            def stop_snapshot(self):
+                raise BackendIOError("stop unavailable")
+        backend = DenyStop()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        self.assertFalse(app._tick_effect(now=12.0, authorized=True))
+        self.assertTrue(app.state.effect_restore_pending)
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertFalse(app._tick_effect(now=12.5, authorized=True))
+        self.assertEqual(len(backend.cas_writes), 1)
+
+    def test_long_session_tab_cannot_start_or_stop_named_effect(self):
+        backend = self.BurstBackend()
+        app = self.long_app(backend)
+
+        class Screen:
+            def __init__(self): self.keys = iter((9, ord("a"), 9, ord("s")))
+            def keypad(self, _enabled): pass
+            def timeout(self, _value): pass
+            def getmaxyx(self): return (30, 110)
+            def erase(self): pass
+            def addnstr(self, *_args): pass
+            def refresh(self): pass
+            def getch(self):
+                key = next(self.keys)
+                if key == ord("a"):
+                    self_outer.assertIsNone(backend.__dict__.get("long_started_rate"))
+                if key == ord("s"):
+                    self_outer.assertIsNotNone(app.effect_runtime)
+                return key
+
+        self_outer = self
+        with mock.patch("okeylitctl.tui.initialize_colors", return_value=False):
+            app._main(Screen())
+        self.assertEqual(backend.long_started_rate, 4)
+        self.assertIsNone(app.effect_runtime)
+        self.assertEqual(app.state.effect_kind, EffectKind.WAVE)
+        if backend.cas_writes:
+            self.assertEqual(backend.cas_writes[-1], app.state.current.to_wire())
+
+    def test_long_session_cannot_rearm_after_successful_stop(self):
+        backend = self.BurstBackend()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        self.assertTrue(app._stop_effect())
+        self.assertFalse(app._start_effect(now=1.0))
+        self.assertIsNone(app.effect_runtime)
+
+    def test_long_session_slow_readback_fails_closed_with_base_ownership_retained(self):
+        class SlowRead(self.BurstBackend):
+            fail_reads = False
+            def snapshot(self):
+                if self.fail_reads:
+                    raise BackendIOError("slow readback timeout")
+                return super().snapshot()
+            def stop_snapshot(self):
+                return self.snapshot()
+
+        backend = SlowRead()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        with mock.patch("okeylitctl.tui.monotonic", return_value=0.01):
+            self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        backend.fail_reads = True
+        self.assertFalse(app._tick_effect(now=0.3, authorized=True))
+        self.assertTrue(app.state.effect_restore_pending)
+        self.assertIsNotNone(app.effect_runtime)
+        self.assertFalse(app._tick_effect(now=12.0, authorized=True))
+        self.assertEqual(len(backend.cas_writes), 1)
+
+    def test_long_session_power_off_does_not_write_base_blindly(self):
+        backend = self.BurstBackend()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        with mock.patch("okeylitctl.tui.monotonic", return_value=0.01):
+            self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        backend.status_value["state"] = "off"
+        self.assertFalse(app._tick_effect(now=0.3, authorized=True))
+        self.assertEqual(app.power_state, "off")
+        self.assertEqual(len(backend.cas_writes), 1)
+        self.assertIsNotNone(app.effect_runtime)
+
+    def test_long_session_external_writer_preserves_baseline_ownership(self):
+        backend = self.BurstBackend()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        with mock.patch("okeylitctl.tui.monotonic", return_value=0.01):
+            self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        backend.revision += 1
+        backend.status_value["colors"] = ["ABCDEF"] * 4
+        self.assertFalse(app._tick_effect(now=0.3, authorized=True))
+        self.assertTrue(app.state.live_last_observed)
+        self.assertEqual(len(backend.cas_writes), 1)
+        self.assertEqual(backend.status_value["colors"], ["ABCDEF"] * 4)
+        self.assertIsNone(app.effect_runtime)
+
+    def test_long_session_crossed_deadline_after_readback_autostops(self):
+        backend = self.BurstBackend()
+        app = self.long_app(backend)
+        self.assertTrue(app._start_effect(now=0.0))
+        with mock.patch("okeylitctl.tui.monotonic", return_value=12.1):
+            self.assertTrue(app._tick_effect(now=0.0, authorized=True))
+        self.assertIsNone(app.effect_runtime)
+        self.assertEqual(len(backend.cas_writes), 2)
+
     def test_unbudgeted_diagnostics_are_disabled_before_backend_access(self):
         for rate in (4, 5):
             with self.subTest(rate=rate), self.assertRaises(ValueError):
