@@ -158,6 +158,17 @@ class IPCBackend:
         if raw != b"OK BURST\n":
             raise UnsupportedABI("malformed rate experiment acknowledgement")
 
+    def start_long_rate_experiment(self, rate: int) -> None:
+        """Require the distinct, one-shot 15-second 4 Hz broker policy."""
+        if type(rate) is not int or rate != 4:
+            raise ValidationError("long rate diagnostic requires exactly 4 Hz")
+        raw = self._exchange(b"2 LONG4\n", mutation=False)
+        if raw == b"ERR INVALID\n":
+            raise BackendIOError("long rate diagnostic needs the dedicated broker")
+        self._check_error(raw)
+        if raw != b"OK LONG4\n":
+            raise UnsupportedABI("malformed long rate diagnostic acknowledgement")
+
     def _snapshot(self, request: bytes) -> dict[str, object]:
         raw = self._exchange(request, mutation=False)
         if request == b"2 STOPSHOT\n" and raw == b"ERR INVALID\n":
