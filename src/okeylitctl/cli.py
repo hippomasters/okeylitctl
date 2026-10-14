@@ -72,6 +72,8 @@ def _parser() -> argparse.ArgumentParser:
     tui.add_argument("--test-effect", choices=tuple(kind.value for kind in EffectKind
                                                      if kind is not EffectKind.STATIC),
                      help="preselect a named effect locally for an explicit rate experiment")
+    tui.add_argument("--test-duration-seconds", choices=("12",),
+                     help="explicit 12-second/40-frame 4 Hz diagnostic; requires a named effect")
     return parser
 
 
@@ -112,6 +114,15 @@ def main(
         if args.test_effect is not None and tui_runner is not None:
             stderr.write(f"{APP_NAME}: --test-effect requires the built-in TUI runner\n")
             return 2
+        if args.test_duration_seconds is not None:
+            if (args.test_rate_hz != 4 or not args.rate_experiment
+                    or args.test_effect is None):
+                stderr.write(f"{APP_NAME}: --test-duration-seconds requires --test-rate-hz 4 "
+                             "--rate-experiment --test-effect NAME\n")
+                return 2
+            if tui_runner is not None:
+                stderr.write(f"{APP_NAME}: --test-duration-seconds requires the built-in TUI runner\n")
+                return 2
 
     backend = backend if backend is not None else IPCBackend()
 
@@ -229,7 +240,9 @@ def main(
                             test_rate_hz=args.test_rate_hz,
                             **({"rate_experiment": True} if args.rate_experiment else {}),
                             **({"test_effect": EffectKind(args.test_effect)}
-                               if args.test_effect is not None else {}))
+                               if args.test_effect is not None else {}),
+                            **({"test_duration_seconds": 12}
+                               if args.test_duration_seconds is not None else {}))
             else:
                 if args.test_rate_hz is not None:
                     stderr.write(f"{APP_NAME}: --test-rate-hz requires the built-in TUI runner\n")
