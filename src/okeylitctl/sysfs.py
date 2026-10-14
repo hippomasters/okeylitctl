@@ -130,6 +130,11 @@ class SysfsBackend:
 
     def write_colors(self, canonical_colors: str) -> None:
         self._check_abi()
+        state = self._read("state")
+        if state == "off":
+            raise BackendIOError("device power off; color write not attempted")
+        if state != "on":
+            raise UnsupportedABI("state response must be on or off")
         self._write("colors", canonical_colors)
         actual = normalize_colors(self._read("colors"))
         if actual != canonical_colors:

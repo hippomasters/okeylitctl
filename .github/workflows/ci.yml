@@ -14,8 +14,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-      - name: Run userspace and protocol tests
-        run: make test
+        with:
+          fetch-depth: 0 # Installer regression fixtures read the 0.2.0 tree via git show.
+      - name: Trust this checkout for root-only fixture history reads
+        run: sudo -n git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Run privileged device-free integration tests
+        run: sudo -n make test
+
+  unprivileged-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Run IPC, CLI and profile tests without elevation or hardware
+        run: PYTHONPATH=src:tests python3 -m unittest -v test_ipc test_cli test_profiles
       - name: Build and install Python package
         run: |
           python3 -m pip install --disable-pip-version-check .

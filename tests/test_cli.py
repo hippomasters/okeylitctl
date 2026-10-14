@@ -1,8 +1,14 @@
 import io
 import json
+import socket
+import threading
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from okeylitctl.cli import main
+from okeylitctl.ipc import ConflictError, IPCBackend
 from okeylitctl.models import ColorLayout
 from okeylitctl.sysfs import ModuleUnavailable, PermissionDenied, UnsupportedABI
 
@@ -59,6 +65,246 @@ class FakeProfileStore:
 
 
 class CliTests(unittest.TestCase):
+    def test_default_backend_uses_broker_and_preserves_json_status(self):
+        from test_ipc import BrokerFixture
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sock"
+            fixture = BrokerFixture(path, b"OK off 111111,222222,333333,444444 AAAAAA,BBBBBB,CCCCCC,DDDDDD\n")
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with patch("okeylitctl.cli.IPCBackend", side_effect=lambda: IPCBackend(socket_path=path)):
+                    code = main(["status", "--json"], stdout=out, stderr=err)
+            finally:
+                fixture.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(fixture.requests, [b"1 STATUS\n"])
+        self.assertEqual(json.loads(out.getvalue()), {
+            "state": "off",
+            "colors": ["111111", "222222", "333333", "444444"],
+            "original": ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"],
+        })
+
+    def test_default_backend_sends_mutation_through_broker(self):
+        from test_ipc import BrokerFixture
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sock"
+            fixture = BrokerFixture(path, b"OK\n")
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with patch("okeylitctl.cli.IPCBackend", side_effect=lambda: IPCBackend(socket_path=path)):
+                    code = main(["colors", "ffffff,000000,123456,abcdef"], stdout=out, stderr=err)
+            finally:
+                fixture.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(fixture.requests, [b"1 SET FFFFFF,000000,123456,ABCDEF\n"])
+
+    def test_default_tui_receives_unprivileged_backend(self):
+        launched = []
+        code = main(["tui"], stdout=io.StringIO(), stderr=io.StringIO(),
+                    tui_runner=launched.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launched), 1)
+        self.assertIsInstance(launched[0], IPCBackend)
+
+    def test_builtin_tui_receives_same_broker_client_and_reads_over_socket(self):
+        from test_ipc import BrokerFixture
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sock"
+            fixture = BrokerFixture(path, b"OK on 111111,222222,333333,444444 AAAAAA,BBBBBB,CCCCCC,DDDDDD\n")
+            created = []
+            def make_backend():
+                backend = IPCBackend(socket_path=path)
+                created.append(backend)
+                return backend
+
+            try:
+                with patch("okeylitctl.cli.IPCBackend", side_effect=make_backend), \
+                     patch("okeylitctl.tui.SysfsBackend", side_effect=AssertionError("sysfs fallback")), \
+                     patch("okeylitctl.tui.CursesTui") as app:
+                    app.side_effect = lambda backend, **kwargs: (backend.status(), app.return_value)[1]
+                    code = main(["tui"], stdout=io.StringIO(), stderr=io.StringIO())
+                    forwarded = app.call_args.args[0]
+            finally:
+                fixture.close()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(created), 1)
+        self.assertIs(forwarded, created[0])
+        self.assertEqual(fixture.requests, [b"1 STATUS\n"])
+        app.return_value.run.assert_called_once_with()
+
+    def test_staged_rate_selects_only_explicit_diagnostic_setting(self):
+        for rate in (2,):
+            with self.subTest(rate=rate), patch("okeylitctl.tui.CursesTui") as tui:
+                code = main(["tui", "--test-rate-hz", str(rate)], backend=FakeBackend(),
+                            stdout=io.StringIO(), stderr=io.StringIO())
+                self.assertEqual(code, 0)
+                self.assertEqual(tui.call_args.kwargs["test_rate_hz"], rate)
+                tui.return_value.run.assert_called_once_with()
+
+    def test_invalid_staged_rate_is_rejected_without_device_access(self):
+        for rate in ("3", "4", "5", "6", "0", "nan"):
+            with self.subTest(rate=rate):
+                backend = FakeBackend()
+                backend.status = lambda: self.fail("invalid test rate accessed device")
+                err = io.StringIO()
+                self.assertEqual(main(["tui", "--test-rate-hz", rate], backend=backend,
+                                      stdout=io.StringIO(), stderr=err), 2)
+                self.assertIn("invalid", err.getvalue())
+
+    def test_explicit_rate_experiment_is_forwarded_only_to_builtin_runner(self):
+        for rate in (4, 5):
+            with self.subTest(rate=rate), patch("okeylitctl.tui.CursesTui") as tui:
+                code = main(["tui", "--test-rate-hz", str(rate), "--rate-experiment"],
+                            backend=FakeBackend(), stdout=io.StringIO(),
+                            stderr=io.StringIO())
+                self.assertEqual(code, 0)
+                self.assertEqual(tui.call_args.kwargs["test_rate_hz"], rate)
+                self.assertTrue(tui.call_args.kwargs["rate_experiment"])
+
+    def test_named_diagnostic_effect_is_selected_without_starting_it(self):
+        for effect in ("Wave", "Scanner"):
+            with self.subTest(effect=effect), patch("okeylitctl.tui.CursesTui") as tui:
+                code = main(["tui", "--test-rate-hz", "5", "--rate-experiment",
+                             "--test-effect", effect], backend=FakeBackend(),
+                            stdout=io.StringIO(), stderr=io.StringIO())
+                self.assertEqual(code, 0)
+                self.assertEqual(tui.call_args.kwargs["test_effect"].value, effect)
+                tui.return_value.run.assert_called_once_with()
+
+    def test_named_effect_requires_explicit_rate_experiment_before_backend_construction(self):
+        for args in (("--test-effect", "Wave"),
+                     ("--test-rate-hz", "2", "--test-effect", "Wave"),
+                     ("--rate-experiment", "--test-effect", "Wave")):
+            with self.subTest(args=args), patch("okeylitctl.cli.IPCBackend") as backend:
+                err = io.StringIO()
+                self.assertEqual(main(["tui", *args], stdout=io.StringIO(), stderr=err), 2)
+                self.assertIn("--rate-experiment" if "--rate-experiment" not in args
+                              else "--test-rate-hz", err.getvalue())
+                backend.assert_not_called()
+
+    def test_invalid_or_missing_named_effect_never_constructs_backend(self):
+        for args in (("--test-effect", "NotAnEffect"), ("--test-effect", "Static"),
+                     ("--test-effect", "wave"), ("--test-effect",)):
+            with self.subTest(args=args), patch("okeylitctl.cli.IPCBackend") as backend:
+                err = io.StringIO()
+                self.assertEqual(main(["tui", "--test-rate-hz", "4",
+                                       "--rate-experiment", *args],
+                                      stdout=io.StringIO(), stderr=err), 2)
+                self.assertIn("--test-effect", err.getvalue())
+                backend.assert_not_called()
+
+    def test_named_effect_cannot_be_ignored_by_injected_runner(self):
+        launched = []
+        err = io.StringIO()
+        self.assertEqual(main(["tui", "--test-rate-hz", "4", "--rate-experiment",
+                               "--test-effect", "Wave"], backend=FakeBackend(),
+                              stdout=io.StringIO(), stderr=err,
+                              tui_runner=launched.append), 2)
+        self.assertEqual(launched, [])
+        self.assertIn("built-in", err.getvalue())
+
+    def test_rate_experiment_without_high_rate_is_rejected_before_device_access(self):
+        backend = FakeBackend()
+        backend.status = lambda: self.fail("invalid rate accessed device")
+        err = io.StringIO()
+        self.assertEqual(main(["tui", "--rate-experiment"], backend=backend,
+                              stdout=io.StringIO(), stderr=err), 2)
+        self.assertIn("--test-rate-hz", err.getvalue())
+
+    def test_long_diagnostic_requires_exact_opt_in_before_backend_construction(self):
+        for args in (("--test-duration-seconds", "12"),
+                     ("--test-rate-hz", "4", "--test-duration-seconds", "12"),
+                     ("--rate-experiment", "--test-duration-seconds", "12"),
+                     ("--test-rate-hz", "5", "--rate-experiment", "--test-effect", "Wave",
+                      "--test-duration-seconds", "12"),
+                     ("--test-rate-hz", "4", "--rate-experiment", "--test-effect", "Wave",
+                      "--test-duration-seconds", "2"),
+                     ("--test-rate-hz", "4", "--rate-experiment", "--test-effect", "Wave",
+                      "--test-duration-seconds", "012")):
+            with self.subTest(args=args), patch("okeylitctl.cli.IPCBackend") as backend:
+                err = io.StringIO()
+                self.assertEqual(main(["tui", *args], stdout=io.StringIO(), stderr=err), 2)
+                backend.assert_not_called()
+
+    def test_long_diagnostic_forwards_bounded_session_to_builtin_runner(self):
+        with patch("okeylitctl.tui.CursesTui") as tui:
+            self.assertEqual(main(["tui", "--test-rate-hz", "4", "--rate-experiment",
+                                   "--test-effect", "Wave", "--test-duration-seconds", "12"],
+                                  backend=FakeBackend(), stdout=io.StringIO(),
+                                  stderr=io.StringIO()), 0)
+            self.assertEqual(tui.call_args.kwargs["test_duration_seconds"], 12)
+            self.assertEqual(tui.call_args.kwargs["test_effect"].value, "Wave")
+
+    def test_long_diagnostic_injected_runner_cannot_ignore_duration(self):
+        launched = []
+        self.assertEqual(main(["tui", "--test-rate-hz", "4", "--rate-experiment",
+                               "--test-effect", "Wave", "--test-duration-seconds", "12"],
+                              backend=FakeBackend(), stdout=io.StringIO(),
+                              stderr=io.StringIO(), tui_runner=launched.append), 2)
+        self.assertEqual(launched, [])
+
+    def test_injected_runner_cannot_silently_ignore_diagnostic_rate(self):
+        backend = FakeBackend()
+        launched = []
+        err = io.StringIO()
+        self.assertEqual(main(["tui", "--test-rate-hz", "2"], backend=backend,
+                              stdout=io.StringIO(), stderr=err,
+                              tui_runner=launched.append), 2)
+        self.assertEqual(launched, [])
+        self.assertIn("built-in", err.getvalue())
+
+    def test_broker_error_retains_cli_exit_code_without_success_output(self):
+        from test_ipc import BrokerFixture
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sock"
+            fixture = BrokerFixture(path, b"ERR BUSY\n")
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with patch("okeylitctl.cli.IPCBackend", side_effect=lambda: IPCBackend(socket_path=path)):
+                    code = main(["restore"], stdout=out, stderr=err)
+            finally:
+                fixture.close()
+        self.assertEqual(code, 5)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("busy", err.getvalue().lower())
+        self.assertEqual(fixture.requests, [b"1 RESTORE\n"])
+
+    def test_mutation_broker_io_or_abi_error_is_visible_without_success_or_sudo_hint(self):
+        from test_ipc import BrokerFixture
+
+        for reply, expected_exit in ((b"ERR IO\n", 5), (b"ERR ABI\n", 6)):
+            with self.subTest(reply=reply), TemporaryDirectory() as directory:
+                path = Path(directory) / "broker.sock"
+                fixture = BrokerFixture(path, reply)
+                out, err = io.StringIO(), io.StringIO()
+                try:
+                    with patch("okeylitctl.cli.IPCBackend", side_effect=lambda: IPCBackend(socket_path=path)):
+                        code = main(["restore"], stdout=out, stderr=err)
+                finally:
+                    fixture.close()
+                self.assertEqual(code, expected_exit)
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn("outcome uncertain", err.getvalue().lower())
+                self.assertIn("do not retry", err.getvalue().lower())
+                self.assertNotIn("sudo", err.getvalue().lower())
+                self.assertEqual(fixture.requests, [b"1 RESTORE\n"])
+
+    def test_permission_failure_never_suggests_sudo(self):
+        backend = FakeBackend()
+        backend.error = PermissionDenied("broker denied access")
+        code, _, err, _ = self.run_cli("restore", backend=backend)
+        self.assertEqual(code, 4)
+        self.assertNotIn("sudo", err.lower())
+        self.assertNotIn("run as root", err.lower())
+        self.assertIn("broker", err.lower())
+
     def run_cli(self, *argv, backend=None, profile_store=None):
         out, err = io.StringIO(), io.StringIO()
         backend = backend or FakeBackend()
@@ -227,6 +473,135 @@ class CliTests(unittest.TestCase):
             [("colors", "ABCDEF,00FF00,0000FF,123456")],
         )
         self.assertIn("ABCDEF,00FF00,0000FF,123456", out)
+
+    def test_named_set_with_snapshot_remerges_after_conflict(self):
+        class RacingBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.token = "0000000000000001:0000000000000001"
+
+            def snapshot(self):
+                self.calls.append(("snapshot", self.token))
+                return {**self.status_value, "token": self.token}
+
+            def compare_and_write(self, token, state, expected_wire, desired_wire):
+                self.calls.append(("cas", token, state, expected_wire, desired_wire))
+                if len([call for call in self.calls if call[0] == "cas"]) == 1:
+                    self.status_value["colors"][1] = "C0FFEE"
+                    self.token = "0000000000000002:0000000000000002"
+                    raise ConflictError("broker snapshot conflict")
+                self.status_value["colors"] = desired_wire.split(",")
+                return "0000000000000003:0000000000000003"
+
+        backend = RacingBackend()
+        code, out, err, _ = self.run_cli("set", "--right", "abcdef", backend=backend)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(backend.calls, [
+            ("snapshot", "0000000000000001:0000000000000001"),
+            ("cas", "0000000000000001:0000000000000001", "on",
+             "FF0000,00FF00,0000FF,FFFFFF", "ABCDEF,00FF00,0000FF,FFFFFF"),
+            ("snapshot", "0000000000000002:0000000000000002"),
+            ("cas", "0000000000000002:0000000000000002", "on",
+             "FF0000,C0FFEE,0000FF,FFFFFF", "ABCDEF,C0FFEE,0000FF,FFFFFF"),
+        ])
+        self.assertIn("ABCDEF,C0FFEE,0000FF,FFFFFF", out)
+
+    def test_named_set_uses_real_seqpacket_snapshot_cas_after_disjoint_race(self):
+        responses = (
+            b"OK 0000000000000001:0000000000000001 on FF0000,00FF00,0000FF,FFFFFF 580BC3,D00FEF,4D0998,AF0AA1\n",
+            b"ERR CONFLICT\n",
+            b"OK 0000000000000002:0000000000000002 on FF0000,C0FFEE,0000FF,FFFFFF 580BC3,D00FEF,4D0998,AF0AA1\n",
+            b"OK 0000000000000003:0000000000000003\n",
+        )
+        requests = []
+        errors = []
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+                listener.bind(str(path))
+                listener.listen(4)
+                listener.settimeout(2)
+
+                def serve():
+                    try:
+                        for response in responses:
+                            with listener.accept()[0] as conn:
+                                requests.append(conn.recv(129))
+                                conn.sendall(response)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                out, err = io.StringIO(), io.StringIO()
+                with patch("okeylitctl.cli.IPCBackend", side_effect=lambda: IPCBackend(socket_path=path)):
+                    code = main(["set", "--right", "abcdef"], stdout=out, stderr=err)
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual((code, err.getvalue()), (0, ""))
+        self.assertEqual(requests, [
+            b"2 SNAPSHOT\n",
+            b"2 CAS 0000000000000001:0000000000000001 on FF0000,00FF00,0000FF,FFFFFF ABCDEF,00FF00,0000FF,FFFFFF\n",
+            b"2 SNAPSHOT\n",
+            b"2 CAS 0000000000000002:0000000000000002 on FF0000,C0FFEE,0000FF,FFFFFF ABCDEF,C0FFEE,0000FF,FFFFFF\n",
+        ])
+        self.assertIn("ABCDEF,C0FFEE,0000FF,FFFFFF", out.getvalue())
+
+    def test_named_set_conflict_retries_are_bounded_without_success_output(self):
+        class AlwaysConflicting(FakeBackend):
+            def snapshot(self):
+                self.calls.append(("snapshot",))
+                return {**self.status_value, "token": "0123456789ABCDEF:FEDCBA9876543210"}
+
+            def compare_and_write(self, *args):
+                self.calls.append(("cas", *args))
+                raise ConflictError("broker snapshot conflict")
+
+        backend = AlwaysConflicting()
+        code, out, err, _ = self.run_cli("set", "--left", "123456", backend=backend)
+        self.assertEqual(code, 5)
+        self.assertEqual(out, "")
+        self.assertIn("conflict", err)
+        self.assertEqual([call[0] for call in backend.calls],
+                         ["snapshot", "cas"] * 3)
+
+    def test_named_set_never_retries_uncertain_mutation(self):
+        from okeylitctl.sysfs import BackendIOError
+
+        class UncertainBackend(FakeBackend):
+            def snapshot(self):
+                self.calls.append(("snapshot",))
+                return {**self.status_value, "token": "0123456789ABCDEF:FEDCBA9876543210"}
+
+            def compare_and_write(self, *args):
+                self.calls.append(("cas", *args))
+                raise BackendIOError("mutation outcome uncertain; do not retry automatically")
+
+        backend = UncertainBackend()
+        code, out, err, _ = self.run_cli("set", "--left", "123456", backend=backend)
+        self.assertEqual(code, 5)
+        self.assertEqual(out, "")
+        self.assertIn("outcome uncertain", err)
+        self.assertEqual([call[0] for call in backend.calls], ["snapshot", "cas"])
+
+    def test_all_and_colors_use_full_write_even_with_snapshot_capability(self):
+        class AtomicBackend(FakeBackend):
+            def snapshot(self):
+                raise AssertionError("full writes must not snapshot")
+
+            def compare_and_write(self, *args):
+                raise AssertionError("full writes must not CAS")
+
+        for argv, expected in (
+            (("set", "--all", "abcdef"), "ABCDEF,ABCDEF,ABCDEF,ABCDEF"),
+            (("colors", "111111,222222,333333,444444"), "111111,222222,333333,444444"),
+        ):
+            with self.subTest(argv=argv):
+                backend = AtomicBackend()
+                code, _, err, _ = self.run_cli(*argv, backend=backend)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(backend.calls, [("colors", expected)])
 
     def test_named_set_all_creates_a_uniform_complete_layout(self):
         code, _, err, backend = self.run_cli("set", "--all", "a1b2c3")

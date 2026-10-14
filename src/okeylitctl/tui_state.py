@@ -38,6 +38,9 @@ class TuiState:
     preview_frame: ColorLayout | None = None
     effect_frame_uncertain: bool = False
     effect_restore_pending: bool = False
+    effect_ownership_lost: bool = False
+    live_last_observed: bool = False
+    live_unknown: bool = False
     preset_index: int = -1
     compact_panel: str = "color"
     help_visible: bool = False

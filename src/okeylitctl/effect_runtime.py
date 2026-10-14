@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import isfinite
-from time import monotonic
+from time import monotonic, sleep
 from typing import Protocol
 
 from .effects import EffectEvent, EffectKind, EffectSpec, frame_at
+from .ipc import BrokerBusyError, BrokerTimeoutError, ConflictError
 from .models import ColorLayout, Zone
 from .sysfs import SysfsError
 
@@ -31,6 +32,19 @@ class EffectRuntime:
     observed_power_off: bool = field(default=False, init=False)
     write_state_uncertain: bool = field(default=False, init=False)
     attempted_frame: ColorLayout | None = field(default=None, init=False)
+    # Only an acknowledged CAS response grants ownership. Never reconstruct it
+    # from a matching layout after a lost acknowledgement or another client's write.
+    owned_token: str | None = field(default=None, init=False)
+    ownership_lost: bool = field(default=False, init=False)
+    last_io_duration: float | None = field(default=None, init=False)
+    last_write_spacing: float | None = field(default=None, init=False)
+    last_snapshot_duration: float | None = field(default=None, init=False)
+    last_cas_duration: float | None = field(default=None, init=False)
+    last_frame_start_spacing: float | None = field(default=None, init=False)
+    verified_frames: int = field(default=0, init=False)
+    _first_write_completed_at: float | None = field(default=None, init=False)
+    _last_write_completed_at: float | None = field(default=None, init=False)
+    _last_frame_started_at: float | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not isfinite(self.rate_hz) or not 0.0 < self.rate_hz <= 5.0:
@@ -49,6 +63,188 @@ class EffectRuntime:
         self.observed_power_off = False
         self.write_state_uncertain = False
         self.attempted_frame = None
+        self.owned_token = None
+        self.ownership_lost = False
+        self.last_io_duration = None
+        self.last_write_spacing = None
+        self.last_snapshot_duration = None
+        self.last_cas_duration = None
+        self.last_frame_start_spacing = None
+        self.verified_frames = 0
+        self._first_write_completed_at = None
+        self._last_write_completed_at = None
+        self._last_frame_started_at = None
+
+    @property
+    def effective_write_rate(self) -> float | None:
+        """Observed verified writes/s across completion timestamps, not requested Hz."""
+        if self.verified_frames < 2 or self._first_write_completed_at is None:
+            return None
+        elapsed = self._last_write_completed_at - self._first_write_completed_at
+        return (self.verified_frames - 1) / elapsed if elapsed > 0 else None
+
+    def _record_completed_write(self, started: float, completed: float) -> None:
+        """Count only verified frames; distinguish start and completion spacing."""
+        self.last_io_duration = max(0.0, completed - started)
+        if self._last_frame_started_at is not None:
+            self.last_frame_start_spacing = max(0.0, started - self._last_frame_started_at)
+        self._last_frame_started_at = started
+        if self._last_write_completed_at is not None:
+            self.last_write_spacing = max(0.0, completed - self._last_write_completed_at)
+        if self._first_write_completed_at is None:
+            self._first_write_completed_at = completed
+        self._last_write_completed_at = completed
+        self.verified_frames += 1
+
+    @property
+    def _uses_cas(self) -> bool:
+        return (callable(getattr(self.backend, "snapshot", None))
+                and callable(getattr(self.backend, "compare_and_write", None)))
+
+    def _lose_ownership(self) -> None:
+        self.ownership_lost = True
+        self.active = False
+        self.owned_token = None
+        # A previously acknowledged frame is no longer ours to restore. In
+        # particular, never claim that the base has been restored.
+        self.last_written = None
+
+    def _stop_snapshot(self) -> dict[str, object]:
+        stop_snapshot = getattr(self.backend, "stop_snapshot", None)
+        read = stop_snapshot if callable(stop_snapshot) else self.backend.snapshot
+        # A failed Stop read has not requested any mutation. One fresh read
+        # after bounded backoff can recover from a transient broker deadline;
+        # the broker still admits and charges each attempt under its quotas.
+        # Never retry CAS here: an unacknowledged write remains uncertain.
+        try:
+            return read()
+        except (BrokerBusyError, BrokerTimeoutError):
+            sleep(0.05)
+            return read()
+
+    def _owns_stop_token(self, token: object) -> bool:
+        if token == self.owned_token:
+            return True  # Older brokers return the ordinary CAS token.
+        # The bounded broker flips only the high nonce bit for STOPSHOT. The
+        # revision must still match the last acknowledged CAS exactly; colors
+        # alone never establish ownership (including across ABA writes).
+        if not isinstance(token, str) or self.owned_token is None:
+            return False
+        parts, owned = token.split(":"), self.owned_token.split(":")
+        if (len(parts) != 2 or len(owned) != 2 or
+                any(len(part) != 16 for part in (*parts, *owned))):
+            return False
+        try:
+            return (parts[1] == owned[1] and
+                    int(parts[0], 16) ^ int(owned[0], 16) == 0x8000000000000000)
+        except ValueError:
+            return False
+
+    def _cas_stop(self) -> bool:
+        if self.ownership_lost:
+            return False
+        if self.write_state_uncertain:
+            # Only a restoration from an acknowledged, owned frame can be
+            # disproved by the unchanged token and expected colors. A changed
+            # token may be our lost ACK or someone else's write (even ABA).
+            if (self.attempted_frame != self.spec.base
+                    or self.owned_token is None or self.last_written is None):
+                return False
+            snapshot = self._stop_snapshot()
+            if snapshot.get("state") != "on":
+                self.observed_power_off = True
+                return False
+            self.observed_power_off = False
+            if (not self._owns_stop_token(snapshot.get("token"))
+                    or snapshot.get("colors") != self.last_written.to_wire().split(",")):
+                self._lose_ownership()
+                return False
+            self.write_state_uncertain = False
+            self.attempted_frame = None
+            return False  # Reconciliation never writes in the same Stop action.
+        if self.owned_token is None or self.last_written is None:
+            return False
+        snapshot = self._stop_snapshot()
+        if snapshot.get("state") != "on":
+            self.observed_power_off = True
+            self._lose_ownership()
+            return False
+        self.observed_power_off = False
+        expected = self.last_written.to_wire()
+        if (not self._owns_stop_token(snapshot.get("token"))
+                or snapshot.get("colors") != expected.split(",")):
+            self._lose_ownership()
+            return False
+        if self.last_written == self.spec.base:
+            return False
+        self.attempted_frame = self.spec.base
+        self.write_state_uncertain = True
+        try:
+            token = self.backend.compare_and_write(
+                snapshot["token"], "on", expected, self.spec.base.to_wire()
+            )
+        except ConflictError:
+            self.write_state_uncertain = False
+            self.attempted_frame = None
+            self._lose_ownership()
+            return False
+        except BaseException:
+            # An acknowledgement may have been lost after the broker applied
+            # the write. Reading colors (even the base) cannot establish that.
+            raise
+        self.owned_token = token
+        self.last_written = self.spec.base
+        self.write_state_uncertain = False
+        self.attempted_frame = None
+        return True
+
+    def _cas_tick(self, *, now: float, io_started: float) -> tuple[bool, float]:
+        snapshot = self.backend.snapshot()
+        snapshot_completed = monotonic()
+        self.last_snapshot_duration = max(0.0, snapshot_completed - io_started)
+        if snapshot.get("state") != "on":
+            self.active = False
+            self.observed_power_off = True
+            self._lose_ownership()
+            return False, snapshot_completed
+        self.observed_power_off = False
+        live_wire = ",".join(snapshot["colors"])
+        if self.owned_token is not None and (
+            snapshot.get("token") != self.owned_token
+            or self.last_written is None
+            or live_wire != self.last_written.to_wire()
+        ):
+            self._lose_ownership()
+            raise ConflictError("effect lost broker CAS ownership")
+        elapsed = now - self.started_at
+        frame = frame_at(self.spec, elapsed, event=self.event)
+        event_expired = (
+            self.event is not None
+            and elapsed > self.event.elapsed
+            and frame == self.spec.base
+        )
+        self.attempted_frame = frame
+        self.write_state_uncertain = True
+        cas_started = monotonic()
+        try:
+            token = self.backend.compare_and_write(
+                snapshot["token"], "on", live_wire, frame.to_wire()
+            )
+        except ConflictError:
+            self.write_state_uncertain = False
+            self.attempted_frame = None
+            self._lose_ownership()
+            raise
+        except BaseException:
+            self.active = False
+            raise
+        self.owned_token = token
+        self.last_written = frame
+        self.write_state_uncertain = False
+        self.attempted_frame = None
+        if event_expired:
+            self.event = None
+        return True, cas_started
 
     def trigger(self, zone: Zone, *, now: float) -> bool:
         if not self.active or self.spec.kind not in (
@@ -64,6 +260,8 @@ class EffectRuntime:
 
     def stop(self) -> bool:
         self.active = False
+        if self._uses_cas:
+            return self._cas_stop()
         if self.write_state_uncertain:
             status = self.backend.status()
             if status.get("state") != "on":
@@ -115,6 +313,18 @@ class EffectRuntime:
         if self.spec.kind in (EffectKind.REACTIVE, EffectKind.RIPPLE) and self.event is None:
             return False
         io_started = monotonic()
+        if self._uses_cas:
+            try:
+                wrote, cas_started = self._cas_tick(now=now, io_started=io_started)
+            except SysfsError:
+                self.active = False
+                raise
+            if wrote:
+                io_completed = monotonic()
+                self.last_cas_duration = max(0.0, io_completed - cas_started)
+                self._record_completed_write(io_started, io_completed)
+                self.next_due = now + max(0.0, io_completed - io_started) + self.interval
+            return wrote
         try:
             status = self.backend.status()
         except SysfsError:
@@ -147,5 +357,6 @@ class EffectRuntime:
         if event_expired:
             self.event = None
         io_completed = monotonic()
+        self._record_completed_write(io_started, io_completed)
         self.next_due = now + max(0.0, io_completed - io_started) + self.interval
         return True

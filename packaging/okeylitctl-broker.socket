@@ -1,0 +1,14 @@
+[Unit]
+Description=OKeyLitCtl local lighting broker socket
+
+[Socket]
+ListenSequentialPacket=/run/okeylitctl.sock
+Accept=no
+SocketUser=root
+SocketGroup=okeylitctl
+SocketMode=0660
+Service=okeylitctl-broker.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

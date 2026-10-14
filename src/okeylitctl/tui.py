@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import curses
 from enum import Enum, auto
+from math import ceil
 from time import monotonic, sleep
 from typing import Any
 
 from . import __version__
 from .effect_runtime import EffectRuntime
+from .ipc import ConflictError, IPCBackend
 from .effects import EffectEvent, EffectKind, PHYSICAL_ZONE_ORDER, frame_at
 from .keyboard_layout import key_zone_by_id
 from .models import ColorLayout, FIRMWARE_ZONE_ORDER, Zone
@@ -238,8 +240,30 @@ def handle_key(
 class CursesTui:
     """Interactive adapter; all editing remains local until Apply."""
 
-    def __init__(self, backend: SysfsBackend, profile_store: ProfileStore | None = None):
+    def __init__(self, backend: IPCBackend | SysfsBackend, profile_store: ProfileStore | None = None,
+                 *, test_rate_hz: int | None = None, rate_experiment: bool = False,
+                 test_effect: EffectKind | None = None,
+                 test_duration_seconds: int | None = None):
+        if (test_rate_hz not in (None, 2, 4, 5) or
+                rate_experiment != (test_rate_hz in (4, 5))):
+            raise ValueError("4/5 Hz requires an explicit bounded rate experiment")
+        if test_effect is not None and (not rate_experiment or
+                                        not isinstance(test_effect, EffectKind) or
+                                        test_effect is EffectKind.STATIC):
+            raise ValueError("--test-effect requires a named non-Static rate experiment")
+        if test_duration_seconds is not None and (
+                type(test_duration_seconds) is not int or test_duration_seconds != 12
+                or test_rate_hz != 4 or not rate_experiment or test_effect is None):
+            raise ValueError("12-second diagnostic requires 4 Hz, opt-in, and a named effect")
         self.backend = backend
+        self.test_rate_hz = test_rate_hz
+        self.rate_experiment = rate_experiment
+        self.test_duration_seconds = test_duration_seconds
+        self._long_test_effect = test_effect if test_duration_seconds is not None else None
+        self._long_test_started_once = False
+        self._experiment_frames = 0
+        self._experiment_started_at = 0.0
+        self._experiment_auto_stop_attempted = False
         self.profile_store = profile_store or ProfileStore()
         self.power_state = "unknown"
         self.colors_enabled = False
@@ -249,6 +273,11 @@ class CursesTui:
         self.effect_runtime: EffectRuntime | None = None
         self._terminal_cleanup_forced = False
         self.state = self._load_state()
+        if test_effect is not None:
+            self.state.effect_index = tuple(EffectKind).index(test_effect)
+        if test_duration_seconds is not None:
+            self.state.message = (f"{test_effect.value} 4Hz diagnostic (12s/40 frames); "
+                                  "A Start, S Stop")
 
     def _load_state(self) -> TuiState:
         status = self.backend.status()
@@ -275,11 +304,20 @@ class CursesTui:
 
     def _cleanup_after_terminal_failure(self) -> bool:
         delay = 0.05
-        while self.effect_runtime is not None:
+        # A broken terminal or unpowered device cannot supply another Stop.
+        # Bound both polling and the final safety net; retain unresolved state.
+        for _ in range(6):
+            if self.effect_runtime is None:
+                return True
             runtime = self.effect_runtime
             was_uncertain = runtime.write_state_uncertain
-            if self._stop_effect():
-                return True
+            try:
+                if self._stop_effect():
+                    return True
+            except KeyboardInterrupt:
+                # An interrupt inside a write may have lost its ACK. The
+                # runtime retains that attempt; only a later read can resolve it.
+                self.state.message = "Cleanup interrupted during I/O; verifying before exit"
             runtime = self.effect_runtime
             if (
                 was_uncertain
@@ -300,7 +338,9 @@ class CursesTui:
                 self._terminal_cleanup_forced = True
                 return False
             delay = min(1.0, delay * 2.0)
-        return True
+        self.state.message = "Exit with effect restoration unresolved after bounded cleanup"
+        self._terminal_cleanup_forced = True
+        return False
 
     def _main(self, screen: Any) -> None:
         self._terminal_cleanup_forced = False
@@ -318,7 +358,9 @@ class CursesTui:
         try:
             while True:
                 self._update_preview(now=monotonic())
+                draw_started = monotonic()
                 workspace_visible = self._draw(screen)
+                draw_duration = max(0.0, monotonic() - draw_started)
                 rendered_geometry = self._rendered_geometry
                 if rendered_geometry is None:
                     if self.effect_runtime is not None:
@@ -348,6 +390,20 @@ class CursesTui:
                         if self.effect_runtime is not None and not self._stop_effect():
                             continue
                         return
+                runtime = self.effect_runtime
+                poll_ms = 50
+                if (actions_enabled and runtime is not None and runtime.active
+                        and (runtime.spec.kind not in (EffectKind.REACTIVE, EffectKind.RIPPLE)
+                             or runtime.event is not None)):
+                    # Wake before the deadline by one measured redraw; the
+                    # runtime still gates every write on completion + interval.
+                    remaining_ms = ceil((runtime.next_due - monotonic()
+                                         - draw_duration) * 1000)
+                    poll_ms = max(1, min(50, remaining_ms))
+                try:
+                    screen.timeout(poll_ms)
+                except (AttributeError, curses.error):
+                    pass
                 try:
                     key = screen.getch()
                 except curses.error:
@@ -365,6 +421,10 @@ class CursesTui:
                 if key == -1:
                     continue
                 if key == curses.KEY_RESIZE:
+                    try:
+                        screen.clearok(True)
+                    except (AttributeError, curses.error):
+                        pass
                     continue
                 try:
                     height, width = screen.getmaxyx()
@@ -379,6 +439,15 @@ class CursesTui:
                 if self.state.help_visible:
                     handle_key(self.state, key, actions_enabled=actions_enabled)
                     continue
+                if self.state.live_unknown and key not in (ord("r"), ord("q"), ord("?"), 27):
+                    self.state.message = "Live unknown; press R to verify before another write"
+                    continue
+                if self.test_duration_seconds is not None and key in (9, curses.KEY_BTAB):
+                    self.state.message = "Named diagnostic fixed; press A Start or S Stop"
+                    continue
+                if key in (9, curses.KEY_BTAB) and self.effect_runtime is not None:
+                    if not self._stop_effect():
+                        continue
                 if self.state.effect_running and actions_enabled and key == ord("v"):
                     handle_key(self.state, key, actions_enabled=True)
                     continue
@@ -397,7 +466,19 @@ class CursesTui:
                     key,
                     actions_enabled=actions_enabled,
                 )
+                if key in (9, curses.KEY_BTAB):
+                    if self.state.effect_kind is EffectKind.STATIC:
+                        if self.state.dirty:
+                            self._apply()
+                    else:
+                        self._start_effect(now=monotonic())
+                    continue
                 if command is TuiCommand.QUIT:
+                    # A diagnostic frame must not remain live while a dirty
+                    # draft waits indefinitely at the confirmation prompt.
+                    if self.rate_experiment and self.effect_runtime is not None:
+                        if not self._stop_effect():
+                            continue
                     if self.state.dirty:
                         if not self._confirm_action(screen, "Quit?"):
                             self.state.message = "Quit cancelled — local changes preserved"
@@ -411,12 +492,16 @@ class CursesTui:
                     else:
                         self._start_effect(now=monotonic())
                 elif command is TuiCommand.STOP:
-                    self._stop_effect()
+                    try:
+                        self._stop_effect()
+                    except KeyboardInterrupt:
+                        self.state.message = (
+                            "Interrupt during Stop; verifying restoration before exit"
+                        )
+                        self._cleanup_after_terminal_failure()
+                        return
                 elif command is TuiCommand.RESTORE:
-                    if self._confirm_action(screen, "Restore the original module layout?"):
-                        self._restore()
-                    else:
-                        self.state.message = "Restore cancelled"
+                    self._restore()
                 elif command is TuiCommand.REFRESH:
                     self._refresh()
                 elif command is TuiCommand.EDIT:
@@ -581,8 +666,13 @@ class CursesTui:
         if role in {"modal_border", "modal_title", "modal_input", "modal_shortcut"}:
             base = curses.color_pair(1) if self.colors_enabled else 0
             return base | curses.A_BOLD
-        if role in {"modal_fill", "modal_swatch_live", "modal_swatch_new"}:
+        if role == "modal_fill":
+            return 0
+        if role in {"modal_swatch_live", "modal_swatch_new"}:
             return curses.A_REVERSE
+        if role == "profile_delete_prompt":
+            base = curses.color_pair(1) if self.colors_enabled else 0
+            return base | curses.A_BOLD
         if role == "modal_ready":
             base = curses.color_pair(3) if self.colors_enabled else 0
             return base | curses.A_BOLD
@@ -750,7 +840,7 @@ class CursesTui:
             "1–4 / ← →    Select a named keyboard zone",
             "↑ ↓           Select red, green, or blue channel",
             "+ -           Adjust the selected RGB channel by one",
-            "Tab / Shift-Tab  Select next or previous effect",
+            "Tab / Shift-Tab  Select and activate next or previous effect",
             "[ ]           Adjust effect speed",
             "{ }           Adjust effect light",
             "D             Reverse effect direction",
@@ -759,12 +849,12 @@ class CursesTui:
             "P             Cycle curated local presets",
             "M             Open the local profile manager",
             "A             Apply and verify the complete layout immediately",
-            "O             Confirm restoration of the original layout",
+            "O             Restore the original layout immediately",
             "X             Discard unapplied local edits",
             "R             Refresh from the device (blocked while dirty)",
             "Q             Quit; dirty drafts require confirmation",
             "",
-            "No color-picker movement writes firmware. Apply is always explicit.",
+            "Tab activates effects; color editing remains local until Apply.",
             "Press ? or Esc to close",
         )
         box_width = min(72, width - 6)
@@ -1150,13 +1240,57 @@ class CursesTui:
         return triggered
 
     def _start_effect(self, *, now: float | None = None) -> bool:
+        if self.test_duration_seconds is not None and (
+                self._long_test_started_once or self.state.effect_kind != self._long_test_effect):
+            self.state.message = "Named diagnostic can start only once with its selected effect"
+            return False
+        if self.state.live_unknown:
+            self.state.message = "Live unknown; press R to verify before another write"
+            return False
+        if self.state.effect_ownership_lost or self.state.live_last_observed:
+            self.state.message = "Effect ownership not established; refresh before starting"
+            return False
         if self.state.effect_running:
             self.state.message = "Effect is already running"
             return False
+        try:
+            power = self.backend.status()["state"]
+            if power not in ("on", "off"):
+                raise ValidationError("device state must be on or off")
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            self.power_state = "unknown"
+            self.state.message = f"Effect status unavailable: {exc}"
+            return False
+        self.power_state = power
+        if power == "off":
+            self.state.message = "Effect unavailable: power off"
+            return False
+        if self.rate_experiment:
+            begin = getattr(self.backend, ("start_long_rate_experiment"
+                                           if self.test_duration_seconds is not None
+                                           else "start_rate_experiment"), None)
+            if not callable(begin):
+                self.state.message = "Rate experiment needs the opt-in diagnostic broker"
+                return False
+            # Start before the broker exchange so a delayed ACK never extends
+            # the shorter frontend window beyond either broker lease.
+            now = monotonic() if now is None else now
+            try:
+                begin(self.test_rate_hz)
+            except (SysfsError, ValidationError) as exc:
+                self.state.message = f"Rate experiment refused: {exc}"
+                return False
+            # The broker independently starts its one-shot lease on ACK;
+            # the frontend deadline is additional headroom, not a Stop guarantee.
+            self._experiment_started_at = now
+            self._experiment_frames = 0
+            self._experiment_auto_stop_attempted = False
+            if self.test_duration_seconds is not None:
+                self._long_test_started_once = True
         runtime = EffectRuntime(
             backend=self.backend,
             spec=self.state.effect_spec,
-            rate_hz=2.0,
+            rate_hz=float(self.test_rate_hz or 2),
         )
         runtime.start(now=monotonic() if now is None else now)
         self.effect_runtime = runtime
@@ -1164,19 +1298,90 @@ class CursesTui:
         self.state.effect_frame = None
         self.state.effect_frame_uncertain = False
         self.state.effect_restore_pending = False
-        self.state.message = f"{self.state.effect_kind.value} effect started at 2 Hz"
+        self.state.effect_ownership_lost = False
+        self.state.message = (
+            f"{self.state.effect_kind.value} 4Hz diagnostic (12s/40 frames); S Stop"
+            if self.test_duration_seconds is not None else
+            f"{self.state.effect_kind.value} effect started at "
+            f"{runtime.rate_hz:g} Hz (provisional test)"
+            if self.test_rate_hz is not None else
+            f"{self.state.effect_kind.value} effect started at 2 Hz"
+        )
         return True
+
+    def _reconcile_lost_effect_ownership(self) -> bool:
+        """Verify a stable observation, not ownership, without writing the base."""
+        self.state.effect_running = True
+        self.state.effect_ownership_lost = True
+        self.state.effect_restore_pending = False
+        self.state.effect_frame_uncertain = True
+        self.state.effect_frame = None
+        try:
+            snapshot = self.backend.snapshot()
+            self.power_state = str(snapshot["state"])
+            if snapshot["state"] != "on":
+                self.state.message = "Effect ownership lost while power is off; press S to verify when on"
+                return False
+            confirmation = self.backend.snapshot()
+            self.power_state = str(confirmation["state"])
+            if (not isinstance(snapshot.get("token"), str)
+                    or not snapshot["token"] or confirmation != snapshot):
+                self.state.message = "Effect ownership lost; token-bearing observation unavailable or changed; press S to verify"
+                return False
+            current = ColorLayout.from_wire(",".join(snapshot["colors"]))
+            original = ColorLayout.from_wire(",".join(snapshot["original"]))
+        except (SysfsError, ValidationError) as exc:
+            self.state.message = (
+                f"Effect ownership lost; Live unknown: {exc}; press S to verify"
+            )
+            return False
+        self.state.current = current
+        self.state.original = original
+        self.state.live_last_observed = True
+        self.state.effect_running = False
+        self.state.effect_restore_pending = False
+        self.state.effect_frame_uncertain = False
+        self.state.effect_frame = None
+        self.effect_runtime = None
+        self.state.message = "Effect ownership lost; last observed layout shown, draft preserved"
+        return True
+
+    def _finish_rate_experiment(self) -> None:
+        """Retry one definite Stop read failure; never retry an uncertain write."""
+        for _ in range(2):
+            runtime = self.effect_runtime
+            if runtime is None:
+                return
+            was_uncertain = runtime.write_state_uncertain
+            if self._stop_effect():
+                return
+            runtime = self.effect_runtime
+            if (runtime is None or was_uncertain or runtime.write_state_uncertain
+                    or runtime.ownership_lost or runtime.observed_power_off):
+                return
 
     def _tick_effect(self, *, now: float | None = None, authorized: bool) -> bool:
         runtime = self.effect_runtime
         if runtime is None:
             return False
+        now = monotonic() if now is None else now
+        frame_limit = 40 if self.test_duration_seconds is not None else 10
+        deadline = self.test_duration_seconds or 2.0
+        if (self.rate_experiment and not self._experiment_auto_stop_attempted
+                and (self._experiment_frames >= frame_limit
+                     or now - self._experiment_started_at >= deadline)):
+            self._experiment_auto_stop_attempted = True
+            self._finish_rate_experiment()
+            return False
         try:
             wrote = runtime.tick(
-                now=monotonic() if now is None else now,
+                now=now,
                 authorized=authorized,
             )
         except SysfsError as exc:
+            if runtime.ownership_lost:
+                self._reconcile_lost_effect_ownership()
+                return False
             needs_restore = (
                 runtime.write_state_uncertain
                 or (
@@ -1203,9 +1408,46 @@ class CursesTui:
                 self.state.message = f"Effect stopped after firmware error: {exc}"
             return False
         if wrote and runtime.last_written is not None:
+            if self.rate_experiment:
+                self._experiment_frames += 1
             self.state.effect_frame = runtime.last_written
             self.state.effect_frame_uncertain = False
             self.state.effect_restore_pending = False
+            self.state.live_last_observed = False
+            if self.test_rate_hz is not None and runtime.last_io_duration is not None:
+                spacing = ("spacing pending" if runtime.last_write_spacing is None else
+                           f"spacing {runtime.last_write_spacing * 1000:.0f}ms")
+                start_spacing = (
+                    f" start {runtime.last_frame_start_spacing * 1000:.0f}ms"
+                    if runtime.last_frame_start_spacing is not None else ""
+                )
+                phase = (
+                    f" snap {runtime.last_snapshot_duration * 1000:.0f}ms"
+                    f" CAS {runtime.last_cas_duration * 1000:.0f}ms"
+                    if runtime.last_snapshot_duration is not None
+                    and runtime.last_cas_duration is not None else ""
+                )
+                self.state.message = (
+                    f"{self.test_rate_hz}Hz S Stop I/O "
+                    f"{runtime.last_io_duration * 1000:.0f}ms {spacing}"
+                    f"{start_spacing}{phase}"
+                )
+            if (self.rate_experiment and
+                    (self._experiment_frames >= frame_limit or
+                     (self.test_duration_seconds is not None and
+                      monotonic() - self._experiment_started_at >= deadline))):
+                self._experiment_auto_stop_attempted = True
+                self._finish_rate_experiment()
+                return wrote
+        if runtime.ownership_lost:
+            self.power_state = "off" if runtime.observed_power_off else self.power_state
+            self.state.effect_running = True
+            self.state.effect_ownership_lost = True
+            self.state.effect_restore_pending = False
+            self.state.effect_frame_uncertain = True
+            self.state.effect_frame = None
+            self.state.message = "Effect ownership lost while power is off; press S to verify when on"
+            return False
         if not runtime.active and runtime.observed_power_off:
             self.power_state = "off"
             needs_restore = (
@@ -1235,6 +1477,8 @@ class CursesTui:
             self.state.effect_restore_pending = False
             self.state.message = "No effect is running"
             return False
+        if runtime.ownership_lost:
+            return self._reconcile_lost_effect_ownership()
         had_verified_frame = runtime.last_written is not None
         needs_restore = (
             runtime.write_state_uncertain
@@ -1243,14 +1487,29 @@ class CursesTui:
                 and runtime.last_written != runtime.spec.base
             )
         )
+        stop_started = monotonic() if self.test_rate_hz is not None else None
         try:
             restored = runtime.stop()
         except SysfsError as exc:
+            if runtime.ownership_lost:
+                return self._reconcile_lost_effect_ownership()
             self.state.effect_running = needs_restore
             self.state.effect_restore_pending = needs_restore
             self.state.effect_frame_uncertain = needs_restore
             self.state.message = f"Effect base restoration is still pending: {exc}"
+            if stop_started is not None:
+                self.state.message += f"; Stop {(monotonic() - stop_started) * 1000:.0f}ms"
             return False
+        except BaseException:
+            # A CAS write can be accepted before the interrupt is delivered.
+            # Never display the preceding frame as Live during reconciliation.
+            self.state.effect_running = True
+            self.state.effect_restore_pending = True
+            self.state.effect_frame_uncertain = True
+            self.state.effect_frame = None
+            raise
+        if runtime.ownership_lost:
+            return self._reconcile_lost_effect_ownership()
         if runtime.observed_power_off:
             self.power_state = "off"
         elif needs_restore:
@@ -1271,12 +1530,23 @@ class CursesTui:
             self.state.effect_running = False
             self.state.draft = runtime.spec.base
             self.state.mark_applied()
+            self.state.live_last_observed = False
             self.power_state = "on"
             self.state.message = (
                 "Effect stopped; base layout restored"
                 if restored
                 else "Effect stopped; verified base layout active"
             )
+            if stop_started is not None:
+                self.state.message = (
+                    "Base restored" if restored
+                    else "Base verified"
+                )
+                self.state.message += f"; Stop {(monotonic() - stop_started) * 1000:.0f}ms"
+                rate = runtime.effective_write_rate
+                self.state.message += f"; {runtime.verified_frames} verified frames"
+                if rate is not None:
+                    self.state.message += f", {rate:.1f} verified/s"
             self.effect_runtime = None
             self.state.effect_frame = None
             self.state.effect_frame_uncertain = False
@@ -1302,14 +1572,44 @@ class CursesTui:
         return True
 
     def _apply(self) -> None:
+        if self.state.live_unknown:
+            self.state.message = "Live unknown; press R to verify before another write"
+            return
         if not self.state.dirty:
             self.state.message = "No unapplied changes"
             return
         try:
+            power = self.backend.status()["state"]
+            if power not in ("on", "off"):
+                raise ValidationError("device state must be on or off")
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            self.power_state = "unknown"
+            self.state.live_unknown = True
+            self.state.message = f"Apply status unknown: {exc}; press R to verify"
+            return
+        self.power_state = power
+        if power == "off":
+            self.state.message = "Apply unavailable: power off; local draft preserved"
+            return
+        try:
             self.backend.write_colors(self.state.draft.to_wire())
+            verified = self.backend.status()
+            self.power_state = str(verified["state"])
+            if self.power_state != "on":
+                raise ValidationError("device power off during Apply readback")
+            if ColorLayout.from_wire(",".join(verified["colors"])) != self.state.draft:
+                raise ValidationError("applied colors no longer match the local draft")
             self.state.mark_applied()
-        except SysfsError as exc:
-            self.state.message = f"Apply failed: {exc}"
+            self.state.live_last_observed = False
+        except ConflictError as exc:
+            self.state.live_last_observed = True
+            self.state.message = f"Apply not written (definite conflict): {exc}; press R to refresh"
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            self.state.live_unknown = True
+            self.state.message = f"Apply outcome unknown: {exc}; press R to verify"
+        except BaseException:
+            self.state.live_unknown = True
+            raise
 
     def _load_profile(self, name: str, *, layout: ColorLayout | None = None) -> None:
         try:
@@ -1339,12 +1639,27 @@ class CursesTui:
             self.state.message = f"Profile delete failed: {exc}"
 
     def _restore(self) -> None:
+        if self.state.effect_running or self.effect_runtime is not None:
+            self.state.message = "Stop the running effect before restoring"
+            return
+        if self.state.live_unknown:
+            self.state.message = "Live unknown; press R to verify before another write"
+            return
         try:
             status = self.backend.status()
             live = ColorLayout.from_wire(",".join(status["colors"]))
             live_original = ColorLayout.from_wire(",".join(status["original"]))
-        except (SysfsError, ValidationError) as exc:
-            self.state.message = f"Restore failed: {exc}"
+            power = status["state"]
+            if power not in ("on", "off"):
+                raise ValidationError("device state must be on or off")
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            self.power_state = "unknown"
+            self.state.live_unknown = True
+            self.state.message = f"Restore status unknown: {exc}; press R to verify"
+            return
+        self.power_state = power
+        if power == "off":
+            self.state.message = "Restore unavailable: power off; local draft preserved"
             return
         if live == live_original:
             had_dirty_draft = self.state.dirty
@@ -1362,16 +1677,77 @@ class CursesTui:
             verified = self.backend.status()
             restored = ColorLayout.from_wire(",".join(verified["colors"]))
             verified_original = ColorLayout.from_wire(",".join(verified["original"]))
+            verified_power = verified["state"]
+            if verified_power not in ("on", "off"):
+                raise ValidationError("device state must be on or off")
+            self.power_state = verified_power
+            if verified_power != "on":
+                raise ValidationError("device power off during Restore readback")
             if restored != verified_original:
                 raise ValidationError(
                     "restored colors no longer match the saved original"
                 )
             self.state.original = verified_original
             self.state.mark_restored()
-        except (SysfsError, ValidationError) as exc:
-            self.state.message = f"Restore failed: {exc}"
+            self.state.live_last_observed = False
+        except ConflictError as exc:
+            self.state.live_last_observed = True
+            self.state.message = f"Restore not written (definite conflict): {exc}; press R to refresh"
+        except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            if self.power_state != "off":
+                self.power_state = "unknown"
+            self.state.live_unknown = True
+            self.state.message = f"Restore outcome unknown: {exc}; press R to verify"
+        except BaseException:
+            self.power_state = "unknown"
+            self.state.live_unknown = True
+            raise
 
     def _refresh(self) -> None:
+        if self.state.live_unknown or self.state.live_last_observed:
+            try:
+                read = getattr(self.backend, "snapshot", None)
+                require_token = self.state.effect_ownership_lost or callable(read)
+                if require_token and not callable(read):
+                    self.state.live_unknown = True
+                    self.state.message = "Live unknown; token-bearing verification unavailable"
+                    return
+                if not callable(read):
+                    read = self.backend.status
+                first = read()
+                first_observation = (
+                    str(first["state"]), tuple(first["colors"]),
+                    tuple(first["original"]), first.get("token"),
+                )
+                self.power_state = first_observation[0]
+                if self.power_state != "on":
+                    self.state.message = "Live unknown; power off; press R to verify when on"
+                    self.state.live_unknown = True
+                    return
+                second = read()
+                self.power_state = str(second["state"])
+                second_observation = (
+                    self.power_state, tuple(second["colors"]),
+                    tuple(second["original"]), second.get("token"),
+                )
+                if (first_observation != second_observation or self.power_state != "on"
+                        or (require_token and not isinstance(first_observation[3], str))
+                        or (require_token and not first_observation[3])):
+                    self.state.message = "Live unknown; observation changed; press R to verify"
+                    self.state.live_unknown = True
+                    return
+                current = ColorLayout.from_wire(",".join(second["colors"]))
+                original = ColorLayout.from_wire(",".join(second["original"]))
+            except (SysfsError, ValidationError, KeyError, TypeError, ValueError) as exc:
+                self.state.message = f"Live unknown; verification failed: {exc}"
+                self.state.live_unknown = True
+                return
+            self.state.current = current
+            self.state.original = original
+            self.state.live_unknown = False
+            self.state.live_last_observed = True
+            self.state.message = "Last observed layout verified; local draft preserved"
+            return
         if self.state.dirty:
             self.state.message = "Apply or discard local changes before refreshing"
             return
@@ -1491,8 +1867,19 @@ class CursesTui:
 
 
 def run_tui(
-    backend: SysfsBackend | None = None,
+    backend: IPCBackend | SysfsBackend | None = None,
     profile_store: ProfileStore | None = None,
+    *, test_rate_hz: int | None = None, rate_experiment: bool = False,
+    test_effect: EffectKind | None = None,
+    test_duration_seconds: int | None = None,
 ) -> None:
     """Load verified device state and start the curses application."""
-    CursesTui(backend or SysfsBackend(), profile_store=profile_store).run()
+    if test_duration_seconds is not None and (
+            type(test_duration_seconds) is not int or test_duration_seconds != 12
+            or test_rate_hz != 4 or not rate_experiment
+            or not isinstance(test_effect, EffectKind)
+            or test_effect is EffectKind.STATIC):
+        raise ValueError("12-second diagnostic requires 4 Hz, opt-in, and a named effect")
+    CursesTui(backend if backend is not None else IPCBackend(), profile_store=profile_store,
+              test_rate_hz=test_rate_hz, rate_experiment=rate_experiment,
+              test_effect=test_effect, test_duration_seconds=test_duration_seconds).run()

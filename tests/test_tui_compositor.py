@@ -6,14 +6,40 @@ from okeylitctl.keyboard_layout import project_block_keyboard
 from okeylitctl.models import ColorLayout, Zone
 from okeylitctl.tui_compositor import (
     _Canvas,
+    compose_adaptive_editor,
     compose_editor,
     compose_exact_hex_modal,
+    compose_narrow_editor,
     compose_profiles,
 )
 from okeylitctl.tui_state import TuiState
 
 
 class EditorCompositorTests(unittest.TestCase):
+    def test_uncertain_effect_io_message_stays_actionable_without_cut_words(self):
+        state = TuiState(
+            current=ColorLayout.from_wire("7B2CFF,00CFFF,FF2E88,E8F7FF"),
+            original=ColorLayout.from_wire("7B2CFF,00CFFF,FF2E88,E8F7FF"),
+        )
+        state.effect_running = True
+        state.effect_frame_uncertain = True
+        state.effect_restore_pending = True
+        state.message = (
+            "Effect stopped after firmware error: broker I/O failure; "
+            "mutation outcome uncertain; do not retry automatically; "
+            "explicit Stop must verify it before restoration"
+        )
+        for screen in (
+            compose_editor(state, power_state="on"),
+            compose_adaptive_editor(state, width=110, height=30, power_state="on"),
+            compose_narrow_editor(state, width=78, height=24, power_state="on"),
+        ):
+            with self.subTest(size=(screen.width, screen.height)):
+                status = screen.lines[2]
+                self.assertIn("Verify", status)
+                self.assertIn("unknown", status.lower())
+                self.assertNotIn("automa", status)
+
     def test_canvas_rejects_out_of_bounds_writes_instead_of_clipping(self):
         canvas = _Canvas(5, 2)
 

@@ -6,21 +6,30 @@ import argparse
 import contextlib
 import json
 import sys
-from typing import Callable, Sequence, TextIO
+from typing import Callable, Protocol, Sequence, TextIO
 
 from . import __version__
+from .effects import EffectKind
+from .ipc import ConflictError, IPCBackend
 from .models import ColorLayout, Zone
 from .profiles import ProfileError, ProfileStore, normalize_profile_name
 from .sysfs import (
     BackendIOError,
     ModuleUnavailable,
     PermissionDenied,
-    SysfsBackend,
     UnsupportedABI,
 )
 from .validation import ValidationError, normalize_color, normalize_colors
 
 APP_NAME = "okeylitctl"
+
+
+class LightingBackend(Protocol):
+    """The narrow API shared by the broker and injected test backends."""
+
+    def status(self) -> dict[str, object]: ...
+    def write_colors(self, canonical_colors: str) -> None: ...
+    def restore(self) -> None: ...
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -55,7 +64,16 @@ def _parser() -> argparse.ArgumentParser:
     profile_delete.add_argument("name", metavar="NAME")
 
     commands.add_parser("restore", help="restore colors saved when the module loaded")
-    commands.add_parser("tui", help="open the interactive four-zone workspace")
+    tui = commands.add_parser("tui", help="open the interactive four-zone workspace")
+    tui.add_argument("--test-rate-hz", type=int, choices=(2, 4, 5),
+                     help="provisional effect-write rate for staged laptop validation (Hz)")
+    tui.add_argument("--rate-experiment", action="store_true",
+                     help="one short 4/5 Hz burst with a separately built diagnostic broker")
+    tui.add_argument("--test-effect", choices=tuple(kind.value for kind in EffectKind
+                                                     if kind is not EffectKind.STATIC),
+                     help="preselect a named effect locally for an explicit rate experiment")
+    tui.add_argument("--test-duration-seconds", choices=("12",),
+                     help="explicit 12-second/40-frame 4 Hz diagnostic; requires a named effect")
     return parser
 
 
@@ -68,16 +86,15 @@ def _print_status(status: dict[str, object], stream: TextIO) -> None:
 def main(
     argv: Sequence[str] | None = None,
     *,
-    backend: SysfsBackend | None = None,
+    backend: LightingBackend | None = None,
     profile_store: ProfileStore | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
-    tui_runner: Callable[[SysfsBackend], None] | None = None,
+    tui_runner: Callable[[LightingBackend], None] | None = None,
 ) -> int:
     """Run the CLI and return a stable process exit code."""
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
-    backend = backend or SysfsBackend()
     parser = _parser()
 
     try:
@@ -85,6 +102,29 @@ def main(
             args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
+
+    if args.command == "tui":
+        if args.rate_experiment != (args.test_rate_hz in (4, 5)):
+            stderr.write(f"{APP_NAME}: invalid rate experiment: --test-rate-hz 4 or 5 "
+                         "requires --rate-experiment (and vice versa)\n")
+            return 2
+        if args.test_effect is not None and not args.rate_experiment:
+            stderr.write(f"{APP_NAME}: --test-effect requires --rate-experiment\n")
+            return 2
+        if args.test_effect is not None and tui_runner is not None:
+            stderr.write(f"{APP_NAME}: --test-effect requires the built-in TUI runner\n")
+            return 2
+        if args.test_duration_seconds is not None:
+            if (args.test_rate_hz != 4 or not args.rate_experiment
+                    or args.test_effect is None):
+                stderr.write(f"{APP_NAME}: --test-duration-seconds requires --test-rate-hz 4 "
+                             "--rate-experiment --test-effect NAME\n")
+                return 2
+            if tui_runner is not None:
+                stderr.write(f"{APP_NAME}: --test-duration-seconds requires the built-in TUI runner\n")
+                return 2
+
+    backend = backend if backend is not None else IPCBackend()
 
     try:
         if args.command == "status":
@@ -136,15 +176,35 @@ def main(
             if normalized_all_values:
                 color = normalized_all_values[0]
                 layout = ColorLayout(color, color, color, color)
+                value = layout.to_wire()
+                backend.write_colors(value)
             else:
-                status = backend.status()
-                layout = ColorLayout.from_wire(",".join(status["colors"]))
-                for zone in (Zone.RIGHT, Zone.CENTER, Zone.LEFT, Zone.WASD):
-                    if zone in provided:
-                        layout = layout.with_zone(zone, provided[zone])
-
-            value = layout.to_wire()
-            backend.write_colors(value)
+                snapshot = getattr(backend, "snapshot", None)
+                compare_and_write = getattr(backend, "compare_and_write", None)
+                if callable(snapshot) and callable(compare_and_write):
+                    for attempt in range(3):
+                        current = snapshot()
+                        expected = ColorLayout.from_wire(",".join(current["colors"]))
+                        layout = expected
+                        for zone in (Zone.RIGHT, Zone.CENTER, Zone.LEFT, Zone.WASD):
+                            if zone in provided:
+                                layout = layout.with_zone(zone, provided[zone])
+                        value = layout.to_wire()
+                        try:
+                            compare_and_write(current["token"], current["state"],
+                                              expected.to_wire(), value)
+                            break
+                        except ConflictError:
+                            if attempt == 2:
+                                raise
+                else:
+                    status = backend.status()
+                    layout = ColorLayout.from_wire(",".join(status["colors"]))
+                    for zone in (Zone.RIGHT, Zone.CENTER, Zone.LEFT, Zone.WASD):
+                        if zone in provided:
+                            layout = layout.with_zone(zone, provided[zone])
+                    value = layout.to_wire()
+                    backend.write_colors(value)
             stdout.write(f"Keyboard colors updated: {value}\n")
         elif args.command == "profile" and args.profile_command == "save":
             store = profile_store or ProfileStore()
@@ -173,8 +233,20 @@ def main(
             if tui_runner is None:
                 from .tui import run_tui
 
-                run_tui(backend, profile_store=profile_store)
+                if args.test_rate_hz is None:
+                    run_tui(backend, profile_store=profile_store)
+                else:
+                    run_tui(backend, profile_store=profile_store,
+                            test_rate_hz=args.test_rate_hz,
+                            **({"rate_experiment": True} if args.rate_experiment else {}),
+                            **({"test_effect": EffectKind(args.test_effect)}
+                               if args.test_effect is not None else {}),
+                            **({"test_duration_seconds": 12}
+                               if args.test_duration_seconds is not None else {}))
             else:
+                if args.test_rate_hz is not None:
+                    stderr.write(f"{APP_NAME}: --test-rate-hz requires the built-in TUI runner\n")
+                    return 2
                 tui_runner(backend)
         else:  # argparse requires a known subcommand; retain fail-closed behavior.
             parser.error("unknown command")
@@ -192,7 +264,7 @@ def main(
         return 3
     except PermissionDenied as exc:
         stderr.write(f"{APP_NAME}: {exc}\n")
-        stderr.write("Hint: mutation commands must be run as root (for example, with sudo).\n")
+        stderr.write("Hint: check access to the okeylitctl broker service and socket.\n")
         return 4
     except BackendIOError as exc:
         stderr.write(f"{APP_NAME}: {exc}\n")
@@ -202,7 +274,7 @@ def main(
         return 6
     except BrokenPipeError:
         return 0
-    except Exception as exc:  # Avoid exposing tracebacks from an installed root CLI.
+    except Exception as exc:  # Avoid exposing tracebacks from an installed CLI.
         stderr.write(f"{APP_NAME}: unexpected internal error: {exc}\n")
         return 70
 
